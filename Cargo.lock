@@ -2397,6 +2397,7 @@ dependencies = [
  "larql-compute",
  "larql-compute-metal",
  "larql-core",
+ "larql-inference",
  "larql-models",
  "larql-vindex-spec",
  "libc",
