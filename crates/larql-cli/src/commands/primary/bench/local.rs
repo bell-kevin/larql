@@ -1,184 +1,65 @@
-//! Local Metal/CPU bench (`run_larql`). Loads the vindex, picks a backend,
-//! runs `generate()` with `warmup + tokens` steps, and reports per-stage
-//! timings. Mirrors the production `walk_cmd` Q4K path.
+//! Pure helpers for the local Metal/CPU bench path. The I/O-heavy
+//! `run_larql` body lives in `local_runtime.rs`; this file owns:
+//!   * `backend_name_for` — `"larql-metal"` / `"larql-cpu"`
+//!   * `format_early_stop_note` — note string for partial / no-decode runs
+//!   * `append_cpu_fallback_note` — makes CPU Q4K fallback rows explicit
+//!   * `format_q4k_cache_log` — verbose `-v` cache-stats line
+//!
+//! All exercised by tests in this file.
 
-use std::time::Instant;
-
-use super::args::BenchArgs;
-use super::row::{compute_percentiles, BenchRow};
-
-/// Run the larql generate loop once with the selected backend.
-///
-/// Warmup runs are discarded; the measured window is `args.tokens` steps
-/// AFTER warmup. Because the shared `generate()` doesn't expose a "run
-/// N extra steps silently" hook, we run a single call with
-/// `max_tokens = warmup + tokens` and subtract. Good enough — the
-/// variance between the first-call warmup and later steady-state is
-/// absorbed into the discarded prefix.
-pub(super) fn run_larql(
-    vindex_path: &std::path::Path,
-    args: &BenchArgs,
-    metal: bool,
-) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    use larql_inference::layer_graph::generate::generate;
-    use larql_inference::layer_graph::CachedLayerGraph;
-
-    if args.verbose {
-        eprintln!(
-            "[bench] loading vindex for {}…",
-            if metal { "metal" } else { "cpu" }
-        );
-    }
-
-    // Load the vindex once per backend. This mirrors `walk_cmd`'s Q4K
-    // path — attention + interleaved Q4K mmaps, weights via the
-    // Q4K-specific loader (the plain `load_model_weights` rejects
-    // quantised vindexes).
-    let mut cb = larql_vindex::SilentLoadCallbacks;
-    let mut q4_index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)?;
-    q4_index.load_attn_q4k(vindex_path)?;
-    q4_index.load_interleaved_q4k(vindex_path)?;
-
-    let cfg = larql_vindex::load_vindex_config(vindex_path)?;
-    if cfg.quant != larql_vindex::QuantFormat::Q4K {
-        return Err(format!(
-            "larql bench currently requires a Q4K vindex (got {:?})",
-            cfg.quant,
-        )
-        .into());
-    }
-    let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
-    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;
-    let wrapped_prompt = larql_inference::chat::render_user_prompt(
-        vindex_path,
-        weights.arch.family(),
-        args.prompt.as_str(),
-    )
-    .unwrap_or_else(|_| args.prompt.to_string());
-    let token_ids: Vec<u32> =
-        larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
-            .map_err(|e| format!("tokenize: {e}"))?;
-
-    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        {
-            let b = larql_compute::metal::MetalBackend::new().ok_or(
-                "Metal backend unavailable — rebuild with `--features metal` on an M-series Mac",
-            )?;
-            Box::new(b)
-        }
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
-        {
-            return Err("Metal backend requires the `metal` feature on macOS".into());
-        }
-    } else {
-        Box::new(larql_compute::CpuBackend)
-    };
-
-    let cached_layers = CachedLayerGraph::from_residuals(Vec::new());
-
-    // Pre-warm: one generate call to allocate the KV cache (~1 GB on Gemma 3 4B)
-    // and populate the Metal buffer caches. The prefill timer would otherwise
-    // include this one-time allocation cost even though it is amortized to zero
-    // in real multi-turn usage.
-    if metal {
-        let num_layers = weights.num_layers;
-        let _ = generate(
-            &mut weights,
-            &tokenizer,
-            &token_ids,
-            1,
-            &q4_index,
-            &*backend,
-            &cached_layers,
-            0..num_layers,
-        );
-    }
-
-    if args.profile {
-        std::env::set_var("LARQL_PROFILE_SPLIT", "1");
-    }
-    let max_tokens = args.warmup + args.tokens;
-    let num_layers = weights.num_layers;
-    let t0 = Instant::now();
-    let result = generate(
-        &mut weights,
-        &tokenizer,
-        &token_ids,
-        max_tokens,
-        &q4_index,
-        &*backend,
-        &cached_layers,
-        0..num_layers,
-    );
-    let wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
-
-    // Q4_K dequant cache footprint after the run. The full-K Metal fast
-    // path streams Q4_K bytes through `q4k_matmul_transb` and should NOT
-    // populate this cache; the per-position fallback in walk_ffn/sparse
-    // does. Print it on `-v` so the perf audit can verify which path
-    // was taken without running vmmap.
-    if args.verbose {
-        let (slots, bytes) = q4_index.q4k_ffn_cache_stats();
-        eprintln!(
-            "[bench] q4k_ffn_cache after {}: {} populated slots, {:.1} MB",
-            backend_name_for(metal),
-            slots,
-            bytes as f64 / 1_048_576.0,
-        );
-    }
-
-    let n_warm = args.warmup.min(result.decode_ms.len());
-    let measured = &result.decode_ms[n_warm..];
-    let measured_n = measured.len();
-    let (prefill_ms, avg_decode_ms, p50_ms, p99_ms, tok_per_s) = if measured_n == 0 {
-        (result.prefill_ms, 0.0, 0.0, 0.0, 0.0)
-    } else {
-        let (avg, p50, p99) = compute_percentiles(measured);
-        (result.prefill_ms, avg, p50, p99, 1000.0 / avg)
-    };
-
-    let backend_name = backend_name_for(metal);
-    let note = if measured_n < args.tokens {
-        format!(
-            "early stop @{}/{} (EOS or GPU fallback)",
-            measured_n, args.tokens
-        )
-    } else if measured_n == 0 {
-        format!("no decode steps completed (wall {:.0}ms)", wall_ms)
-    } else {
-        String::new()
-    };
-
-    // StageTimings across ALL decode steps (including warmup); we'd need
-    // to re-architect `generate` to bucket post-warmup only. Report the
-    // raw totals and let the caller compute the post-warmup ratio
-    // heuristically (~same within noise on 50-token runs).
-    let stages = Some(result.stage_timings.avg_per_step(result.decode_ms.len()));
-
-    Ok(BenchRow {
-        backend: backend_name.to_string(),
-        prefill_ms,
-        avg_decode_ms,
-        p50_ms,
-        p99_ms,
-        tok_per_s,
-        stages,
-        ffn_rtt_ms: None,
-        attn_ms: None,
-        wire_bytes_per_tok: None,
-        shard_efficiency: None,
-        n_steps: measured_n,
-        note,
-    })
-}
-
+/// Returns the table-row backend label for the local bench.
 pub(super) fn backend_name_for(metal: bool) -> &'static str {
     if metal {
         "larql-metal"
     } else {
         "larql-cpu"
     }
+}
+
+/// Note string for the local bench row: either empty (full target reached),
+/// "early stop @n/target …" (partial), or "no decode steps completed …"
+/// when `measured_n == 0`.
+pub(super) fn format_early_stop_note(
+    measured_n: usize,
+    target_tokens: usize,
+    wall_ms: f64,
+) -> String {
+    if measured_n == 0 {
+        format!("no decode steps completed (wall {:.0}ms)", wall_ms)
+    } else if measured_n < target_tokens {
+        format!(
+            "early stop @{}/{} (EOS or GPU fallback)",
+            measured_n, target_tokens
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Annotates CPU rows with which Q4K sub-path ran. The cached path
+/// uses prefill + KV-cached single-row decode; the legacy path
+/// reprocesses the full sequence at every step.
+pub(super) fn append_cpu_fallback_note(note: String, cached: bool) -> String {
+    let tag = if cached {
+        "cpu q4k (KV-cached decode)"
+    } else {
+        "cpu q4k legacy (O(N²) per-step)"
+    };
+    if note.is_empty() {
+        tag.to_string()
+    } else {
+        format!("{note}; {tag}")
+    }
+}
+
+/// Verbose log line for the Q4K dequant-cache stats after a run.
+pub(super) fn format_q4k_cache_log(backend_label: &str, slots: usize, bytes: usize) -> String {
+    format!(
+        "[bench] q4k_ffn_cache after {}: {} populated slots, {:.1} MB",
+        backend_label,
+        slots,
+        bytes as f64 / 1_048_576.0,
+    )
 }
 
 #[cfg(test)]
@@ -189,5 +70,57 @@ mod tests {
     fn backend_name_for_picks_label() {
         assert_eq!(backend_name_for(true), "larql-metal");
         assert_eq!(backend_name_for(false), "larql-cpu");
+    }
+
+    #[test]
+    fn early_stop_note_empty_when_target_reached() {
+        assert!(format_early_stop_note(50, 50, 1234.0).is_empty());
+    }
+
+    #[test]
+    fn early_stop_note_reports_partial_when_below_target() {
+        let s = format_early_stop_note(20, 50, 5000.0);
+        assert!(s.starts_with("early stop @20/50"));
+        assert!(s.contains("EOS or GPU fallback"));
+    }
+
+    #[test]
+    fn early_stop_note_reports_wall_when_zero_steps() {
+        let s = format_early_stop_note(0, 50, 1234.0);
+        assert!(s.starts_with("no decode steps completed"));
+        assert!(s.contains("1234ms"));
+    }
+
+    #[test]
+    fn cpu_fallback_note_labels_cached_vs_legacy() {
+        assert_eq!(
+            append_cpu_fallback_note(String::new(), true),
+            "cpu q4k (KV-cached decode)"
+        );
+        assert_eq!(
+            append_cpu_fallback_note(String::new(), false),
+            "cpu q4k legacy (O(N²) per-step)"
+        );
+    }
+
+    #[test]
+    fn cpu_fallback_note_appends_to_existing_note() {
+        let s = append_cpu_fallback_note("early stop @4/5".to_string(), true);
+        assert_eq!(s, "early stop @4/5; cpu q4k (KV-cached decode)");
+    }
+
+    #[test]
+    fn q4k_cache_log_reports_slots_and_mb() {
+        let s = format_q4k_cache_log("larql-metal", 12, 16 * 1024 * 1024);
+        assert!(s.contains("after larql-metal"));
+        assert!(s.contains("12 populated slots"));
+        assert!(s.contains("16.0 MB"));
+    }
+
+    #[test]
+    fn q4k_cache_log_zero_bytes_shows_zero() {
+        let s = format_q4k_cache_log("larql-cpu", 0, 0);
+        assert!(s.contains("0 populated slots"));
+        assert!(s.contains("0.0 MB"));
     }
 }

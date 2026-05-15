@@ -9,6 +9,22 @@ service GridService {
 
   // Read-only grid status (admin / monitoring).
   rpc Status(StatusRequest) returns (StatusResponse);
+
+  // ADR-0004 Phase 5 admin RPCs. Each is idempotent at the wire level:
+  // the caller is expected to surface the AdminAck back to whoever asked.
+
+  // Send `UnassignMsg(reason="admin_drain")` to a named server. The server
+  // drains in-flight requests and exits its serving state. Returns `Ok`
+  // if the UnassignMsg was queued, `Err` with a message if the server_id
+  // is unknown or its outbound channel is full.
+  rpc DrainServer(DrainRequest) returns (AdminAck);
+
+  // Force-assign a layer range to either a named server (when
+  // `target_server_id` is set) or to any available server. The router
+  // resolves the origin via the existing find_origin_for path. Returns
+  // `Ok` on dispatch, `Err` with a message if no origin or no available
+  // server matches.
+  rpc AssignRange(AssignRangeRequest) returns (AdminAck);
 }
 
 // ── Server → Router ───────────────────────────────────────────────────────────
@@ -133,6 +149,31 @@ message ShardInfo {
 message Gap {
   uint32 layer_start = 1;
   uint32 layer_end   = 2;
+}
+
+// ── Admin RPCs (ADR-0004 Phase 5) ────────────────────────────────────────────
+
+message DrainRequest {
+  string server_id = 1;
+  string reason    = 2;  // free-form, surfaced to the server as `UnassignMsg.reason`
+}
+
+message AssignRangeRequest {
+  string model_id           = 1;
+  uint32 layer_start        = 2;  // inclusive
+  uint32 layer_end          = 3;  // inclusive
+  // When set, target this specific available server. When empty, the
+  // router picks any spare with enough RAM.
+  string target_server_id   = 4;
+  // Used only when no live replica covers the requested range. Lets the
+  // operator point the new assignment at an external origin (S3, etc.).
+  string explicit_origin_url   = 5;
+  string explicit_origin_hash  = 6;
+}
+
+message AdminAck {
+  bool ok = 1;
+  string message = 2;  // human-readable; empty on success when nothing useful to say
 }
 
 message ServerInfo {

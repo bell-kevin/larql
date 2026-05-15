@@ -48,6 +48,8 @@ pub(crate) struct BenchJsonRow {
     pub wire_bytes_per_tok: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard_efficiency: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stages: Option<BenchJsonStages>,
     pub n_steps: usize,
     pub note: String,
 }
@@ -57,6 +59,40 @@ pub(crate) struct BenchJsonLatency {
     pub mean: f64,
     pub p50: f64,
     pub p99: f64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct BenchJsonStages {
+    pub embed_ms: f64,
+    pub gpu_fwd_ms: f64,
+    pub cpu_fwd_ms: f64,
+    pub gate_up_ms: f64,
+    pub down_ms: f64,
+    pub final_norm_ms: f64,
+    pub lm_head_ms: f64,
+    pub detok_ms: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub dequant_ms: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
+}
+
+impl From<larql_inference::layer_graph::generate::StageTimings> for BenchJsonStages {
+    fn from(s: larql_inference::layer_graph::generate::StageTimings) -> Self {
+        Self {
+            embed_ms: s.embed_ms_total,
+            gpu_fwd_ms: s.gpu_ms_total,
+            cpu_fwd_ms: s.cpu_fwd_ms_total,
+            gate_up_ms: s.gate_up_ms_total,
+            down_ms: s.down_ms_total,
+            final_norm_ms: s.norm_ms_total,
+            lm_head_ms: s.lm_head_ms_total,
+            detok_ms: s.detok_ms_total,
+            dequant_ms: s.dequant_ms_total,
+        }
+    }
 }
 
 // ── Percentile helpers ───────────────────────────────────────────────────────
@@ -107,6 +143,73 @@ mod tests {
     #[test]
     fn compute_percentiles_empty_returns_zeros() {
         assert_eq!(compute_percentiles(&[]), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn is_zero_matches_only_exact_zero() {
+        assert!(is_zero(&0.0));
+        assert!(!is_zero(&0.001));
+        assert!(!is_zero(&-0.0001));
+    }
+
+    #[test]
+    fn bench_json_stages_from_stage_timings_copies_fields() {
+        let s = larql_inference::layer_graph::generate::StageTimings {
+            embed_ms_total: 1.0,
+            gpu_ms_total: 11.6,
+            cpu_fwd_ms_total: 0.0,
+            gate_up_ms_total: 7.0,
+            down_ms_total: 4.6,
+            norm_ms_total: 0.01,
+            lm_head_ms_total: 1.75,
+            detok_ms_total: 0.012,
+            dequant_ms_total: 0.0,
+            ..Default::default()
+        };
+        let j: BenchJsonStages = s.into();
+        assert!((j.embed_ms - 1.0).abs() < 1e-9);
+        assert!((j.gpu_fwd_ms - 11.6).abs() < 1e-9);
+        assert!((j.gate_up_ms - 7.0).abs() < 1e-9);
+        assert!((j.down_ms - 4.6).abs() < 1e-9);
+        assert!((j.lm_head_ms - 1.75).abs() < 1e-9);
+        // dequant_ms is zero → serialises to nothing (verified separately).
+        assert_eq!(j.dequant_ms, 0.0);
+    }
+
+    #[test]
+    fn bench_json_stages_serialisation_skips_zero_dequant() {
+        let j = BenchJsonStages {
+            embed_ms: 1.0,
+            gpu_fwd_ms: 11.6,
+            cpu_fwd_ms: 0.0,
+            gate_up_ms: 7.0,
+            down_ms: 4.6,
+            final_norm_ms: 0.01,
+            lm_head_ms: 1.75,
+            detok_ms: 0.012,
+            dequant_ms: 0.0,
+        };
+        let json = serde_json::to_string(&j).unwrap();
+        assert!(!json.contains("dequant_ms"));
+    }
+
+    #[test]
+    fn bench_json_stages_serialisation_emits_nonzero_dequant() {
+        let mut j = BenchJsonStages {
+            embed_ms: 0.0,
+            gpu_fwd_ms: 0.0,
+            cpu_fwd_ms: 0.0,
+            gate_up_ms: 0.0,
+            down_ms: 0.0,
+            final_norm_ms: 0.0,
+            lm_head_ms: 0.0,
+            detok_ms: 0.0,
+            dequant_ms: 0.0,
+        };
+        j.dequant_ms = 2.5;
+        let json = serde_json::to_string(&j).unwrap();
+        assert!(json.contains("dequant_ms"));
+        assert!(json.contains("2.5"));
     }
 
     #[test]

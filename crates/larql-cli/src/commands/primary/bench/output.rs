@@ -39,7 +39,11 @@ pub(super) fn format_header_line(has_wire: bool) -> String {
 }
 
 pub(super) fn format_separator(has_wire: bool) -> String {
-    let n = if has_wire { WIRE_COL_WIDTH } else { PLAIN_COL_WIDTH };
+    let n = if has_wire {
+        WIRE_COL_WIDTH
+    } else {
+        PLAIN_COL_WIDTH
+    };
     format!("  {}", "─".repeat(n))
 }
 
@@ -65,6 +69,7 @@ pub(super) fn format_stage_breakdown(rows: &[BenchRow]) -> Vec<String> {
     let s = r.stages.unwrap();
     let total = s.embed_ms_total
         + s.gpu_ms_total
+        + s.cpu_fwd_ms_total
         + s.norm_ms_total
         + s.lm_head_ms_total
         + s.detok_ms_total;
@@ -80,12 +85,34 @@ pub(super) fn format_stage_breakdown(rows: &[BenchRow]) -> Vec<String> {
             s.embed_ms_total,
             pct(s.embed_ms_total)
         ),
-        format!(
+    ];
+    if s.cpu_fwd_ms_total > 0.0 {
+        out.push(format!(
+            "    CPU fwd   {:>6.3}ms  ({:>4.1}%)",
+            s.cpu_fwd_ms_total,
+            pct(s.cpu_fwd_ms_total)
+        ));
+        if s.dequant_ms_total > 0.0 {
+            // Dequant is a slice of cpu_fwd time, not additive — show it
+            // indented so the table still sums to 100%.
+            out.push(format!(
+                "      dequant {:>6.3}ms  ({:>4.1}% of cpu_fwd)",
+                s.dequant_ms_total,
+                if s.cpu_fwd_ms_total > 0.0 {
+                    s.dequant_ms_total / s.cpu_fwd_ms_total * 100.0
+                } else {
+                    0.0
+                }
+            ));
+        }
+    }
+    if s.gpu_ms_total > 0.0 {
+        out.push(format!(
             "    GPU fwd   {:>6.3}ms  ({:>4.1}%)",
             s.gpu_ms_total,
             pct(s.gpu_ms_total)
-        ),
-    ];
+        ));
+    }
     if s.gate_up_ms_total > 0.0 {
         out.push(format!(
             "      gate+up {:>6.3}ms  ({:>4.1}%)",
@@ -288,10 +315,27 @@ mod tests {
         let lines = format_stage_breakdown(&[r]);
         // Section header + blank line + 8 rows (embed, gpu, gate+up, act+down, final_norm, lm_head, detok)
         assert!(!lines.is_empty());
-        assert!(lines.iter().any(|l| l.contains("Per-stage average (metal)")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Per-stage average (metal)")));
         assert!(lines.iter().any(|l| l.contains("embed")));
         assert!(lines.iter().any(|l| l.contains("gate+up")));
         assert!(lines.iter().any(|l| l.contains("final_norm")));
+    }
+
+    #[test]
+    fn stage_breakdown_labels_cpu_fallback_forward() {
+        let mut r = empty_row("larql-cpu", 1.0);
+        let stages = larql_inference::layer_graph::generate::StageTimings {
+            cpu_fwd_ms_total: 20.0,
+            lm_head_ms_total: 2.0,
+            ..Default::default()
+        };
+        r.stages = Some(stages);
+        let lines = format_stage_breakdown(&[r]);
+        assert!(lines.iter().any(|l| l.contains("CPU fwd")));
+        assert!(!lines.iter().any(|l| l.contains("GPU fwd")));
+        assert!(lines.iter().any(|l| l.contains("lm_head")));
     }
 
     #[test]
@@ -321,7 +365,9 @@ mod tests {
         r.attn_ms = Some(20.0);
         let lines = format_remote_ffn_breakdown(&[r]);
         assert!(!lines.is_empty());
-        assert!(lines.iter().any(|l| l.contains("Per-stage average (remote-ffn")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Per-stage average (remote-ffn")));
         assert!(lines.iter().any(|l| l.contains("ffn round-trips")));
     }
 

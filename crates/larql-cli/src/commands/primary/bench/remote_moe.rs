@@ -1,16 +1,15 @@
-//! Remote MoE expert bench — attention + router run locally, expert blocks
-//! are dispatched across remote shards. Wrapper `run_concurrent_moe`
-//! parallelises clients for the `--concurrent N` mode.
+//! Pure helpers for the remote-MoE bench path. The I/O-bound bench
+//! execution lives in `remote_moe_runtime.rs`; this file holds:
+//!   * `parse_shard_segments` — shard-map flag parser
+//!   * `format_moe_backend_label` — table-label composer
+//!   * `summarize_moe_result` — decode-result post-processing
 //!
-//! The shard-map parser, label formatter, and result-summariser live as
-//! pure helpers so the I/O-heavy `run_remote_moe_bench` shell stays thin
-//! and the policy gate is satisfied without spinning up shards in tests.
+//! All three are exercised by unit tests in this file. The runtime wrapper
+//! depends on them but doesn't pull in any test-only state.
 
 use larql_inference::ffn::moe_remote::ShardConfig;
 
-use super::args::BenchArgs;
-use super::remote_ffn::combine_concurrent_rows;
-use super::row::{compute_percentiles, BenchRow};
+use super::row::compute_percentiles;
 
 /// Parse the `--moe-shards` flag value into a `Vec<ShardConfig>`. Accepts
 /// `"START-END=URL,START-END=URL,..."`. Returns an error message with the
@@ -106,152 +105,6 @@ pub(super) fn summarize_moe_result(
     }
 }
 
-/// Run `args.concurrent` parallel MoE clients against the same shard map
-/// and aggregate them into one row. `concurrent == 1` short-circuits to
-/// `run_remote_moe_bench`.
-pub(super) fn run_concurrent_moe(
-    vindex_path: &std::path::Path,
-    args: &BenchArgs,
-    shards_str: &str,
-) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    let n = args.concurrent.max(1);
-    if n == 1 {
-        return run_remote_moe_bench(vindex_path, args, shards_str);
-    }
-
-    let mut handles = Vec::with_capacity(n);
-    for _ in 0..n {
-        let vp = vindex_path.to_path_buf();
-        let a = args.clone();
-        let shards = shards_str.to_string();
-        handles.push(std::thread::spawn(move || {
-            run_remote_moe_bench(&vp, &a, &shards).map_err(|e| e.to_string())
-        }));
-    }
-    let mut rows: Vec<BenchRow> = Vec::with_capacity(n);
-    for h in handles {
-        match h.join() {
-            Ok(Ok(row)) => rows.push(row),
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                return Err(
-                    "concurrent MoE bench worker panicked — see stderr for details".into(),
-                );
-            }
-        }
-    }
-    Ok(combine_concurrent_rows(rows, n))
-}
-
-/// Bench the remote MoE expert path. Attention + router run locally; expert
-/// blocks are dispatched to remote shards via `RemoteMoeBackend`.
-///
-/// Reports overall tok/s plus a breakdown:
-///   expert-rtt  — time spent in remote expert dispatch per token
-///   attn+       — remainder = local attn + router + dense FFN
-pub(super) fn run_remote_moe_bench(
-    vindex_path: &std::path::Path,
-    args: &BenchArgs,
-    shards_str: &str,
-) -> Result<BenchRow, Box<dyn std::error::Error>> {
-    use larql_inference::ffn::moe_remote::RemoteMoeBackend;
-    use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
-
-    let configs = parse_shard_segments(shards_str)?;
-    let num_shards = configs.len();
-    let backend = larql_compute::default_backend();
-    eprintln!("Connecting to {} MoE shard(s)…", num_shards);
-    let remote = RemoteMoeBackend::connect(configs)
-        .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;
-    eprintln!("  Attention:  {} (local)", backend.name());
-    eprintln!("  Router:     local");
-    eprintln!(
-        "  Experts:    remote  (sharded across {} endpoint{})",
-        num_shards,
-        if num_shards == 1 { "" } else { "s" }
-    );
-
-    let mut cb = larql_vindex::SilentLoadCallbacks;
-    let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)
-        .map_err(|e| format!("failed to load client weights: {e}"))?;
-    let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)
-        .map_err(|e| format!("failed to load tokenizer: {e}"))?;
-    let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
-        .map_err(|e| format!("failed to load vindex: {e}"))?;
-    index.load_attn_q4k(vindex_path)?;
-    index.load_interleaved_q4k(vindex_path)?;
-    let _ = index.load_lm_head_q4(vindex_path);
-
-    let wrapped_prompt =
-        larql_inference::chat::render_user_prompt(vindex_path, weights.arch.family(), &args.prompt)
-            .unwrap_or_else(|_| args.prompt.clone());
-    let prompt_ids = larql_inference::encode_prompt(&tokenizer, &*weights.arch, &wrapped_prompt)
-        .map_err(|e| format!("tokenise: {e}"))?;
-
-    let eos = larql_inference::layer_graph::generate::eos::EosConfig::from_vindex_dir(vindex_path);
-    let max_tokens = args.warmup + args.tokens;
-    let is_batch = args.moe_dispatch.trim() == "batch";
-    let iters = args.moe_predispatch_iters.max(1);
-
-    // Warmup.
-    let run_once =
-        |n: usize| -> Result<larql_inference::layer_graph::grid::GridGenerateResult, String> {
-            if is_batch {
-                generate_with_remote_moe_batch(
-                    &weights,
-                    &tokenizer,
-                    prompt_ids.clone(),
-                    n,
-                    &index,
-                    &remote,
-                    &*backend,
-                    &eos,
-                    iters,
-                )
-                .map_err(|e| e.to_string())
-            } else {
-                generate_with_remote_moe(
-                    &weights,
-                    &tokenizer,
-                    prompt_ids.clone(),
-                    n,
-                    &index,
-                    &remote,
-                    &*backend,
-                    &eos,
-                )
-                .map_err(|e| e.to_string())
-            }
-        };
-
-    let _ = run_once(args.warmup.max(1));
-
-    let result = run_once(max_tokens).map_err(|e| format!("moe bench generate failed: {e}"))?;
-
-    let summary = summarize_moe_result(
-        &result.decode_ms,
-        &result.ffn_rtt_ms,
-        args.warmup,
-        args.tokens,
-    );
-
-    Ok(BenchRow {
-        backend: format_moe_backend_label(is_batch, num_shards),
-        prefill_ms: 0.0,
-        avg_decode_ms: summary.avg_decode_ms,
-        p50_ms: summary.p50_ms,
-        p99_ms: summary.p99_ms,
-        tok_per_s: summary.tok_per_s,
-        stages: None,
-        ffn_rtt_ms: summary.ffn_rtt_ms,
-        attn_ms: summary.attn_ms,
-        wire_bytes_per_tok: None,
-        shard_efficiency: None,
-        n_steps: summary.n_steps,
-        note: summary.note,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,8 +113,7 @@ mod tests {
 
     #[test]
     fn parse_shard_segments_accepts_well_formed_map() {
-        let cfgs =
-            parse_shard_segments("0-31=http://a:8080, 32-63=http://b:8080").unwrap();
+        let cfgs = parse_shard_segments("0-31=http://a:8080, 32-63=http://b:8080").unwrap();
         assert_eq!(cfgs.len(), 2);
         assert_eq!(cfgs[0].start, 0);
         assert_eq!(cfgs[0].end, 31);
@@ -300,7 +152,10 @@ mod tests {
 
     #[test]
     fn label_picks_mode_and_shows_shard_count() {
-        assert_eq!(format_moe_backend_label(true, 4), "remote-moe-batch (4 shards)");
+        assert_eq!(
+            format_moe_backend_label(true, 4),
+            "remote-moe-batch (4 shards)"
+        );
         assert_eq!(
             format_moe_backend_label(false, 1),
             "remote-moe-stream (1 shards)"
@@ -312,7 +167,6 @@ mod tests {
     #[test]
     fn summarize_no_post_warmup_returns_zeros() {
         let s = summarize_moe_result(&[10.0, 10.0], &[], 5, 10);
-        // warmup (5) > samples (2) → 0 measured.
         assert_eq!(s.n_steps, 0);
         assert_eq!(s.avg_decode_ms, 0.0);
         assert_eq!(s.tok_per_s, 0.0);
@@ -330,15 +184,12 @@ mod tests {
         assert!((s.avg_decode_ms - 100.0).abs() < 1e-9);
         assert!((s.tok_per_s - 10.0).abs() < 1e-9);
         assert_eq!(s.ffn_rtt_ms, Some(80.0));
-        // attn = decode - ffn = 20 ms.
-        assert!(s.attn_ms.unwrap().abs() > 0.0);
         assert!((s.attn_ms.unwrap() - 20.0).abs() < 1e-9);
         assert!(s.note.is_empty(), "n == target so no early-stop note");
     }
 
     #[test]
     fn summarize_missing_ffn_rtt_leaves_none() {
-        // ffn_rtt has fewer samples than decode (after warmup trim).
         let decode = vec![100.0, 100.0, 100.0];
         let ffn = vec![];
         let s = summarize_moe_result(&decode, &ffn, 0, 3);
@@ -349,7 +200,6 @@ mod tests {
 
     #[test]
     fn summarize_clamps_negative_attn_to_zero() {
-        // ffn > decode (sensor noise): attn must not go negative.
         let decode = vec![50.0];
         let ffn = vec![80.0];
         let s = summarize_moe_result(&decode, &ffn, 0, 1);

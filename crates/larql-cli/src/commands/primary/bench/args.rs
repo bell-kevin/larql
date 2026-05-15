@@ -26,6 +26,10 @@ pub struct BenchArgs {
     #[arg(long, default_value = "metal")]
     pub backends: String,
 
+    /// Shorthand for `--backends cpu`.
+    #[arg(long)]
+    pub cpu: bool,
+
     /// Also query a local Ollama server on the default port with this
     /// model name (e.g. `gemma3:4b`). Requires `ollama serve` running.
     #[arg(long, value_name = "MODEL")]

@@ -61,6 +61,11 @@ pub struct AnnounceConfig {
     /// actually serve. The protocol round-trip nonetheless completes, which
     /// is what the rebalancer needs to see.
     pub available_after_drain: Option<AvailableConfig>,
+    /// ADR-0010: SHA-256 fingerprint (hex) of the router's QUIC server
+    /// cert. Required when `join_url` uses the `quic://` scheme; ignored
+    /// otherwise. `None` together with a `quic://` URL means "skip cert
+    /// verification" — LAN / dev only.
+    pub quic_cert_fingerprint: Option<String>,
 }
 
 // ── Mode B config ──────────────────────────────────────────────────────────────
@@ -74,6 +79,8 @@ pub struct AvailableConfig {
     pub disk_bytes: u64,
     pub store_path: String,
     pub grid_key: Option<String>,
+    /// ADR-0010: SHA-256 fingerprint (hex) of the router's QUIC server cert.
+    pub quic_cert_fingerprint: Option<String>,
 }
 
 // ── Public entry points ────────────────────────────────────────────────────────
@@ -164,6 +171,7 @@ pub fn build_available_after_drain(
         disk_bytes: 0,
         store_path,
         grid_key: grid_key.map(str::to_string),
+        quic_cert_fingerprint: None,
     })
 }
 
@@ -248,6 +256,67 @@ async fn drain_requests(counter: &std::sync::atomic::AtomicU32, timeout: Duratio
 
 // ── Single connection lifecycle ────────────────────────────────────────────────
 
+/// Build a tonic `Channel` for `join_url`, picking the right transport
+/// based on URL scheme. `quic://` uses the QUIC transport from
+/// `larql-router-protocol` (when built with `--features quic`); anything
+/// else falls through to the default TCP gRPC path.
+async fn connect_grid_channel(
+    join_url: &str,
+    quic_cert_fingerprint: Option<&str>,
+) -> Result<tonic::transport::Channel, Box<dyn std::error::Error + Send + Sync>> {
+    if join_url.starts_with("quic://") {
+        #[cfg(feature = "quic")]
+        {
+            use larql_router_protocol::transport::quic::{
+                client_endpoint, connect_grpc_channel,
+            };
+
+            // Parse "quic://host:port" → (host, SocketAddr). We strip the
+            // scheme by hand because tonic's Uri parser rejects schemes it
+            // doesn't recognise.
+            let rest = &join_url["quic://".len()..];
+            let host = rest
+                .split(':')
+                .next()
+                .ok_or("quic:// URL missing host")?
+                .to_string();
+            let server_addr: std::net::SocketAddr = rest.parse().map_err(|e| {
+                format!("quic:// URL must be host:port (resolved IPv4/IPv6), got {rest:?}: {e}")
+            })?;
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let endpoint = client_endpoint(
+                "0.0.0.0:0".parse().unwrap(),
+                quic_cert_fingerprint.map(str::to_string),
+            )
+            .map_err(|e| format!("QUIC client endpoint: {e}"))?;
+            let (_conn, channel) = connect_grpc_channel(&endpoint, server_addr, &host)
+                .await
+                .map_err(|e| format!("QUIC connect: {e}"))?;
+            // _conn dropped at function exit would close the QUIC
+            // connection, which would tear down our gRPC channel. Leak it
+            // for the lifetime of the program — the announce task owns
+            // the resulting Channel and only lives as long as the
+            // connection stays usable. (This is the same lifetime
+            // contract Channel::from_shared(...).connect() has on TCP.)
+            std::mem::forget(_conn);
+            Ok(channel)
+        }
+        #[cfg(not(feature = "quic"))]
+        {
+            let _ = quic_cert_fingerprint;
+            Err(format!(
+                "quic:// scheme requires building with --features quic (join_url = {join_url:?})"
+            )
+            .into())
+        }
+    } else {
+        let channel = tonic::transport::Channel::from_shared(join_url.to_string())?
+            .connect()
+            .await?;
+        Ok(channel)
+    }
+}
+
 /// Run one announce connection to completion. Public so integration tests
 /// can drive the real production flow against an in-process router. Production
 /// code should use `run_announce` instead, which wraps this with reconnect.
@@ -255,9 +324,8 @@ async fn drain_requests(counter: &std::sync::atomic::AtomicU32, timeout: Duratio
 pub async fn try_once(
     cfg: &AnnounceConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = tonic::transport::Channel::from_shared(cfg.join_url.clone())?
-        .connect()
-        .await?;
+    let channel =
+        connect_grid_channel(&cfg.join_url, cfg.quic_cert_fingerprint.as_deref()).await?;
 
     // Inject the grid key into every outgoing RPC as "Authorization: Bearer <key>".
     let bearer = grid_bearer_value(cfg.grid_key.as_deref())?;
@@ -359,9 +427,8 @@ pub async fn try_once(
 async fn try_once_available(
     cfg: &AvailableConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let channel = tonic::transport::Channel::from_shared(cfg.join_url.clone())?
-        .connect()
-        .await?;
+    let channel =
+        connect_grid_channel(&cfg.join_url, cfg.quic_cert_fingerprint.as_deref()).await?;
 
     let bearer = grid_bearer_value(cfg.grid_key.as_deref())?;
     let mut client =
@@ -492,6 +559,7 @@ mod tests {
             latency_tracker: Arc::new(LayerLatencyTracker::new()),
             requests_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             available_after_drain: None,
+            quic_cert_fingerprint: None,
         }
     }
 

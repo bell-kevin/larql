@@ -11,6 +11,7 @@
 //!   -n, --tokens N        decode steps to time (default: 50).
 //!   --warmup N            warmup steps before measurement (default: 3).
 //!   --backends LIST       comma-separated: `metal`, `cpu`. Default: `metal`.
+//!   --cpu                 shorthand for `--backends cpu`.
 //!   --ollama MODEL        also query Ollama via localhost.
 //!   --ffn URL             bench remote FFN path.
 //!   --wire f32,f16,i8     compare wire formats end-to-end (requires --ffn).
@@ -38,11 +39,15 @@ pub mod row;
 pub mod run;
 
 pub(super) mod engine;
+pub(super) mod engine_runtime;
 pub(super) mod local;
+pub(super) mod local_runtime;
 pub(super) mod ollama;
 pub(super) mod output;
 pub(super) mod remote_ffn;
+pub(super) mod remote_ffn_runtime;
 pub(super) mod remote_moe;
+pub(super) mod remote_moe_runtime;
 
 // Public surface kept identical to the pre-split bench_cmd: callers only
 // see `BenchArgs` and `run`.

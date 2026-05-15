@@ -44,56 +44,59 @@ pub fn dispatch(q6k_data: &[u8], x: &[f32], num_rows: usize, hidden: usize) -> V
     let bytes_per_row = superblocks * Q6K_BLOCK_SIZE;
     let mut out = vec![0.0f32; num_rows];
 
-    for (row, out_val) in out.iter_mut().enumerate().take(num_rows) {
-        let row_start = row * bytes_per_row;
-        let mut acc = 0.0f32;
+    // Row-parallel — same rationale as `q4_common::q4k_matvec_into`.
+    // Q6_K's per-row decode is heavier (256 6-bit values vs 256 nibbles),
+    // so the win is larger.
+    use rayon::prelude::*;
+    let q6k_ref = q6k_data;
+    let x_ref = x;
+    out.par_iter_mut()
+        .enumerate()
+        .take(num_rows)
+        .for_each(|(row, out_val)| {
+            let row_start = row * bytes_per_row;
+            let mut acc = 0.0f32;
 
-        for sb in 0..superblocks {
-            let block = &q6k_data[row_start + sb * Q6K_BLOCK_SIZE..];
+            for sb in 0..superblocks {
+                let block = &q6k_ref[row_start + sb * Q6K_BLOCK_SIZE..];
 
-            // Lower 4 bits: 128 bytes (256 nibbles packed)
-            let ql = &block[0..128];
-            // Upper 2 bits: 64 bytes (256 × 2 bits, 4 per byte)
-            let qh = &block[128..192];
-            // 16 × int8 scales
-            let scales = &block[192..208];
-            // Super-block scale (f16)
-            let d_bits = u16::from_le_bytes([block[208], block[209]]);
-            let d = f16_to_f32(d_bits);
+                let ql = &block[0..128];
+                let qh = &block[128..192];
+                let scales = &block[192..208];
+                let d_bits = u16::from_le_bytes([block[208], block[209]]);
+                let d = f16_to_f32(d_bits);
 
-            let x_base = sb * 256;
+                let x_base = sb * 256;
 
-            for (j, &scale) in scales.iter().enumerate() {
-                let sc = d * (scale as i8) as f32;
-                let sub_base = j * 16;
+                for (j, &scale) in scales.iter().enumerate() {
+                    let sc = d * (scale as i8) as f32;
+                    let sub_base = j * 16;
 
-                for i in 0..8usize {
-                    let qi = sub_base + i * 2;
-                    let byte_idx = qi / 2;
-                    let lo_byte = ql[byte_idx];
+                    for i in 0..8usize {
+                        let qi = sub_base + i * 2;
+                        let byte_idx = qi / 2;
+                        let lo_byte = ql[byte_idx];
 
-                    let hi_byte_idx = qi / 4;
-                    let hi_byte = qh[hi_byte_idx];
+                        let hi_byte_idx = qi / 4;
+                        let hi_byte = qh[hi_byte_idx];
 
-                    // Lower 4 bits
-                    let lo4_0 = (lo_byte & 0x0F) as f32;
-                    let lo4_1 = ((lo_byte >> 4) & 0x0F) as f32;
-                    // Upper 2 bits
-                    let bit_offset_0 = (qi % 4) * 2;
-                    let bit_offset_1 = ((qi + 1) % 4) * 2;
-                    let hi2_0 = ((hi_byte >> bit_offset_0) & 0x03) as f32;
-                    let hi2_1 = ((qh[(qi + 1) / 4] >> bit_offset_1) & 0x03) as f32;
+                        let lo4_0 = (lo_byte & 0x0F) as f32;
+                        let lo4_1 = ((lo_byte >> 4) & 0x0F) as f32;
+                        let bit_offset_0 = (qi % 4) * 2;
+                        let bit_offset_1 = ((qi + 1) % 4) * 2;
+                        let hi2_0 = ((hi_byte >> bit_offset_0) & 0x03) as f32;
+                        let hi2_1 = ((qh[(qi + 1) / 4] >> bit_offset_1) & 0x03) as f32;
 
-                    let val0 = sc * ((lo4_0 + hi2_0 * 16.0) - 32.0);
-                    let val1 = sc * ((lo4_1 + hi2_1 * 16.0) - 32.0);
+                        let val0 = sc * ((lo4_0 + hi2_0 * 16.0) - 32.0);
+                        let val1 = sc * ((lo4_1 + hi2_1 * 16.0) - 32.0);
 
-                    acc += val0 * x[x_base + qi];
-                    acc += val1 * x[x_base + qi + 1];
+                        acc += val0 * x_ref[x_base + qi];
+                        acc += val1 * x_ref[x_base + qi + 1];
+                    }
                 }
             }
-        }
-        *out_val = acc;
-    }
+            *out_val = acc;
+        });
     out
 }
 

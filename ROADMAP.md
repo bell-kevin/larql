@@ -175,14 +175,14 @@ roadmap even if the underlying fix isn't.
 > claim is published. CPU technique → CPU baseline. GPU technique → GPU
 > baseline.
 
-Current state (2026-05-09):
+Current state (2026-05-15):
 
 | Track | Configuration | LARQL | State-of-the-art | Gap | Threshold? |
 |---|---|---|---|---|---|
 | **GPU (Metal)** | Gemma 3 4B decode | 88 tok/s | ollama ~103 | 17% behind | over (defensible-with-caveat) |
 | **GPU (Metal)** | Gemma 3 4B prefill (340 tok) | per-pos matvec | gemm | 14× behind | far over |
 | **GPU (Metal)** | Gemma 4 + MTP (when adopted) | 88 tok/s no-MTP | ~225 with MTP | ~2.6× behind | far over |
-| **CPU** | Gemma 3 4B decode | not measured | llama.cpp CPU baseline | unknown | not measurable yet |
+| **CPU** | Gemma 3 4B Q4K decode | 0.36 tok/s | llama.cpp Q4_K_M CPU 40.92 tok/s | ~114× behind | far over |
 | **CPU** | Gemma 4 26B-A4B decode | currently grid 18.3 tok/s | unknown | unknown | not measurable yet |
 
 Items the threshold makes load-bearing (not optional) on the **GPU track**:
@@ -643,7 +643,7 @@ compression 10× = ~100×) make this ~134 ms/token — the actual
 | C7 | KV compression as **default** for long context (Apollo / MarkovRS / UnlimitedContext / TurboQuant) | larql-inference | shipped (4 engines) but opt-in | Currently `LARQL_KV_ENGINE` selects; promote one of the 4 engines as default for context > N (probably Apollo's 20,000× on the right corpus, MarkovRS at 287× as a more general fallback). Long context on CPU is unaffordable without this. |
 | C8 | BR4 (Boundary refs Phase 4 — bounded KV eviction + durability-first capture) | larql-server + larql-inference | not started | See § "P1 — Boundary refs and cold-context storage" below. The CPU track makes BR4 load-bearing because long-context CPU inference can't keep raw KV in RAM. |
 | C9 | Distributed-load-balancing for "model spans 4 consumer machines" | larql-router + larql-server | shipped (grid + rebalancer) | **DEMOTED to P2 per ADR-019 (2026-05-09)** — substantial production-engineering with no current experiment requiring multi-machine. Single-shard grid (already shipped) sufficient for substrate. Re-promote if a specific experiment needs multi-machine. |
-| C10 | CPU bench harness — `larql bench --cpu` with per-stage breakdown matched against `llama.cpp -ngl 0` | larql-cli + bench/ | not started | Currently `larql bench` measures Metal-only. CPU-track baseline-credibility threshold can't be enforced without this. First test: Gemma 3 4B Q4_K on M3 Max CPU vs `llama.cpp -ngl 0`. Then Llama 2 7B + Mistral 7B for cross-arch CPU. |
+| C10 | CPU bench harness — `larql bench --cpu` with per-stage breakdown matched against `llama.cpp -ngl 0` | larql-cli + bench/ | started — `larql bench --cpu --output json` is now a first-class shorthand; Gemma 3 4B Q4K vs llama.cpp Q4_K_M CPU baseline is recorded in `bench/baselines/cpu/`; current gap is ~114×, with ~92% in CPU full-prefix forward | CPU-track baseline-credibility threshold can't be enforced without this. First acceptance test: Gemma 3 4B Q4_K on M3 Max CPU vs quant-matched `llama.cpp -ngl 0`. Then Llama 2 7B + Mistral 7B for cross-arch CPU. |
 | C11 | Architecture rule enforcement — CI check for "no GPU-only paths in core" | scripts/ + crate boundaries | not started | Static check: anything in `larql-inference` core (not `metal/`, not `cpu/`) must compile and pass tests with Metal feature off. Prevents the dual-track from drifting into Metal-locked code. |
 
 **Implementation order** (post ADR-019): C10 → C1 → C2 → C7 → C3 → C4 → C5 → C6 → C8 → C11.

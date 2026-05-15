@@ -7,6 +7,7 @@
 //! focused entry points for hidden-state forward, generation, hooks,
 //! interventions, remote FFN, Metal decode, and per-layer FFN serving.
 
+mod cached;
 mod dequant;
 mod generation;
 mod hidden;
@@ -16,6 +17,11 @@ mod metal;
 mod remote_ffn;
 mod tensors;
 mod walk_ffn;
+
+pub use cached::{
+    predict_q4k_decode_step, predict_q4k_decode_step_direct, predict_q4k_prefill,
+    supports_cached_decode, supports_direct_matvec_decode, CachedTimings, CpuKvCache,
+};
 
 pub(crate) use generation::generate_q4k_cpu_constrained_streaming_sampled_with_eos;
 pub use generation::{

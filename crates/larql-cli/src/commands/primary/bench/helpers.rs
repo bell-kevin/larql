@@ -21,9 +21,7 @@ pub fn parse_wire_list(spec: &str) -> Vec<WirePreference> {
     spec.split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            WirePreference::from_str(s).unwrap_or(WirePreference::BestAvailable)
-        })
+        .map(|s| WirePreference::from_str(s).unwrap_or(WirePreference::BestAvailable))
         .collect()
 }
 
@@ -75,14 +73,8 @@ pub fn aggregate_concurrent_rows(samples: &[ConcurrentSample]) -> Option<Concurr
     }
     let aggregate_tok_per_s: f64 = samples.iter().map(|s| s.tok_per_s).sum();
     let mean_ms: f64 = samples.iter().map(|s| s.mean_ms).sum::<f64>() / samples.len() as f64;
-    let worst_p50_ms: f64 = samples
-        .iter()
-        .map(|s| s.p50_ms)
-        .fold(0.0_f64, f64::max);
-    let worst_p99_ms: f64 = samples
-        .iter()
-        .map(|s| s.p99_ms)
-        .fold(0.0_f64, f64::max);
+    let worst_p50_ms: f64 = samples.iter().map(|s| s.p50_ms).fold(0.0_f64, f64::max);
+    let worst_p99_ms: f64 = samples.iter().map(|s| s.p99_ms).fold(0.0_f64, f64::max);
     let total_wire_bytes_per_tok = {
         let any = samples.iter().any(|s| s.wire_bytes_per_tok.is_some());
         if any {

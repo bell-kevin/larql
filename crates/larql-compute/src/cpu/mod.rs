@@ -79,7 +79,16 @@ impl QuantMatVec for CpuBackend {
         num_rows: usize,
         hidden: usize,
     ) -> Option<Vec<f32>> {
-        Some(ops::q4k_matvec::dispatch(q4k_data, x, num_rows, hidden))
+        // `ops::q4k_matvec::dispatch` is a tight reference impl but
+        // pays a redundant sumy compute inside the row loop. The
+        // production path uses `q4_common::q4k_matvec_into`, which
+        // precomputes per-sub-block sum_x once and shares it across
+        // rows — measurable savings on Gemma-3-4B-class shapes.
+        // Parallelised across rows with rayon for the matvec shapes
+        // a decode step pulls (2560–8192 rows).
+        let mut out = vec![0.0f32; num_rows];
+        ops::q4_common::q4k_matvec_into(&mut out, x, q4k_data, num_rows, hidden);
+        Some(out)
     }
 
     fn q6k_matvec(

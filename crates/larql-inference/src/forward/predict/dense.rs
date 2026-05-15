@@ -3,12 +3,40 @@
 use super::super::embed::embed_tokens;
 use super::super::layer::run_layer_with_ffn;
 use super::super::ple::precompute_per_layer_inputs;
-use super::super::{apply_norm, dot_proj};
+use super::super::apply_norm;
 use super::types::{PredictResult, PredictResultWithResiduals};
 use crate::attention::SharedKV;
 use crate::ffn::WeightFfn;
 use crate::model::ModelWeights;
 use ndarray::Array2;
+use rayon::prelude::*;
+
+/// Row-parallel matvec: `out[v] = sum_h x[0, h] * lm_head[v, h]`.
+/// `lm_head` is `[vocab, hidden]` row-major; `x` is `[1, hidden]`.
+/// Each row's dot product runs independently in scalar f32; rayon
+/// fans out across performance cores. Bypasses ndarray's BLAS fall-back
+/// when the right operand is a transposed view.
+fn parallel_lm_head_logits(
+    x: &ndarray::ArrayView2<'_, f32>,
+    lm_head: &larql_models::WeightArray,
+) -> Vec<f32> {
+    let hidden = lm_head.shape()[1];
+    let vocab = lm_head.shape()[0];
+    let x_row: &[f32] = x.row(0).to_slice().expect("h_final last row contiguous");
+    let lm_slice: &[f32] = lm_head
+        .as_slice()
+        .expect("lm_head expected contiguous row-major");
+    let mut out = vec![0.0f32; vocab];
+    out.par_iter_mut().enumerate().for_each(|(v, slot)| {
+        let row = &lm_slice[v * hidden..(v + 1) * hidden];
+        let mut acc = 0.0f32;
+        for k in 0..hidden {
+            acc += row[k] * x_row[k];
+        }
+        *slot = acc;
+    });
+    out
+}
 
 /// Descending order on the probability field of `(index, prob)` pairs,
 /// with NaN probabilities treated as the smallest value so they never
@@ -53,10 +81,15 @@ pub(crate) fn logits_to_predictions(
     let final_softcap = weights.arch.final_logit_softcapping();
 
     let last_2d = h_final.slice(ndarray::s![seq_len - 1..seq_len, ..]);
-    let logits_raw = dot_proj(&last_2d, &weights.lm_head);
+    // ndarray's `last_2d.dot(&lm_head.t())` falls off the BLAS fast path
+    // because `lm_head.t()` is a transposed view (non-standard layout) —
+    // sgemv was running at ~10 GB/s on M3 Max. Hand-roll the row-parallel
+    // dot product over `lm_head` (row-major, shape [vocab, hidden]) so
+    // we read each row contiguously and let rayon spread vocab across
+    // cores. Measured ~10× faster on Gemma 3 4B's 262K × 2560 head.
+    let logits_raw = parallel_lm_head_logits(&last_2d, &weights.lm_head);
     let inv_scale = 1.0 / logits_scale;
     let logits: Vec<f32> = logits_raw
-        .row(0)
         .iter()
         .map(|&v| {
             let mut logit = v * inv_scale;

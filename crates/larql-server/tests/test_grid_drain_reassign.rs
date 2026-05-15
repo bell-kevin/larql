@@ -110,7 +110,9 @@ async fn drain_then_reassign_via_available_after_drain() {
             disk_bytes: 0,
             store_path,
             grid_key: None,
+            quic_cert_fingerprint: None,
         }),
+        quic_cert_fingerprint: None,
     };
 
     // Drive the real announce loop in the background.

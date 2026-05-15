@@ -448,7 +448,7 @@ larql-server-ci: larql-server-fmt-check larql-server-lint larql-server-test
 # **67.58% line / 70.21% function** for router-only test run (server-side
 # integration tests in `crates/larql-server/tests/` exercise additional
 # router code paths but are not counted under -p larql-router).
-LARQL_ROUTER_COVERAGE_MIN ?= 75
+LARQL_ROUTER_COVERAGE_MIN ?= 91
 LARQL_ROUTER_COVERAGE_POLICY ?= crates/larql-router/coverage-policy.json
 LARQL_ROUTER_COVERAGE_REPORT ?= coverage/larql-router/summary.json
 

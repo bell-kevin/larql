@@ -6,6 +6,9 @@ pub mod expert_proto {
     tonic::include_proto!("larql.expert.v1");
 }
 
+#[cfg(feature = "quic")]
+pub mod transport;
+
 pub use expert_proto::expert_service_client::ExpertServiceClient;
 pub use expert_proto::expert_service_server::{ExpertService, ExpertServiceServer};
 pub use expert_proto::{

@@ -627,6 +627,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub vindex_store: Option<String>,
 
+    /// ADR-0010: SHA-256 fingerprint (hex) of the router's QUIC server
+    /// cert. Required only when `--join` uses the `quic://` scheme.
+    /// Without this, the QUIC client skips certificate verification —
+    /// LAN / dev only.
+    #[arg(long, value_name = "HEX")]
+    pub quic_cert_fingerprint: Option<String>,
+
     /// Server-side MoE expert shard map: `"START-END=URL,START-END=URL,..."`
     /// The walk-ffn handler dispatches MoE expert calls to these remote servers.
     /// Combine with --layers for full 2D (layer × expert) sharding.
@@ -1000,6 +1007,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                             disk_bytes: 0, // TODO: query disk
                             store_path: store_path.clone(),
                             grid_key: cli.grid_key.clone(),
+                            quic_cert_fingerprint: cli.quic_cert_fingerprint.clone(),
                         });
                     }
                 }
@@ -1044,6 +1052,7 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                     latency_tracker: m.layer_latency_tracker.clone(),
                     requests_in_flight: m.requests_in_flight.clone(),
                     available_after_drain: avail,
+                    quic_cert_fingerprint: cli.quic_cert_fingerprint.clone(),
                 });
             }
         }

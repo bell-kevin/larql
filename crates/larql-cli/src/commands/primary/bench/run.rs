@@ -7,14 +7,14 @@ use larql_kv::EngineKind;
 use crate::commands::primary::cache;
 
 use super::args::BenchArgs;
-use super::engine::{run_engine, run_engine_q4k};
+use super::engine_runtime::{run_engine, run_engine_q4k};
 use super::helpers;
-use super::local::run_larql;
+use super::local_runtime::run_larql;
 use super::ollama::run_ollama;
 use super::output::print_table;
-use super::remote_ffn::run_concurrent_ffn;
-use super::remote_moe::run_concurrent_moe;
-use super::row::{BenchJsonLatency, BenchJsonResult, BenchJsonRow, BenchRow};
+use super::remote_ffn_runtime::run_concurrent_ffn;
+use super::remote_moe_runtime::run_concurrent_moe;
+use super::row::{BenchJsonLatency, BenchJsonResult, BenchJsonRow, BenchJsonStages, BenchRow};
 
 pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
     let vindex_path = cache::resolve_model(&args.model)?;
@@ -26,12 +26,15 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let requested_backends: Vec<&str> = args
-        .backends
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let requested_backends: Vec<&str> = if args.cpu {
+        vec!["cpu"]
+    } else {
+        args.backends
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
     let want_metal = requested_backends.contains(&"metal");
     let want_cpu = requested_backends.contains(&"cpu");
     let want_engine = args.engine.is_some();
@@ -49,7 +52,11 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
         "Decode: {} tokens after {} warmup; backends={}{}",
         args.tokens,
         args.warmup,
-        args.backends,
+        if args.cpu {
+            "cpu"
+        } else {
+            args.backends.as_str()
+        },
         args.ollama
             .as_deref()
             .map(|m| format!(", ollama={m}"))
@@ -211,9 +218,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 if n_shards == 1 {
                     single_shard_tok_per_s = Some(row.tok_per_s);
                 }
-                row.shard_efficiency = single_shard_tok_per_s.and_then(|base| {
-                    helpers::shard_efficiency(row.tok_per_s, n_shards, base)
-                });
+                row.shard_efficiency = single_shard_tok_per_s
+                    .and_then(|base| helpers::shard_efficiency(row.tok_per_s, n_shards, base));
                 row.note = format!(
                     "{} shard{} | {}",
                     n_shards,
@@ -250,6 +256,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                 tok_per_s: r.tok_per_s,
                 wire_bytes_per_tok: r.wire_bytes_per_tok,
                 shard_efficiency: r.shard_efficiency,
+                stages: r.stages.map(BenchJsonStages::from),
                 n_steps: r.n_steps,
                 note: r.note.clone(),
             })

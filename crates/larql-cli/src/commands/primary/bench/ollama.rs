@@ -17,7 +17,12 @@ pub(super) fn run_ollama(model: &str, prompt: &str, num_predict: usize) -> Bench
 /// In production the fetcher shells out to `curl`; tests pass a closure that
 /// returns canned strings to exercise every branch without touching the
 /// network.
-pub(super) fn run_ollama_with<F>(model: &str, prompt: &str, num_predict: usize, fetch: F) -> BenchRow
+pub(super) fn run_ollama_with<F>(
+    model: &str,
+    prompt: &str,
+    num_predict: usize,
+    fetch: F,
+) -> BenchRow
 where
     F: Fn(&str) -> Option<String>,
 {

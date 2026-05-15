@@ -450,11 +450,13 @@ where
         stage_timings: StageTimings {
             embed_ms_total: outcome.t_embed,
             gpu_ms_total: outcome.t_gpu,
+            cpu_fwd_ms_total: 0.0,
             gate_up_ms_total: outcome.t_gate_up,
             down_ms_total: outcome.t_down,
             norm_ms_total: outcome.t_norm,
             lm_head_ms_total: outcome.t_lmhead,
             detok_ms_total: outcome.t_detok,
+            dequant_ms_total: 0.0,
         },
         error: None,
     }

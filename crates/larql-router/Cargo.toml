@@ -31,8 +31,25 @@ thiserror = { workspace = true }
 futures = "0.3"
 futures-core = "0.3"
 
+# rustls is only used when the `quic` feature is on. Pulled in here so the
+# `spawn_quic_listener` helper can call `rustls::crypto::ring::default_provider()`
+# without re-declaring the dep upstream every time.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
+# `tower::ServiceExt::oneshot` for axum-router unit testing in
+# tests/test_http_handlers.rs. Only needed for the HTTP-handler test
+# harness; not pulled into the binary.
+tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = []
+# ADR-0010 QUIC transport. Forwards to larql-router-protocol so the same
+# feature flag governs both the wire-format crate and the binary that
+# uses it. With this off, the router has no UDP socket or TLS code paths.
+quic = ["larql-router-protocol/quic", "dep:rustls"]
 
 [[bench]]
 name = "routing"

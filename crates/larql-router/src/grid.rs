@@ -12,9 +12,9 @@ use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
 
 use larql_router_protocol::{
-    AckMsg, AnnounceMsg, Gap, GridService, LayerLatency, ModelCoverage, RouterMessage,
-    RouterPayload, ServerInfo, ServerMessage, ServerPayload, ShardInfo, StatusRequest,
-    StatusResponse,
+    AckMsg, AdminAck, AnnounceMsg, AssignMsg, AssignRangeRequest, DrainRequest, Gap, GridService,
+    LayerLatency, ModelCoverage, RouterMessage, RouterPayload, ServerInfo, ServerMessage,
+    ServerPayload, ShardInfo, StatusRequest, StatusResponse, UnassignMsg,
 };
 
 // ── Per-server record ─────────────────────────────────────────────────────────
@@ -491,6 +491,51 @@ impl GridState {
         sent
     }
 
+    /// ADR-0004 Phase 5: send an `AssignMsg` to a specific available
+    /// server, identified by `server_id`. Used by the admin `assign_range`
+    /// RPC when the operator wants a deterministic destination instead of
+    /// "any spare with enough RAM".
+    ///
+    /// Returns `Ok(())` on dispatch, `Err(msg)` when the server isn't in
+    /// the available pool or its outbound channel rejected the message.
+    pub fn send_assign_to_named_available(
+        &mut self,
+        server_id: &str,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+        origin_url: &str,
+        shard_hash: &str,
+    ) -> Result<(), String> {
+        let entry = self
+            .available_servers
+            .remove(server_id)
+            .ok_or_else(|| format!("server_id {server_id:?} is not in the available pool"))?;
+        let msg = RouterMessage {
+            payload: Some(RouterPayload::Assign(AssignMsg {
+                model_id: model_id.to_owned(),
+                layer_start,
+                layer_end,
+                origin_url: origin_url.to_owned(),
+                shard_hash: shard_hash.to_owned(),
+            })),
+        };
+        if let Err(e) = entry.sender.try_send(Ok(msg)) {
+            // Put the entry back so a follow-up call can retry.
+            self.available_servers
+                .insert(server_id.to_string(), entry);
+            return Err(format!("send to {server_id:?} failed: {e}"));
+        }
+        tracing::info!(
+            server_id,
+            model_id,
+            layers = %format!("{layer_start}-{layer_end}"),
+            origin_url,
+            "Grid: admin-targeted AssignMsg sent"
+        );
+        Ok(())
+    }
+
     /// Scan current coverage gaps and try to fill each one from the available
     /// pool. Returns the number of assignments sent.
     pub fn try_fill_all_gaps(&mut self) -> usize {
@@ -931,6 +976,134 @@ impl GridService for GridServiceImpl {
         let resp = self.state.read().await.status_response();
         Ok(Response::new(resp))
     }
+
+    /// ADR-0004 Phase 5: admin drain. Sends `UnassignMsg(reason)` to the
+    /// named serving server. The server's announce loop handles drain →
+    /// `DroppingMsg` → optional re-enter Mode B from there.
+    async fn drain_server(
+        &self,
+        request: Request<DrainRequest>,
+    ) -> Result<Response<AdminAck>, Status> {
+        let req = request.into_inner();
+        let reason = if req.reason.is_empty() {
+            "admin_drain".to_string()
+        } else {
+            req.reason
+        };
+
+        // Find the server + the layer range it currently covers.
+        let (sender, layers) = {
+            let guard = self.state.read().await;
+            let entry = guard
+                .servers()
+                .find(|(id, _)| **id == req.server_id)
+                .map(|(_, e)| (e.model_id.clone(), e.layer_start, e.layer_end));
+            (
+                guard.serving_sender(&req.server_id),
+                entry,
+            )
+        };
+
+        let Some((model_id, layer_start, layer_end)) = layers else {
+            return Ok(Response::new(AdminAck {
+                ok: false,
+                message: format!("server_id {:?} is not currently serving", req.server_id),
+            }));
+        };
+        let Some(tx) = sender else {
+            return Ok(Response::new(AdminAck {
+                ok: false,
+                message: format!("server_id {:?} has no outbound channel", req.server_id),
+            }));
+        };
+
+        let msg = RouterMessage {
+            payload: Some(RouterPayload::Unassign(UnassignMsg {
+                model_id,
+                layer_start,
+                layer_end,
+                reason,
+            })),
+        };
+        match tx.try_send(Ok(msg)) {
+            Ok(()) => Ok(Response::new(AdminAck {
+                ok: true,
+                message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(AdminAck {
+                ok: false,
+                message: format!("send to {:?} failed: {e}", req.server_id),
+            })),
+        }
+    }
+
+    /// ADR-0004 Phase 5: force-assign a layer range. Either targets a
+    /// named available server (when `target_server_id` is set) or any
+    /// available spare; either uses the explicit origin URL/hash from the
+    /// request, or resolves an origin from the live coverage matrix.
+    async fn assign_range(
+        &self,
+        request: Request<AssignRangeRequest>,
+    ) -> Result<Response<AdminAck>, Status> {
+        let req = request.into_inner();
+        let mut guard = self.state.write().await;
+
+        // Resolve the origin: explicit > live replica.
+        let (origin_url, shard_hash) = if !req.explicit_origin_url.is_empty() {
+            (req.explicit_origin_url.clone(), req.explicit_origin_hash.clone())
+        } else {
+            match guard.find_origin_for(&req.model_id, req.layer_start, req.layer_end) {
+                Some(o) => o,
+                None => {
+                    return Ok(Response::new(AdminAck {
+                        ok: false,
+                        message: format!(
+                            "no live replica covers {}[{}-{}] — pass explicit_origin_url to override",
+                            req.model_id, req.layer_start, req.layer_end
+                        ),
+                    }));
+                }
+            }
+        };
+
+        // If target_server_id was named, hand the assignment to that specific
+        // available server. Otherwise pick any spare.
+        let assigned = if req.target_server_id.is_empty() {
+            guard.try_assign_gap_with_origin(
+                &req.model_id,
+                req.layer_start,
+                req.layer_end,
+                &origin_url,
+                &shard_hash,
+                /* min_ram */ 0,
+            )
+        } else {
+            match guard.send_assign_to_named_available(
+                &req.target_server_id,
+                &req.model_id,
+                req.layer_start,
+                req.layer_end,
+                &origin_url,
+                &shard_hash,
+            ) {
+                Ok(()) => true,
+                Err(reason) => {
+                    return Ok(Response::new(AdminAck { ok: false, message: reason }));
+                }
+            }
+        };
+        Ok(Response::new(if assigned {
+            AdminAck {
+                ok: true,
+                message: String::new(),
+            }
+        } else {
+            AdminAck {
+                ok: false,
+                message: "no available server matched the request".into(),
+            }
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -1104,6 +1277,77 @@ mod tests {
         assert_eq!(server.layer_stats.len(), 1);
         assert_eq!(server.layer_stats[0].layer, 0);
         assert!((server.layer_stats[0].avg_ms - 2.1).abs() < 0.001);
+    }
+
+    #[test]
+    fn send_assign_to_named_available_dispatches_to_specific_server() {
+        let mut state = GridState::default();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        state.register_available("target".into(), tx, 1, 0, "/".into());
+
+        state
+            .send_assign_to_named_available(
+                "target",
+                "test-model",
+                10,
+                14,
+                "http://origin:8090",
+                "deadbeef",
+            )
+            .expect("send must succeed");
+        let msg = rx
+            .try_recv()
+            .expect("AssignMsg should have been queued")
+            .expect("ok payload");
+        let Some(RouterPayload::Assign(a)) = msg.payload else {
+            panic!("expected Assign, got {msg:?}");
+        };
+        assert_eq!(a.model_id, "test-model");
+        assert_eq!(a.layer_start, 10);
+        assert_eq!(a.layer_end, 14);
+        assert_eq!(a.origin_url, "http://origin:8090");
+        assert_eq!(a.shard_hash, "deadbeef");
+        // Entry consumed.
+        assert!(!state.has_available_servers());
+    }
+
+    #[test]
+    fn send_assign_to_named_available_unknown_id_errors() {
+        let mut state = GridState::default();
+        let err = state
+            .send_assign_to_named_available(
+                "no-such",
+                "test-model",
+                0,
+                4,
+                "http://origin",
+                "h",
+            )
+            .unwrap_err();
+        assert!(err.contains("not in the available pool"));
+    }
+
+    #[test]
+    fn send_assign_to_named_available_failed_send_re_inserts_entry() {
+        let mut state = GridState::default();
+        // Drop the receiver so the send fails.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        state.register_available("target".into(), tx, 1, 0, "/".into());
+
+        let err = state
+            .send_assign_to_named_available(
+                "target",
+                "m",
+                0,
+                4,
+                "http://origin",
+                "h",
+            )
+            .unwrap_err();
+        assert!(err.contains("failed"));
+        // Entry must still be in the pool for a follow-up retry.
+        assert!(state.has_available_servers());
     }
 
     #[test]

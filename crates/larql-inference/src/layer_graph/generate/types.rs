@@ -8,6 +8,8 @@
 pub struct StageTimings {
     pub embed_ms_total: f64,
     pub gpu_ms_total: f64,
+    /// CPU fallback forward time when the backend lacks fused Q4 decode.
+    pub cpu_fwd_ms_total: f64,
     /// Gate+up dispatch time within GPU fwd (populated when LARQL_PROFILE_SPLIT=1).
     pub gate_up_ms_total: f64,
     /// Activation+down+residual time within GPU fwd (populated when LARQL_PROFILE_SPLIT=1).
@@ -15,6 +17,9 @@ pub struct StageTimings {
     pub norm_ms_total: f64,
     pub lm_head_ms_total: f64,
     pub detok_ms_total: f64,
+    /// CPU-path-only: dequant time for Q4_K/Q6_K → f32 layer tensors.
+    /// Lets the bench separate weight-unpack cost from gemm/attention.
+    pub dequant_ms_total: f64,
 }
 
 /// Typed generation failure.
@@ -124,11 +129,13 @@ impl StageTimings {
         StageTimings {
             embed_ms_total: self.embed_ms_total / nf,
             gpu_ms_total: self.gpu_ms_total / nf,
+            cpu_fwd_ms_total: self.cpu_fwd_ms_total / nf,
             gate_up_ms_total: self.gate_up_ms_total / nf,
             down_ms_total: self.down_ms_total / nf,
             norm_ms_total: self.norm_ms_total / nf,
             lm_head_ms_total: self.lm_head_ms_total / nf,
             detok_ms_total: self.detok_ms_total / nf,
+            dequant_ms_total: self.dequant_ms_total / nf,
         }
     }
 }

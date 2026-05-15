@@ -39,6 +39,9 @@ tokio-stream = "0.1"
 tonic = "0.13"
 prost = "0.13"
 async-stream = "0.3"
+# rustls is only used when the `quic` feature is on (announce.rs installs
+# the ring crypto provider before opening a QUIC client endpoint).
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 bytes = "1"
 futures = "0.3"
 rayon = "1.10"
@@ -70,6 +73,10 @@ default = []
 # Enable Metal-backed GPU expert kernels on the shard server.  Forwards to
 # `larql-compute`'s `metal` feature.  macOS-only.
 metal-experts = ["larql-compute/metal"]
+# ADR-0010 QUIC transport for the grid `Join` stream. Servers can connect
+# to the router via `--join quic://router:PORT` when this is on. Forwards
+# to larql-router-protocol so all QUIC code paths share one feature flag.
+quic = ["larql-router-protocol/quic", "dep:rustls"]
 
 [build-dependencies]
 tonic-build = "0.13"
