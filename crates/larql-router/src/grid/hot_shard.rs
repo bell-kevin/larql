@@ -24,16 +24,17 @@ use std::collections::HashMap;
 use super::GridState;
 
 impl GridState {
-    /// Hot-shard detection: distinct `(model_id, layer_start, layer_end)`
-    /// ranges where at least one serving replica's most recent
-    /// `req_per_sec` heartbeat exceeds `threshold`. Returns an empty list
-    /// when `threshold <= 0` (the feature is disabled).
+    /// Hot-shard detection: distinct
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end)`
+    /// slices where at least one serving replica's most recent
+    /// `req_per_sec` heartbeat exceeds `threshold`. Returns an empty
+    /// list when `threshold <= 0` (the feature is disabled).
     ///
     /// Uses max-rate-across-replicas: if a router does perfect
     /// load-balancing the rates converge, so any replica crossing the
-    /// threshold means the shard's per-replica load has saturated and
+    /// threshold means the slice's per-replica load has saturated and
     /// adding capacity is warranted. Sorted for deterministic iteration.
-    pub fn hot_layer_ranges(&self, threshold: f32) -> Vec<(String, u32, u32)> {
+    pub fn hot_layer_ranges(&self, threshold: f32) -> Vec<(String, u32, u32, u32, u32)> {
         // `threshold > 0.0` returns false for NaN; the explicit not-greater
         // form below disables the check for NaN and non-positives alike
         // without tripping the `<=` NaN trap.
@@ -42,15 +43,21 @@ impl GridState {
         if disabled {
             return Vec::new();
         }
-        let mut max_rate: HashMap<(String, u32, u32), f32> = HashMap::new();
+        let mut max_rate: HashMap<(String, u32, u32, u32, u32), f32> = HashMap::new();
         for e in self.servers.values() {
-            let key = (e.model_id.clone(), e.layer_start, e.layer_end);
+            let key = (
+                e.model_id.clone(),
+                e.layer_start,
+                e.layer_end,
+                e.expert_start,
+                e.expert_end,
+            );
             let cur = max_rate.entry(key).or_insert(0.0);
             if e.req_per_sec > *cur {
                 *cur = e.req_per_sec;
             }
         }
-        let mut out: Vec<(String, u32, u32)> = max_rate
+        let mut out: Vec<(String, u32, u32, u32, u32)> = max_rate
             .into_iter()
             .filter_map(|(k, v)| if v > threshold { Some(k) } else { None })
             .collect();
@@ -58,26 +65,53 @@ impl GridState {
         out
     }
 
-    /// Mark `(model_id, layer_start, layer_end)` as elevated so that
-    /// `effective_target_for` returns `target_replicas + 1`. Returns
-    /// `true` if this call newly inserted the range.
-    pub fn mark_elevated(&mut self, model_id: &str, layer_start: u32, layer_end: u32) -> bool {
-        self.elevated_ranges
-            .insert((model_id.to_owned(), layer_start, layer_end))
+    /// Mark the `(model_id, layer_range, expert_range)` slice as
+    /// elevated so that `effective_target_for` returns
+    /// `target_replicas + 1`. Returns `true` if this call newly
+    /// inserted the slice.
+    pub fn mark_elevated(
+        &mut self,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
+    ) -> bool {
+        self.elevated_ranges.insert((
+            model_id.to_owned(),
+            layer_start,
+            layer_end,
+            expert_start,
+            expert_end,
+        ))
     }
 
-    /// Clear the elevation flag for `(model_id, layer_start, layer_end)`.
-    /// Returns `true` if the range was previously elevated. After demotion
-    /// the standard over-replication tick drops the surplus replica.
-    pub fn demote_elevated(&mut self, model_id: &str, layer_start: u32, layer_end: u32) -> bool {
-        self.elevated_ranges
-            .remove(&(model_id.to_owned(), layer_start, layer_end))
+    /// Clear the elevation flag for the
+    /// `(model_id, layer_range, expert_range)` slice. Returns `true`
+    /// if the slice was previously elevated. After demotion the
+    /// standard over-replication tick drops the surplus replica.
+    pub fn demote_elevated(
+        &mut self,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
+    ) -> bool {
+        self.elevated_ranges.remove(&(
+            model_id.to_owned(),
+            layer_start,
+            layer_end,
+            expert_start,
+            expert_end,
+        ))
     }
 
-    /// Snapshot of currently-elevated ranges. Used by the hot-shard tick
-    /// to decide which previously-elevated ranges to demote.
-    pub fn elevated_ranges_snapshot(&self) -> Vec<(String, u32, u32)> {
-        let mut out: Vec<(String, u32, u32)> = self.elevated_ranges.iter().cloned().collect();
+    /// Snapshot of currently-elevated slices. Used by the hot-shard
+    /// tick to decide which previously-elevated slices to demote.
+    pub fn elevated_ranges_snapshot(&self) -> Vec<(String, u32, u32, u32, u32)> {
+        let mut out: Vec<(String, u32, u32, u32, u32)> =
+            self.elevated_ranges.iter().cloned().collect();
         out.sort();
         out
     }
@@ -112,7 +146,7 @@ mod tests {
         state.register(cool);
 
         let ranges = state.hot_layer_ranges(20.0);
-        assert_eq!(ranges, vec![("model-x".to_string(), 0, 4)]);
+        assert_eq!(ranges, vec![("model-x".to_string(), 0, 4, 0, 0)]);
 
         // Threshold above both replicas: range is not hot.
         assert!(state.hot_layer_ranges(75.0).is_empty());
@@ -129,11 +163,11 @@ mod tests {
         assert!(state.under_replicated_ranges().is_empty());
 
         // Elevate → effective target = 3. Two replicas now look under by 1.
-        assert!(state.mark_elevated("model-x", 0, 4));
-        assert_eq!(state.effective_target_for("model-x", 0, 4), 3);
+        assert!(state.mark_elevated("model-x", 0, 4, 0, 0));
+        assert_eq!(state.effective_target_for("model-x", 0, 4, 0, 0), 3);
         assert_eq!(
             state.under_replicated_ranges(),
-            vec![("model-x".to_string(), 0, 4, 1)]
+            vec![("model-x".to_string(), 0, 4, 0, 0, 1)]
         );
         assert!(state.over_replicated_ranges().is_empty());
 
@@ -143,35 +177,35 @@ mod tests {
         assert!(state.under_replicated_ranges().is_empty());
 
         // Demote → effective target = 2. Three replicas surplus by 1.
-        assert!(state.demote_elevated("model-x", 0, 4));
+        assert!(state.demote_elevated("model-x", 0, 4, 0, 0));
         assert_eq!(
             state.over_replicated_ranges(),
-            vec![("model-x".to_string(), 0, 4, 1)]
+            vec![("model-x".to_string(), 0, 4, 0, 0, 1)]
         );
     }
 
     #[test]
     fn mark_elevated_is_idempotent_and_demote_reports_prior_state() {
         let mut state = GridState::default();
-        assert!(state.mark_elevated("m", 0, 4)); // newly inserted
-        assert!(!state.mark_elevated("m", 0, 4)); // already there
-        assert!(state.demote_elevated("m", 0, 4)); // was present
-        assert!(!state.demote_elevated("m", 0, 4)); // already gone
+        assert!(state.mark_elevated("m", 0, 4, 0, 0)); // newly inserted
+        assert!(!state.mark_elevated("m", 0, 4, 0, 0)); // already there
+        assert!(state.demote_elevated("m", 0, 4, 0, 0)); // was present
+        assert!(!state.demote_elevated("m", 0, 4, 0, 0)); // already gone
     }
 
     #[test]
     fn elevated_ranges_snapshot_sorted_and_isolated() {
         let mut state = GridState::default();
-        state.mark_elevated("z", 0, 4);
-        state.mark_elevated("a", 5, 9);
-        state.mark_elevated("a", 0, 4);
+        state.mark_elevated("z", 0, 4, 0, 0);
+        state.mark_elevated("a", 5, 9, 0, 0);
+        state.mark_elevated("a", 0, 4, 0, 0);
         let snap = state.elevated_ranges_snapshot();
         assert_eq!(
             snap,
             vec![
-                ("a".to_string(), 0, 4),
-                ("a".to_string(), 5, 9),
-                ("z".to_string(), 0, 4),
+                ("a".to_string(), 0, 4, 0, 0),
+                ("a".to_string(), 5, 9, 0, 0),
+                ("z".to_string(), 0, 4, 0, 0),
             ]
         );
     }

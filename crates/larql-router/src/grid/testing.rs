@@ -36,5 +36,9 @@ pub(crate) fn entry(
         layer_latencies: HashMap::new(),
         req_per_sec: 0.0,
         rtt_ms: None,
+        // ADR-0018: dense by default. Test cases that need MoE
+        // shards mutate these fields after construction.
+        expert_start: 0,
+        expert_end: 0,
     }
 }

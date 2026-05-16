@@ -331,7 +331,165 @@ fn vec_to_2d_row(v: Vec<f32>) -> Array2<f32> {
 /// but reads weights from `index.attn_q4k_layer_data(layer)` instead of
 /// dequantised f32 in `weights.tensors`.
 #[allow(clippy::too_many_arguments)]
-fn run_attn_decode_step_q4k_direct(
+/// Metal-fused prefill: run the prompt through every layer via the
+/// backend's `prefill_q4` kernel (one command buffer per session), seed
+/// the backend's internal K/V cache, return last-row hidden.
+///
+/// Returns `None` if the backend doesn't have Q4 support
+/// (`!backend.has_q4()`), the vindex lacks Q4K/Q4_0 interleaved FFN
+/// bytes, or the architecture isn't compatible with the fused pipeline.
+/// CPU callers get `None` — they use [`predict_q4k_prefill`] instead.
+///
+/// Public counterpart to [`predict_q4k_prefill`] for the Metal side.
+/// Previously lived inline in `larql-kv/engines/unlimited_context/engine.rs`;
+/// promoted here so [`crate::kv_dispatch::metal::MetalBackend::coarse_prefill`]
+/// can use it without an `larql-inference → larql-kv` dep cycle.
+pub fn metal_fused_prefill(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_ids: &[u32],
+    backend: &dyn ComputeBackend,
+) -> Option<Array2<f32>> {
+    use crate::layer_graph::pipeline_layer::{
+        build_pipeline_layers, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
+    };
+    use larql_vindex::GateIndex;
+
+    if !backend.has_q4() {
+        return None;
+    }
+
+    let gate_index: &dyn GateIndex = index;
+    let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
+        (m, true)
+    } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+        (m, false)
+    } else {
+        return None;
+    };
+    index.attn_q4k_layer_data(0)?;
+
+    let arch = &*weights.arch;
+    let hidden = weights.hidden_size;
+    let num_layers = weights.num_layers;
+    let intermediate = gate_index.num_features(0);
+    if intermediate == 0 {
+        return None;
+    }
+
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let q4_ffn_per_matrix = ffn_format.packed_matrix_bytes(intermediate, hidden)?;
+
+    let layers = build_pipeline_layers(
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn_mmap,
+        q4_ffn_per_matrix,
+        ffn_format,
+    );
+
+    let h_embed = crate::forward::embed_tokens_pub(weights, token_ids);
+    let x: Vec<f32> = h_embed.as_slice().unwrap_or(&[]).to_vec();
+
+    let seq_len = token_ids.len();
+    let softcap = arch.attn_logit_softcapping().unwrap_or(0.0);
+    let qk_norm = arch.attn_q_norm_key(0).is_some();
+
+    backend.reset_kv_cache();
+    {
+        let kv_shapes: Vec<(usize, usize)> = (0..num_layers)
+            .map(|l| (arch.num_kv_heads_for_layer(l), arch.head_dim_for_layer(l)))
+            .collect();
+        backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
+    }
+
+    let h_vec = backend.prefill_q4(&layers, &x, hidden, intermediate, seq_len, qk_norm, softcap)?;
+
+    let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
+    let last = h_2d.shape()[0] - 1;
+    Some(h_2d.slice(ndarray::s![last..=last, ..]).to_owned())
+}
+
+/// Metal-fused single-token decode: run one token through all layers via
+/// the backend's fused `decode_token` kernel, using the K/V cache
+/// populated by a prior [`metal_fused_prefill`] call on the same backend.
+///
+/// Returns `None` for CPU backends (no fused `decode_token` impl) and
+/// for vindex shapes the fused pipeline can't handle. Public counterpart
+/// to [`predict_q4k_decode_step_direct`] for the Metal side.
+pub fn metal_fused_decode_step(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    token_id: u32,
+    backend: &dyn ComputeBackend,
+) -> Option<Array2<f32>> {
+    use crate::layer_graph::pipeline_layer::build_pipeline_layers;
+    use larql_vindex::GateIndex;
+
+    let gate_index: &dyn GateIndex = index;
+    let (q4_ffn_mmap, ffn_is_q4k) = if let Some(m) = gate_index.interleaved_q4k_mmap_ref() {
+        (m, true)
+    } else if let Some(m) = gate_index.interleaved_q4_mmap_ref() {
+        (m, false)
+    } else {
+        return None;
+    };
+
+    let hidden = weights.hidden_size;
+    let num_layers = weights.num_layers;
+    let intermediate = gate_index.num_features(0);
+
+    let ffn_format = if ffn_is_q4k {
+        larql_compute::QuantFormat::Q4_K
+    } else {
+        larql_compute::QuantFormat::Q4_0
+    };
+    let q4_ffn_per_matrix = ffn_format.packed_matrix_bytes(intermediate, hidden)?;
+
+    let layers = build_pipeline_layers(
+        weights,
+        index,
+        0..num_layers,
+        q4_ffn_mmap,
+        q4_ffn_per_matrix,
+        ffn_format,
+    );
+
+    let h_tok = crate::forward::embed_tokens_pub(weights, &[token_id]);
+    let x_dec: Vec<f32> = h_tok.row(0).to_vec();
+
+    let h_vec = backend.decode_token(&layers, &x_dec, hidden, intermediate)?;
+    Array2::from_shape_vec((1, hidden), h_vec).ok()
+}
+
+/// Production-path attention decode step reading **quantised** weights
+/// from the vindex (not f32 dequantised tensors). Same input/output
+/// shape as
+/// [`crate::attention::run_attention_block_decode_step_backend`], but
+/// reads `index.attn_q4k_layer_data(layer)` directly and dispatches
+/// the Q/K/V/O projections to the backend's native quantised matvec
+/// (today Q4K / Q4_KF / Q6K via `q4k_matvec_q8_input`). Extending to
+/// new quantised formats is internal to this function — the public
+/// signature stays format-agnostic.
+///
+/// Used by `StandardEngine`'s coarse path and by research engines
+/// (`MarkovResidual`, `UnlimitedContext`, `TurboQuant`) that want the
+/// production decode kernel without inheriting the per-layer dispatch
+/// trait's cached-K/V shape.
+///
+/// `h_new` must be a single-row residual (1 × hidden). Multi-row
+/// prefill is handled by `predict_q4k_prefill` (separate shape; the
+/// `q4k_` in that name is pre-existing debt — see ROADMAP U8/U9 for
+/// the broader quant-agnostic rename of the q4k_forward module).
+///
+/// Returns `None` if the layer has no quantised attention data in the
+/// index or if the backend's matvec for the format is unavailable.
+pub fn attention_decode_step_native(
     weights: &ModelWeights,
     index: &VectorIndex,
     // Kept on the helper signature for parity with the outer
@@ -510,6 +668,29 @@ fn run_attn_decode_step_q4k_direct(
     Some((h_post_attn, (k_concat, v_concat)))
 }
 
+/// One-row gated FFN block using direct native-quantised matvec on
+/// the vindex's compact bytes (Q4K / Q6K today). Mirrors
+/// [`crate::ffn::weight::dense_ffn_forward_backend`] but reads gate/up/
+/// down from the vindex slices and avoids the f32 staging — same
+/// production path that powers `larql run` / `larql bench --cpu` at
+/// ~24 tok/s on Gemma 3 4B Q4K (M3 Max, 8 threads).
+///
+/// Returns `None` if the vindex layer lacks compact FFN bytes or the
+/// architecture isn't supported by the direct-matvec path. Engines
+/// that get `None` fall back to whichever `FfnBackend` they have.
+///
+/// `h_post_attn` must be a single-row residual (1 × hidden). Public
+/// counterpart to [`attention_decode_step_native`] for the FFN side.
+pub fn ffn_decode_step_native(
+    weights: &ModelWeights,
+    index: &VectorIndex,
+    backend: &dyn ComputeBackend,
+    h_post_attn: &Array2<f32>,
+    layer: usize,
+) -> Option<Array2<f32>> {
+    run_ffn_decode_step_q4k_direct(weights, index, backend, h_post_attn, layer)
+}
+
 /// One-row gated FFN block using direct Q4_K/Q6_K matvec. Mirrors
 /// [`crate::ffn::weight::dense_ffn_forward_backend`] but reads gate/up/
 /// down from the vindex slices and avoids the f32 staging.
@@ -652,7 +833,7 @@ pub fn predict_q4k_decode_step_direct(
 
     for layer in 0..num_layers {
         let kv_entry = cache[layer].as_ref();
-        let (h_post_attn, new_kv) = run_attn_decode_step_q4k_direct(
+        let (h_post_attn, new_kv) = attention_decode_step_native(
             weights,
             index,
             backend,

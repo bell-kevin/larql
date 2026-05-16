@@ -19,8 +19,10 @@ mod tensors;
 mod walk_ffn;
 
 pub use cached::{
-    predict_q4k_decode_step, predict_q4k_decode_step_direct, predict_q4k_prefill,
-    supports_cached_decode, supports_direct_matvec_decode, CachedTimings, CpuKvCache,
+    attention_decode_step_native, ffn_decode_step_native, metal_fused_decode_step,
+    metal_fused_prefill, predict_q4k_decode_step, predict_q4k_decode_step_direct,
+    predict_q4k_prefill, supports_cached_decode, supports_direct_matvec_decode, CachedTimings,
+    CpuKvCache,
 };
 
 pub(crate) use generation::generate_q4k_cpu_constrained_streaming_sampled_with_eos;

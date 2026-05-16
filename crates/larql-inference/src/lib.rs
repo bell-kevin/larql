@@ -127,6 +127,27 @@ pub fn default_async_engine_backend() -> Box<dyn AsyncComputeBackend> {
     cpu_async_engine_backend()
 }
 
+/// Default compute backend as `Box<dyn ComputeBackend>` — Metal on
+/// macOS when the `metal` feature is enabled, CPU otherwise.
+///
+/// `larql_compute::default_backend()` lost its Metal auto-detection
+/// after the `larql-compute-metal` extraction (the comment in that
+/// function recommends callers construct `MetalBackend` directly).
+/// This factory restores the convenience for callers that want a
+/// runtime-detected GPU backend without `#[cfg(feature = "metal")]`
+/// gating in every call site — `larql bench --backends metal` uses it,
+/// engines that want a compute backend for `q4k_prefill_metal` /
+/// `q4k_decode_token` use it.
+pub fn default_compute_backend() -> Box<dyn larql_compute::ComputeBackend> {
+    #[cfg(feature = "metal")]
+    {
+        if let Some(metal) = larql_compute_metal::MetalBackend::new() {
+            return Box::new(metal);
+        }
+    }
+    larql_compute::cpu_backend()
+}
+
 /// Map a model's activation function to the compute-layer `Activation` enum.
 pub fn activation_from_arch(
     arch: &dyn larql_models::ModelArchitecture,

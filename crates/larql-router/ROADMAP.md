@@ -147,10 +147,10 @@ Both crates pass policy (2026-05-16):
 
 | Crate | Total | Files at 90% default | Debt baselines |
 |---|---|---|---|
-| `larql-router` | 92.81% | 18 of 19 | 1 (`grid/service.rs` 88%) |
+| `larql-router` | 93.17% | 19 of 20 | 1 (`grid/service.rs` 88%) |
 | `larql-router-protocol` | 91.36% | 1 of 1 | 0 |
 
-Router per-file (2026-05-16, post grid/ + tasks/rebalancer/ splits):
+Router per-file (2026-05-16, post ADR-0018 MoE expert routing):
 
 | File | Lines |
 |---|---|
@@ -161,18 +161,19 @@ Router per-file (2026-05-16, post grid/ + tasks/rebalancer/ splits):
 | `grid/testing.rs` | 100.00% |
 | `tasks/rebalancer/config.rs` | 100.00% |
 | `admin.rs` | 99.64% |
+| `metrics.rs` | 99.63% |
+| `grid/routing.rs` | 98.27% |
 | `cli_helpers.rs` | 98.53% |
-| `grid/routing.rs` | 97.84% |
-| `grid/replication.rs` | 97.47% |
-| `grid/mod.rs` | 97.37% |
-| `tasks/rebalancer/replication.rs` | 96.60% |
-| `tasks/rebalancer/eviction.rs` | 96.55% |
-| `tasks/rebalancer/mod.rs` | 96.43% |
-| `http.rs` | 96.03% |
+| `tasks/rebalancer/replication.rs` | 97.98% |
+| `grid/replication.rs` | 96.46% |
+| `grid/mod.rs` | ~97% |
+| `tasks/rebalancer/eviction.rs` | ~93% |
+| `tasks/rebalancer/mod.rs` | ~95% |
+| `http.rs` | 93.61% |
 | `tasks/rtt_probe.rs` | 94.86% |
 | `tasks/rebalancer/imbalance.rs` | 94.83% |
-| `tasks/rebalancer/hot_shard.rs` | 90.99% |
-| `grid/service.rs` | 88.59% (debt — gRPC streaming join handler, baseline 88%) |
+| `tasks/rebalancer/hot_shard.rs` | 92.00% |
+| `grid/service.rs` | 89.87% (debt — gRPC streaming join handler, baseline 88%) |
 | `main.rs` | (excluded — binary entry point) |
 
 Two file-system reorganizations landed on 2026-05-16:
@@ -509,59 +510,386 @@ Smoke-tested with the experiment's `config.example.json` —
 
 ---
 
-## P1 — Remaining
+## Next work — by theme
 
-_(none — Exp 53 shipped 2026-05-16, see below.)_
+Items are tagged **P1** (active or next-up), **P2** (well-defined,
+implementation sketch exists, 3-6 month horizon), **P3** (recognized
+future work, no concrete plan yet). Everything surfaced during the
+2026-05-16 doc/spec review is folded in.
+
+P1 is **empty by default** — items move into P1 only when explicitly
+chosen as next work. The candidate pool below is the menu.
 
 ---
 
-## P2 — Forward-looking
+### Theme: Dense model sharding
 
-### Cross-router federation
+The router's bread-and-butter use case — pipeline-parallel models
+across many hosts.
 
-Multiple routers cover different geographic regions. A client request is
-forwarded to the regional router that owns the model shard. Requires a
-router-to-router protocol (reuse `GridService.Join` with a `RouterMsg`
-variant, or a separate `FederationService`). No implementation planned
-until Act 2 multi-host demo is complete.
+**Shipped:** ADR-0003 (static `--shards`), ADR-0004 P1–5
+(self-assembling grid), ADR-0011 (Mode B + replication), ADR-0014
+(hot-shard load-rate replication), ADR-0013 (routing comparator).
 
-### Expert-level routing
+**P2 — well-defined, implementable:**
 
-Current routing is at the layer granularity (server owns a layer range).
-For MoE models, a server could own a subset of experts within a layer,
-not a range of layers. This requires the router to know expert IDs, not
-just layer IDs. Proto messages already have `model_id` and
-`layer_start/end`; extending to expert ranges is additive. ADR-0003
-§Phase 2 covers this.
+- **Auto-shard planner.** Given a `vindex` + N hosts with declared
+  RAM budgets, compute a layer assignment that minimises shard-size
+  variance under the per-host memory cap. Today the operator picks
+  `--layers` manually per host; auto-plan would mean the router (or a
+  one-shot `larql-router plan` command) emits a recommended map.
+- **Heterogeneous-aware routing.** Server announce carries a `host_kind`
+  hint (e.g. `gpu_metal`, `gpu_cuda`, `cpu`). The 3-tier comparator
+  gains a 0th tier that prefers GPU hosts for compute-heavy layers
+  (`lm_head`, attention) and CPU hosts for FFN-only shards. Extends
+  ADR-0013 with a layer-kind classifier.
+- **Mid-flight resharding without packet drop.** Today's
+  drain-then-reassign (ADR-0011 Phase B2) is operator-driven via
+  `admin assign`. P2 makes it traffic-driven: if a host's
+  `ram_used / ram_total` exceeds a threshold AND a spare with more
+  RAM exists in the available pool, the rebalancer initiates a
+  drain-and-reassign on the smaller host. Requires safe handover —
+  spare needs to be `Ready` before the original is `Unassign`ed.
 
-_(RTT-based routing moved to Shipped — see entry below.)_
+**P3 — speculative:**
 
-### Cross-references — V1 / V2 work (other crates, tracked here for grid context)
+- **Tensor parallelism (single layer split across hosts).** Current
+  model is layer-pipeline; tensor-parallel would split a single
+  attention head across hosts. Major proto surgery (per-head IDs,
+  partial-residual aggregation) — only worth it for models that
+  don't fit on a single host even at one-layer-per-host granularity.
+- **Cross-host KV cache reuse.** Attention layers cache K/V per
+  prefix. If a prefix is shared across requests (system prompt,
+  common preamble), routing same-prefix requests to the same host
+  reuses the cache. Needs sticky session routing keyed on prefix
+  hash.
 
-These don't live in the router crate but bear on what the grid will be
-asked to serve. Listed here so they're visible alongside transport / shard
-work.
+---
 
-- **Exp 27 — hash routing across all layers (V1).** Top-2048 mask, 100%
-  argmax recovered at KL=0.030 at L0 on Gemma 3 4B. Maps to
-  `ROADMAP_STATUS` item #2 — "V1 hash routing across all layers". The
-  L0 result is interp-validated; scaling across layers and architectures
-  is the next step. Touches `larql-inference` / `larql-vindex`, not the
-  router; the router's interest is in the resulting vindex shape (FFN
-  rows become sparse-addressable, which changes shard-size economics).
+### Theme: MoE model sharding and routing
+
+**Shipped (ADR-0018, 2026-05-16):**
+
+- **Proto extension** — `AnnounceMsg` / `ReadyMsg` / `AssignMsg`
+  carry `expert_start` / `expert_end`. Dense servers send `0/0`;
+  MoE shards advertise a contiguous expert range.
+- **`ServerEntry::owns_expert(expert_id)` + `is_dense()`** — every
+  helper that filters by expert ID short-circuits when the server is
+  dense, so dense routing pays zero extra cost.
+- **`route_expert(model, layer, expert_id)` + `route_all_experts`** —
+  three-tier comparator (ADR-0013) over the filtered candidate set.
+- **HTTP shape** — `/v1/walk-ffn` accepts `{layer, experts: [...]}`
+  or `{layer_experts: [{layer, experts}, ...]}` alongside the
+  existing dense shapes. MoE dispatch is grid-only; static `--shards`
+  servers see a 503.
+- **Replication keys widen to 5-tuples** — `under/over_replicated_ranges`,
+  `find_origin_for`, `try_assign_gap`, `effective_target_for`,
+  `send_assign_to_named_available`, `least_loaded_in_range` all key
+  on `(model, layer_start, layer_end, expert_start, expert_end)`.
+  Two shards sharing a layer range but owning different experts are
+  treated as distinct slices.
+- **Hot-shard elevation set widens** — `hot_layer_ranges`,
+  `mark_elevated`, `demote_elevated`, `elevated_ranges_snapshot` all
+  emit/take 5-tuples. Hot saturation on one expert-shard elevates
+  only that shard, not its sibling.
+- **`larql_router_grid_shard_kind{kind=dense|moe}`** — bounded-
+  cardinality Prometheus gauge for grid-wide MoE health.
+- **Coverage** — 19/20 files at 90%+ post-MoE, total 93.29%.
+- **Dense regression** — all 202 pre-MoE tests still green; bench
+  shows dense `route()` within ±10% of the pre-MoE baseline (the
+  expert filter is a single boolean check on a dense `ServerEntry`).
+
+**Target deployment scale (per ADR-0018 §Target deployments):**
+DeepSeek-V3 (671B / 60 layers × 256 experts), Kimi K2 / K2.6
+(~1T-class), DeepSeek-V4 (≥1T). One physical host per (single
+layer, expert-subset) shard; route table stays tractable because the
+route_table is keyed on `(model, layer)` and expert filtering happens
+inline.
+
+**P2 — future MoE extensions:**
+
+- **Expert affinity routing.** Same expert ID routes to same host
+  repeatedly so the host's KV/MLP cache stays warm. Adds a 4th tier
+  to the routing comparator. Deferred from ADR-0018 — needs real
+  workload data showing the cache-warmth signal is meaningful.
+
+**P3 — needs more discovery:**
+
+- **Expert specialization with refusal.** Hosts may load a subset of
+  experts and `Refuse` requests for experts they don't own. Today's
+  `RefuseMsg` is for Mode B assignment refusal; expert-level refusal
+  is a new semantic.
+- **Binary wire format v2 with expert IDs.** Today's binary protocol
+  is dense-only (ADR-0018 §"Binary protocol stays single-dimension").
+  ADR-0009 (wire-format evolution) is the spec hook.
+- **Admin RPC `AssignRangeRequest` expert fields.** Today's admin
+  `assign` is dense-only. Additive proto change, no design surprises.
+
+---
+
+### Theme: Splitting large models (deployment-time concerns)
+
+How an operator actually gets a 26B / 70B / 405B model running on a
+heterogeneous cluster.
+
+**Shipped:** Static `--shards` + Mode B available pool.
+
+**P1 — gap surfaced in this session:**
+
+- **Vindex shard-download endpoint.** `AssignMsg` carries an
+  `origin_url`; the spare downloads the matching slice. Confirm the
+  server-side `GET /v1/shard/{model}/{start}-{end}` endpoint exists
+  and is documented in router-spec.md. (Today the assign path assumes
+  the spare can resolve the URL; the actual served endpoint needs an
+  audit pass.)
+- **Multi-host deploy walkthrough.** `docs/hot-shard-demo.md` covers a
+  single-host topology; a real 2-host LAN deployment doesn't have a
+  step-by-step doc. Build one alongside the existing demo script.
+
+**P2 — extends auto-shard planner:**
+
+- **Large-model bootstrap timeline.** Warm-up loading curve, vindex
+  preload, attention buffer allocation under shard ownership. Today's
+  Mode B path treats "Ready" as a single event; large models would
+  benefit from progress reporting (`LoadingMsg { pct }`) so the
+  rebalancer doesn't see a 10-minute load as a 10-minute stall.
+- **Disk + RAM constraint solver.** Available-pool advertises
+  `ram_bytes` and `disk_bytes` but `try_assign_gap` only checks RAM.
+  Add disk gating so spares without enough disk for the vindex slice
+  are skipped.
+
+**P3 — future:**
+
+- **Multi-vindex models** — different layers loaded from different
+  `.vindex` files. Useful for fine-tuning experiments (swap one
+  layer's weights to compare). Today each server loads exactly one
+  vindex.
+
+---
+
+### Theme: Self-healing grid
+
+Replication + gap-fill + stale eviction cover the happy reliability
+paths. The gaps are in **partial-failure** and **adversarial-load**
+scenarios.
+
+**Shipped:** Stale-heartbeat eviction (ADR-0011), replication ticks,
+gap-fill on Dropping/disconnect (ADR-0004 P2), Phase B2 drain-then-
+reassign (ADR-0011), hot-shard load-rate replication (ADR-0014),
+two-threshold hot-shard hysteresis (ADR-0014 amendment, demote at
+0.8×T), backpressure filter in `route()` /
+`route_expert()` (ADR-0020, `--saturation-ceiling N`,
+`larql_router_route_saturation_total` counter, 503 with
+`Retry-After: 0.5` on saturated dispatch), long-running chaos test
+(`tests/test_grid_chaos.rs`, 5,000 random churn ticks × 2 variants,
+asserts ledger consistency + coverage floor + no `route()` panic).
+
+**P1 — reliability gaps surfaced in reviews:**
+
+**P2:**
+
+- **Multi-failure recovery scenarios.** Stress-test with N
+  simultaneous failures (3+ servers crash at once). Today's
+  rebalancer ticks every 30 s by default; in a 3-server-fail event
+  the gap-fill and replicate paths fire in the same tick — verify
+  ordering doesn't dispatch two AssignMsgs for the same range.
+- **Network partition tolerance.** Router-server unreachable but
+  server-server reachable. Today the router would deregister servers
+  it can't see. A "partition-suspected" mode could hold deregistration
+  for K seconds to avoid mass-eviction on a switch flap.
+- **Cascade-failure isolation.** A slow shard backs up requests
+  upstream; without a hop-budget circuit-breaker the slow shard's
+  upstream peers also slow down. Add a fail-fast hop budget to
+  `walk-ffn`.
+
+**P3:**
+
+- **Split-brain protection for multi-router deployments.** Two
+  routers both think they're authoritative for the same grid; they
+  could send conflicting `AssignMsg` to the same available server.
+  Resolution needs either consensus (raft over a small router set)
+  or sticky-leader (one router authoritative per `model_id`).
+
+---
+
+### Theme: Latency (router on the hot path)
+
+Today's per-call wire RTT (`README.md` snapshot): TCP HTTP ~660 µs,
+UDS HTTP ~510 µs, gRPC streaming ~460 µs. Across a 30-layer model
+sharded into 2 hosts (15 hops × 2 = 30 layers serial), wire alone is
+~14 ms — a meaningful chunk of decode time.
+
+**Shipped:** 3-tier route() (ADR-0013), GT3 layer-latency in
+heartbeats, active-probe RTT, 110 ns route() in production-shape
+benches, connection pool tuning.
+
+**P1 — biggest near-term win:**
+
+- **Speculative next-layer prefetch.** While layer N's response is
+  being received, send the layer N+1 request to its owning shard.
+  Halves wire latency on serial walks. Requires careful handling on
+  the response side (don't apply N+1 until N is applied to the
+  residual) but the dispatch can pipeline freely.
+
+**P2:**
+
+- **Wire RTT budget audit.** Real measurement of where the 460 µs is
+  going (gRPC framing, TLS, socket queueing, axum middleware).
+  Likely yields actionable per-stage optimisations.
+- **Connection-pool tuning at scale.** Current
+  `pool_max_idle_per_host(16)` was chosen for 2-shard deployments.
+  At 20+ shards the pool churn dominates. Auto-size based on observed
+  shard count?
+- **Native UDS for same-host shards.** When router + server are on
+  the same host (single-box dev mode), Unix domain sockets shave
+  ~150 µs per call vs loopback TCP. Detect same-host via
+  `listen_url` and prefer UDS when available.
+
+**P3:**
+
+- **Real HTTP/3 with per-stream independence.** Today's GT7 (ADR-0010)
+  wraps HTTP/2 over a single QUIC bi-stream — fine for the one-stream
+  `Join` call, but for expert fan-out (8 parallel streams per token)
+  HoL blocking on one stream stalls the rest. Real HTTP/3 (via the
+  `h3` crate + hyper-h3) unlocks per-stream independence. Only worth
+  it once expert routing is shipped — the fan-out has to exist before
+  the HoL cost matters.
+
+---
+
+### Theme: Throughput / speed
+
+Latency is per-request; throughput is requests/sec at p99. The
+router rarely bottlenecks throughput on its own (route() is
+constant-time), but rebalancer and wire decisions shape what the
+fleet can sustain.
+
+**Shipped:** Bench harness (ADR-0012 GT9), production-shape +
+worst-case bench scenarios.
+
+**P1 — bench-driven:**
+
+- **Concurrent-route bench.** Today's `routing.rs` bench is
+  single-threaded. Add a `route_concurrent` group that drives
+  `route()` from N parallel tokio tasks against a single
+  `Arc<RwLock<GridState>>`. Surfaces lock contention before
+  production does.
+- **Per-shard concurrency cap.** Hot-shard elevation reacts to
+  `req_per_sec` but doesn't *cap* a shard. A misconfigured client
+  flooding one shard can knock it over. Per-shard semaphore in the
+  client-side dispatch path, or a server-side cap reported back.
+
+**P2:**
+
+- **Batched walk-ffn.** Today each layer is a separate HTTP call to
+  its owning shard. If three consecutive layers all live on the
+  same shard, batching them into one call halves overhead per
+  three-layer run. Existing `route_all` already returns the layer-
+  to-url map; the dispatch side needs to group same-URL layers
+  before issuing requests.
+- **Wire format options (GT8 from ADR-0012).** f16 / i8 residuals
+  cut wire bytes proportionally. f16 is the obvious win (2× wire
+  reduction, ~no quality loss); i8 is a step further with
+  quantisation error to characterise.
+- **GT10 from ADR-0012 — CI regression gate.** A shell script that
+  runs a stored baseline and fails the build if throughput or tail
+  latency regresses beyond thresholds. ADR-0012 sketched this;
+  not implemented.
+
+**P3:**
+
+- **GPU-aware throughput tuning.** Once heterogeneous routing exists,
+  the rebalancer can pack GPU hosts to a higher utilisation target
+  than CPU hosts.
+- **FP4 wire format (post-V2 generality).** Quarters wire bytes per
+  Exp 26 result; needs the V2 generality work in `larql-vindex`
+  before it's safe to ship as default.
+
+---
+
+### Theme: Operability (observability, admin, deployment)
+
+The router currently emits logs and exposes a status RPC. Production
+operations need more.
+
+**Shipped:** Admin CLI (ADR-0004 P5) — `status` / `gaps` / `drain` /
+`assign`. Hot-shard demo doc.
+
+**Shipped:**
+
+- **Prometheus `/metrics` endpoint** ✅ shipped 2026-05-16
+  (ADR-0017). Counters for grid registers/deregisters (split by
+  reason), rebalancer-tick outcomes (replicate / drop / elevate /
+  demote / evict / unassign_imbalance), RTT probe outcomes
+  (success / non_2xx / error), walk-ffn requests (success /
+  error_4xx / error_5xx). Histogram for walk-ffn end-to-end
+  duration. Gauges (refreshed at each rebalancer tick) for server
+  count, distinct models, coverage gaps, elevated ranges,
+  configured `--target-replicas`. Bounded cardinality — no
+  `model_id` / `server_id` / `layer_id` labels. Unauth, same
+  trust model as `/v1/health`.
+
+**P2:**
+
+- **JSON output mode for admin commands.** `larql-router status --json`
+  for dashboard ingestion. `format_status` already separates rendering
+  from data — slot a JSON serializer alongside the text one.
+- **Multi-host deploy walkthrough doc.** Mirrors
+  `docs/hot-shard-demo.md` but for a 2-box LAN topology, including
+  TLS setup, firewall ports, and the `--quic-cert-fingerprint` flow.
+- **`larql-router metrics` admin subcommand.** Dumps current
+  Prometheus-style metrics to stdout for one-shot capture in
+  scripts. Built on the same endpoint as above.
+
+**P3:**
+
+- **Web dashboard.** Axum-served minimal HTML, live grid state +
+  rebalancer event stream. Probably worth it once metrics +
+  multi-host docs are out.
+- **Per-layer tau in ShardService (ADR-0015 open question).** Today
+  tau is per-server; per-layer would mean tuning each layer's cache
+  hit rate independently. Wait for usage data showing it matters.
+
+---
+
+### Theme: Cross-router federation (P2 originally)
+
+Stays at P2 — well-defined but no implementation planned until Act 2
+multi-host demo is complete. Multiple routers cover different
+geographic regions; a client request is forwarded to the regional
+router that owns the model shard. Requires either:
+
+- a `RouterMsg` variant on `GridService.Join` so routers join each
+  other's grids, or
+- a separate `FederationService` for router-to-router routing decisions.
+
+Probably blocks on the multi-host deploy walkthrough (Operability P2)
+and on real cross-region perf data (Latency P2).
+
+---
+
+## Cross-references — workspace-level (other crates)
+
+These don't live in the router crate but shape what the grid is asked
+to serve. Tracked here so they're visible alongside router work.
+
+- **Decode/prefill perf gap.** Per `crates/larql-router/README.md`
+  perf snapshot: local Metal decode 86 tok/s vs ollama 98.7 tok/s
+  (1.15× behind on decode). Per memory: prefill 4-14× behind ollama
+  depending on prompt length. Lives in `larql-inference` /
+  `larql-compute`; router only sees the result.
+- **Compute crate split** (in flight, parallel session). Metal lifted
+  out into `larql-compute-metal` sibling crate. Brief workspace
+  resolver hiccup observed mid-session; resolved by 2026-05-16 EOD.
+- **Exp 27 — hash routing across all layers (V1).** Top-2048 mask,
+  100% argmax recovered at KL=0.030 at L0 on Gemma 3 4B
+  (`ROADMAP_STATUS` item #2). L0 result is interp-validated; scaling
+  across layers and architectures is the next step. Router's interest
+  is in the resulting vindex shape — FFN rows become sparse-
+  addressable, which changes shard-size economics.
 - **Exp 26 — FP4 generality (V2).** `gemma3-4b-f16.vindex` is **99.83%
   per-feature block R<16-compliant natively, no QAT**; `down` is the
-  long tail at 99.65%. Maps to `ROADMAP_STATUS` item #3 — "V2 FP4
-  generality". Extending the audit script across architectures is the
-  next step. Touches `larql-vindex` extraction; router impact is that
-  FP4 shards quarter the wire-bytes-per-tok metric tracked by the bench
+  long tail at 99.65% (`ROADMAP_STATUS` item #3). Extending the audit
+  script across architectures is the next step. Router impact: FP4
+  shards quarter the wire-bytes-per-tok metric tracked by the bench
   harness.
-
----
-
-### Real HTTP/3 (post-GT7)
-
-GT7 wraps HTTP/2 over a single QUIC bi-stream — fine for the one-stream
-`Join` call. For expert fan-out (8 parallel streams per token), real
-HTTP/3 (via the `h3` crate + hyper-h3) would unlock per-stream
-independence and avoid one stream's HoL stalling the others.

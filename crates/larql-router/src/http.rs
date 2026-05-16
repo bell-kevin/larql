@@ -20,6 +20,7 @@ use crate::dispatch::{
     unique_candidate_urls,
 };
 use crate::grid::GridState;
+use crate::metrics::{encode_metrics_text, RouterMetrics};
 use crate::shards::{find_shard_for_layer, peek_binary, Shard};
 
 /// Content-Type used by the FFN binary protocol. JSON requests use the
@@ -33,6 +34,18 @@ pub struct AppState {
     pub static_shards: Vec<Shard>,
     pub grid: Option<Arc<RwLock<GridState>>>,
     pub client: reqwest::Client,
+    /// ADR-0017 — shared metrics registry. `None` disables
+    /// observation (used by some integration tests that don't need
+    /// the dependency); production paths always carry a value.
+    pub metrics: Option<Arc<RouterMetrics>>,
+    /// ADR-0019 — optional HTTP/3 shard transport. When `Some(...)`,
+    /// the MoE expert fan-out path dispatches through h3 instead of
+    /// reqwest. The dense path keeps reqwest unchanged because the
+    /// HTTP/3 win (per-stream independence) only matters for
+    /// parallel per-token fan-outs. Always `None` when the crate is
+    /// built without the `http3` feature.
+    #[cfg(feature = "http3")]
+    pub h3_client: Option<Arc<larql_router_protocol::transport::h3::H3Client>>,
 }
 
 impl AppState {
@@ -79,7 +92,36 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/walk-ffn", post(handle_walk_ffn))
         .route("/v1/health", get(handle_health))
         .route("/v1/stats", get(handle_stats))
+        .route("/metrics", get(handle_metrics))
         .with_state(state)
+}
+
+/// ADR-0017 — Prometheus text-format `/metrics` endpoint. Unauth,
+/// same model as `/v1/health`. Returns 503 with a short body when
+/// the router was built without a metrics registry (test harness).
+pub async fn handle_metrics(State(state): State<Arc<AppState>>) -> Response {
+    let Some(metrics) = &state.metrics else {
+        return Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body("metrics registry not installed".to_string().into())
+            .unwrap();
+    };
+    match encode_metrics_text(metrics) {
+        Ok(text) => Response::builder()
+            .status(StatusCode::OK)
+            .header(
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            )
+            .body(text.into())
+            .unwrap(),
+        Err(e) => Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(format!("metrics encode failed: {e}").into())
+            .unwrap(),
+    }
 }
 
 // ── Handlers ────────────────────────────────────────────────────────────────
@@ -89,6 +131,28 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 /// building a full HTTP request.
 pub fn is_binary_content_type(ct: &str) -> bool {
     ct.starts_with(BINARY_CT)
+}
+
+/// ADR-0018 — request shape after parsing. JSON bodies can be **dense**
+/// (just `layer` / `layers`) or **MoE** (`experts` / `layer_experts`).
+/// Binary bodies are always dense.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestSpec {
+    /// Plain layer list — every owning shard runs the full layer's FFN.
+    Dense(Vec<usize>),
+    /// Per-layer expert list — the gate scorer upstream emits sparse
+    /// `(layer, expert_ids)` pairs and the router dispatches to each
+    /// expert-shard.
+    Moe(Vec<(usize, Vec<u32>)>),
+}
+
+impl RequestSpec {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Dense(layers) => layers.is_empty(),
+            Self::Moe(pairs) => pairs.is_empty() || pairs.iter().all(|(_, exs)| exs.is_empty()),
+        }
+    }
 }
 
 /// Pull layer IDs and optional `model_id` out of a request body. For
@@ -101,27 +165,102 @@ pub fn extract_layers_and_model_id(
     body: &[u8],
     is_binary: bool,
 ) -> Result<(Vec<usize>, Option<String>), String> {
+    match extract_request_spec_and_model_id(body, is_binary)? {
+        (RequestSpec::Dense(layers), model_id) => Ok((layers, model_id)),
+        (RequestSpec::Moe(_), _) => Err(
+            "MoE request (`experts`/`layer_experts`) is not accepted on the dense \
+             code path; use `handle_walk_ffn`"
+                .to_string(),
+        ),
+    }
+}
+
+/// ADR-0018 — dispatch-shape parser. Handles both dense and MoE JSON
+/// shapes; binary bodies are always dense.
+///
+/// JSON MoE shapes (in priority order — first match wins):
+///   - `{"layer_experts": [{"layer": L, "experts": [...]}, ...]}`
+///   - `{"layer": L, "experts": [...]}`
+///
+/// JSON dense shapes (fallback):
+///   - `{"layers": [...]}`
+///   - `{"layer": L}`
+///
+/// `model_id` is optional in every shape.
+pub fn extract_request_spec_and_model_id(
+    body: &[u8],
+    is_binary: bool,
+) -> Result<(RequestSpec, Option<String>), String> {
     if is_binary {
+        // ADR-0018: binary protocol stays dense-only. A future v2 wire
+        // format with expert IDs is tracked under ADR-0009.
         let layers =
             peek_binary(body).ok_or_else(|| "binary: truncated or malformed header".to_string())?;
-        Ok((layers, None))
-    } else {
-        let peek: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
-        let layers: Vec<usize> = if let Some(arr) = peek.get("layers").and_then(|v| v.as_array()) {
-            arr.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as usize))
-                .collect()
-        } else if let Some(n) = peek.get("layer").and_then(|v| v.as_u64()) {
-            vec![n as usize]
-        } else {
-            return Err("must provide 'layer' or 'layers'".into());
-        };
-        let model_id = peek
-            .get("model_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        Ok((layers, model_id))
+        return Ok((RequestSpec::Dense(layers), None));
     }
+
+    let peek: Value = serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let model_id = peek
+        .get("model_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // MoE — multi-layer form takes priority over the single-layer form
+    // because `layer_experts` is unambiguous.
+    if let Some(arr) = peek.get("layer_experts").and_then(|v| v.as_array()) {
+        let mut pairs: Vec<(usize, Vec<u32>)> = Vec::with_capacity(arr.len());
+        for item in arr {
+            let layer = item
+                .get("layer")
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| "layer_experts: each entry needs a 'layer' field".to_string())?
+                as usize;
+            let experts_arr = item
+                .get("experts")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| "layer_experts: each entry needs an 'experts' array".to_string())?;
+            let experts: Vec<u32> = experts_arr
+                .iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u32))
+                .collect();
+            if experts.is_empty() {
+                return Err(format!(
+                    "layer_experts: empty 'experts' array for layer {layer}"
+                ));
+            }
+            pairs.push((layer, experts));
+        }
+        return Ok((RequestSpec::Moe(pairs), model_id));
+    }
+
+    // MoE — single-layer form.
+    if let Some(arr) = peek.get("experts").and_then(|v| v.as_array()) {
+        let layer = peek
+            .get("layer")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "moe: 'experts' requires a 'layer' scalar".to_string())?
+            as usize;
+        let experts: Vec<u32> = arr
+            .iter()
+            .filter_map(|e| e.as_u64().map(|n| n as u32))
+            .collect();
+        if experts.is_empty() {
+            return Err("moe: 'experts' array is empty".into());
+        }
+        return Ok((RequestSpec::Moe(vec![(layer, experts)]), model_id));
+    }
+
+    // Dense fallback.
+    let layers: Vec<usize> = if let Some(arr) = peek.get("layers").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|v| v.as_u64().map(|n| n as usize))
+            .collect()
+    } else if let Some(n) = peek.get("layer").and_then(|v| v.as_u64()) {
+        vec![n as usize]
+    } else {
+        return Err("must provide 'layer' or 'layers'".into());
+    };
+    Ok((RequestSpec::Dense(layers), model_id))
 }
 
 /// `POST /v1/walk-ffn` entry point. Errors are normalised to JSON
@@ -131,15 +270,41 @@ pub async fn handle_walk_ffn(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
-    match handle_walk_ffn_inner(state, request).await {
+    // ADR-0017 — observe duration + status. The timer starts before
+    // the inner handler runs and stops on every exit path, including
+    // early errors.
+    let timer = state.metrics.as_ref().map(|m| {
+        m.walk_ffn_duration_seconds
+            .with_label_values(&[])
+            .start_timer()
+    });
+    let result = handle_walk_ffn_inner(state.clone(), request).await;
+    if let Some(t) = timer {
+        t.observe_duration();
+    }
+    if let Some(m) = &state.metrics {
+        let label = match &result {
+            Ok(_) => "success",
+            Err((status, _)) if status.is_client_error() => "error_4xx",
+            Err(_) => "error_5xx",
+        };
+        m.walk_ffn_requests_total.with_label_values(&[label]).inc();
+    }
+    match result {
         Ok(r) => r,
         Err((status, msg)) => {
             let body = format!(r#"{{"error":{}}}"#, serde_json::Value::String(msg));
-            Response::builder()
+            let mut builder = Response::builder()
                 .status(status)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap()
+                .header(header::CONTENT_TYPE, "application/json");
+            // ADR-0020 — clients can use Retry-After to back off from
+            // a saturated router rather than hammering it. 0.5s
+            // matches the doc default; any 503 emitted by this
+            // handler is currently saturation-driven.
+            if status == StatusCode::SERVICE_UNAVAILABLE {
+                builder = builder.header(header::RETRY_AFTER, "0.5");
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
         }
     }
 }
@@ -159,20 +324,53 @@ async fn handle_walk_ffn_inner(
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("read body: {e}")))?;
 
-    let (layers, model_id_owned) = extract_layers_and_model_id(&body_bytes, is_binary)
+    let (spec, model_id_owned) = extract_request_spec_and_model_id(&body_bytes, is_binary)
         .map_err(|m| (StatusCode::BAD_REQUEST, m))?;
 
-    if layers.is_empty() {
+    if spec.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "empty layer list".to_string()));
     }
 
+    // ADR-0018 — MoE dispatch branches off here. Dense path continues
+    // through the rest of the function unchanged.
+    if let RequestSpec::Moe(pairs) = &spec {
+        return handle_moe_dispatch(state, model_id_owned.as_deref(), pairs).await;
+    }
+    let layers: Vec<usize> = match spec {
+        RequestSpec::Dense(l) => l,
+        RequestSpec::Moe(_) => unreachable!("handled above"),
+    };
+
     let mid = model_id_owned.as_deref();
-    let layer_urls = state.resolve_all(mid, &layers).await.map_err(|missing| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("layer {missing} has no owning shard in this router"),
-        )
-    })?;
+    let layer_urls = match state.resolve_all(mid, &layers).await {
+        Ok(map) => map,
+        Err(missing) => {
+            // ADR-0020 — distinguish "no shard owns this layer"
+            // (400) from "shards own it but all are saturated"
+            // (503). Saturation increments a counter so operators
+            // can see the load-shedding signal.
+            let saturated = match &state.grid {
+                Some(grid) => grid.read().await.has_owners_for(mid, missing as u32),
+                None => false,
+            };
+            if saturated {
+                if let Some(m) = &state.metrics {
+                    m.route_saturation_total.inc();
+                }
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "layer {missing}: every replica is at or above the configured \
+                         saturation ceiling — retry shortly"
+                    ),
+                ));
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("layer {missing} has no owning shard in this router"),
+            ));
+        }
+    };
 
     let unique_urls: std::collections::HashSet<&String> = layer_urls.values().collect();
 
@@ -234,6 +432,184 @@ async fn handle_walk_ffn_inner(
         .header(header::CONTENT_TYPE, "application/json")
         .body(axum::body::Body::from(json_bytes))
         .unwrap())
+}
+
+/// ADR-0018 — MoE dispatch path. For each `(layer, [experts])` entry:
+///
+///   1. Resolve every `(layer, expert)` pair to its owning shard via
+///      `GridState::route_all_experts`. Grid-only — MoE has no static
+///      shard fallback.
+///   2. Group the pairs by destination URL so each shard gets one
+///      sub-request carrying every `(layer, expert)` it owns from this
+///      call.
+///   3. Build a JSON body per shard in the same `layer_experts` shape
+///      the caller sent.
+///   4. Fan out in parallel; merge responses with the existing
+///      [`merge_shard_responses`] envelope.
+///
+/// Routing requires a live grid — MoE deployments never use static
+/// `--shards`. If `state.grid` is `None` the handler 503s with a
+/// helpful message.
+async fn handle_moe_dispatch(
+    state: Arc<AppState>,
+    model_id: Option<&str>,
+    pairs: &[(usize, Vec<u32>)],
+) -> Result<Response, (StatusCode, String)> {
+    let Some(grid) = &state.grid else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "MoE routing requires a self-assembling grid (--grid-port); \
+             this router was started in static --shards-only mode"
+                .to_string(),
+        ));
+    };
+
+    // Flatten the (layer, [experts]) list into individual (layer, expert)
+    // pairs that route_all_experts can resolve.
+    let flat: Vec<(usize, u32)> = pairs
+        .iter()
+        .flat_map(|(layer, experts)| experts.iter().map(move |&e| (*layer, e)))
+        .collect();
+
+    let layer_expert_urls = {
+        let guard = grid.read().await;
+        guard
+            .route_all_experts(model_id, &flat)
+            .map_err(|(layer, expert)| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no shard owns (layer {layer}, expert {expert}) in this router"),
+                )
+            })?
+    };
+
+    // Group (layer, expert) pairs by destination URL → per-shard
+    // sub-request payload.
+    let mut by_url: HashMap<String, HashMap<usize, Vec<u32>>> = HashMap::new();
+    for ((layer, expert), url) in &layer_expert_urls {
+        by_url
+            .entry(url.clone())
+            .or_default()
+            .entry(*layer)
+            .or_default()
+            .push(*expert);
+    }
+
+    let mut handles = Vec::new();
+    for (url, layer_to_experts) in by_url {
+        let layer_experts_json: Vec<Value> = layer_to_experts
+            .into_iter()
+            .map(|(layer, mut experts)| {
+                experts.sort_unstable();
+                serde_json::json!({ "layer": layer, "experts": experts })
+            })
+            .collect();
+        let mut sub_body = serde_json::Map::new();
+        if let Some(mid) = model_id {
+            sub_body.insert("model_id".into(), Value::String(mid.to_string()));
+        }
+        sub_body.insert("layer_experts".into(), Value::Array(layer_experts_json));
+        let sub_body = Value::Object(sub_body);
+
+        // ADR-0019 — when the operator opted into `--http3-shards`,
+        // dispatch the MoE sub-request through h3 instead of
+        // reqwest. h3 gives per-stream independence over QUIC, which
+        // is the whole point: parallel per-token expert sub-requests
+        // to the same shard stop blocking each other on TCP HoL.
+        #[cfg(feature = "http3")]
+        if let Some(h3) = state.h3_client.clone() {
+            handles.push(tokio::spawn(dispatch_via_h3(h3, url.clone(), sub_body)));
+            continue;
+        }
+
+        let client = state.client.clone();
+        let target = format!("{url}/v1/walk-ffn");
+        handles.push(tokio::spawn(async move {
+            client
+                .post(&target)
+                .json(&sub_body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?
+                .json::<Value>()
+                .await
+                .map_err(|e| e.to_string())
+        }));
+    }
+
+    let mut responses = Vec::with_capacity(handles.len());
+    for h in handles {
+        match h.await {
+            Ok(Ok(v)) => responses.push(v),
+            Ok(Err(e)) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("MoE sub-request to shard failed: {e}"),
+                ))
+            }
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("MoE dispatch task join: {e}"),
+                ))
+            }
+        }
+    }
+
+    let merged = merge_shard_responses(&responses);
+    let body = serde_json::to_vec(&merged)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("encode: {e}")))?;
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap())
+}
+
+/// ADR-0019 — issue one MoE sub-request via the HTTP/3 transport.
+///
+/// Parses the shard URL (`http://host:port` or `https://host:port`)
+/// into the `(SocketAddr, server_name)` pair that
+/// [`larql_router_protocol::transport::h3::H3Client::post_json`]
+/// expects, serializes the JSON body, and returns the parsed
+/// response. Feature-gated under `http3` so the dense build never
+/// pays the h3 dispatch cost.
+#[cfg(feature = "http3")]
+async fn dispatch_via_h3(
+    client: Arc<larql_router_protocol::transport::h3::H3Client>,
+    shard_url: String,
+    body: Value,
+) -> Result<Value, String> {
+    // `shard_url` looks like `http://10.0.0.11:8080` or `http://shard-a:8080`.
+    // Strip scheme, split host:port, resolve to a SocketAddr. h3 ignores
+    // the URL scheme; what matters is the UDP socket + SNI name.
+    let trimmed = shard_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let (host, port_str) = trimmed
+        .rsplit_once(':')
+        .ok_or_else(|| format!("shard URL {shard_url:?} missing :port"))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|e| format!("shard URL {shard_url:?} bad port: {e}"))?;
+
+    use std::net::ToSocketAddrs;
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("no address for {host}:{port}"))?;
+
+    let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("encode body: {e}"))?;
+    let resp = client
+        .post_json(addr, host, "/v1/walk-ffn", body_bytes.into())
+        .await
+        .map_err(|e| format!("h3 post: {e}"))?;
+    if resp.status >= 400 {
+        return Err(format!("shard returned HTTP {}", resp.status));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| format!("decode response: {e}"))
 }
 
 /// Forward raw bytes to a shard, passing the Content-Type header through.
@@ -369,5 +745,99 @@ mod tests {
         let body = br#"{"layers":[0,"oops",2]}"#;
         let (layers, _) = extract_layers_and_model_id(body, false).unwrap();
         assert_eq!(layers, vec![0, 2]);
+    }
+
+    // ── ADR-0018: extract_request_spec_and_model_id ─────────────────────────
+
+    #[test]
+    fn extract_spec_dense_single_layer() {
+        let body = br#"{"layer":3}"#;
+        let (spec, model) = extract_request_spec_and_model_id(body, false).unwrap();
+        assert_eq!(spec, RequestSpec::Dense(vec![3]));
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_spec_dense_multi_layer() {
+        let body = br#"{"layers":[0,1,2],"model_id":"m"}"#;
+        let (spec, model) = extract_request_spec_and_model_id(body, false).unwrap();
+        assert_eq!(spec, RequestSpec::Dense(vec![0, 1, 2]));
+        assert_eq!(model.as_deref(), Some("m"));
+    }
+
+    #[test]
+    fn extract_spec_moe_single_layer() {
+        let body = br#"{"layer":5,"experts":[0,3,7]}"#;
+        let (spec, model) = extract_request_spec_and_model_id(body, false).unwrap();
+        assert_eq!(spec, RequestSpec::Moe(vec![(5, vec![0, 3, 7])]));
+        assert!(model.is_none());
+    }
+
+    #[test]
+    fn extract_spec_moe_multi_layer() {
+        let body =
+            br#"{"layer_experts":[{"layer":5,"experts":[0,3]},{"layer":6,"experts":[1,5]}]}"#;
+        let (spec, _) = extract_request_spec_and_model_id(body, false).unwrap();
+        assert_eq!(
+            spec,
+            RequestSpec::Moe(vec![(5, vec![0, 3]), (6, vec![1, 5])])
+        );
+    }
+
+    #[test]
+    fn extract_spec_moe_layer_experts_takes_priority_over_single_form() {
+        // If both shapes are present, the multi-layer form wins.
+        let body = br#"{"layer":99,"experts":[0],"layer_experts":[{"layer":5,"experts":[0,3]}]}"#;
+        let (spec, _) = extract_request_spec_and_model_id(body, false).unwrap();
+        assert_eq!(spec, RequestSpec::Moe(vec![(5, vec![0, 3])]));
+    }
+
+    #[test]
+    fn extract_spec_moe_experts_without_layer_errors() {
+        let body = br#"{"experts":[0,3]}"#;
+        let err = extract_request_spec_and_model_id(body, false).unwrap_err();
+        assert!(err.contains("requires a 'layer'"));
+    }
+
+    #[test]
+    fn extract_spec_moe_empty_experts_errors() {
+        let body = br#"{"layer":5,"experts":[]}"#;
+        let err = extract_request_spec_and_model_id(body, false).unwrap_err();
+        assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn extract_spec_moe_layer_experts_missing_field_errors() {
+        let body = br#"{"layer_experts":[{"layer":5}]}"#;
+        let err = extract_request_spec_and_model_id(body, false).unwrap_err();
+        assert!(err.contains("'experts' array"));
+    }
+
+    #[test]
+    fn extract_spec_binary_is_always_dense() {
+        // Binary bodies bypass JSON parsing entirely.
+        // Encode "single layer 9": just 4 LE bytes of u32 = 9.
+        let body = (9u32).to_le_bytes();
+        let (spec, _) = extract_request_spec_and_model_id(&body, true).unwrap();
+        assert_eq!(spec, RequestSpec::Dense(vec![9]));
+    }
+
+    #[test]
+    fn request_spec_is_empty_branches() {
+        assert!(RequestSpec::Dense(vec![]).is_empty());
+        assert!(!RequestSpec::Dense(vec![0]).is_empty());
+        assert!(RequestSpec::Moe(vec![]).is_empty());
+        // All-empty experts → still treated as empty.
+        assert!(RequestSpec::Moe(vec![(5, vec![])]).is_empty());
+        assert!(!RequestSpec::Moe(vec![(5, vec![1])]).is_empty());
+    }
+
+    #[test]
+    fn extract_layers_legacy_helper_rejects_moe_bodies() {
+        // The dense-only wrapper around the new parser surfaces a clean
+        // error for MoE bodies rather than silently accepting them.
+        let body = br#"{"layer":5,"experts":[0]}"#;
+        let err = extract_layers_and_model_id(body, false).unwrap_err();
+        assert!(err.contains("MoE request"));
     }
 }

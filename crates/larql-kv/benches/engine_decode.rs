@@ -134,6 +134,83 @@ fn bench_engine_vs_legacy_generation(c: &mut Criterion) {
         });
     });
 
+    // A5: async dispatch on `CpuBackend` is a degenerate `Ready*` wrapper.
+    // Expected: bit-identical token stream + tok/s within criterion noise
+    // of the sync path. Confirms the `BackendSlot::Async` branch +
+    // `Ready*` handle allocations don't introduce overhead on the CPU
+    // path (the only path that matters until A4 lands real Metal
+    // deferred dispatch).
+    group.bench_function("engine_dispatch_standard_async", |b| {
+        use larql_inference::AsyncComputeBackend;
+        b.iter(|| {
+            let backend: Box<dyn AsyncComputeBackend> = Box::new(larql_compute::CpuBackend);
+            let mut engine = StandardEngine::with_async_backend(None, backend);
+            generate_with_engine(
+                &mut engine as &mut dyn larql_kv::KvEngine,
+                &weights,
+                &tokenizer,
+                &ffn,
+                &prompt,
+                max,
+                |_, _| {},
+            );
+        });
+    });
+
+    group.finish();
+}
+
+/// Compares the per-layer dispatch helpers directly: sync vs async on
+/// CpuBackend. Isolates the `attention_*_async` + `read_hidden` + `flush`
+/// overhead from the surrounding generate-loop / sampling work.
+fn bench_helpers_sync_vs_async(c: &mut Criterion) {
+    use larql_inference::kv_dispatch::helpers::{
+        kv_decode_step_via_dispatch, kv_decode_step_via_dispatch_async, kv_prefill_via_dispatch,
+        kv_prefill_via_dispatch_async,
+    };
+
+    let weights = make_test_weights();
+    let ffn = WeightFfn { weights: &weights };
+    let prompt: Vec<u32> = (0..8).collect();
+    let cpu = larql_compute::CpuBackend;
+
+    let mut group = c.benchmark_group("helpers");
+
+    group.bench_function("prefill_sync", |b| {
+        b.iter(|| {
+            let _ = kv_prefill_via_dispatch(&cpu, &weights, &ffn, &prompt, None).unwrap();
+        });
+    });
+
+    group.bench_function("prefill_async", |b| {
+        b.iter(|| {
+            let _ = kv_prefill_via_dispatch_async(&cpu, &weights, &ffn, &prompt, None).unwrap();
+        });
+    });
+
+    group.bench_function("decode_step_sync", |b| {
+        let (_, mut handles) =
+            kv_prefill_via_dispatch(&cpu, &weights, &ffn, &prompt, None).unwrap();
+        let mut pos = prompt.len();
+        b.iter(|| {
+            let _ =
+                kv_decode_step_via_dispatch(&cpu, &weights, &ffn, &mut handles, 1, pos, None);
+            pos += 1;
+        });
+    });
+
+    group.bench_function("decode_step_async", |b| {
+        let (_, mut handles) =
+            kv_prefill_via_dispatch_async(&cpu, &weights, &ffn, &prompt, None).unwrap();
+        let mut pos = prompt.len();
+        b.iter(|| {
+            let _ = kv_decode_step_via_dispatch_async(
+                &cpu, &weights, &ffn, &mut handles, 1, pos, None,
+            );
+            pos += 1;
+        });
+    });
+
     group.finish();
 }
 
@@ -142,5 +219,6 @@ criterion_group!(
     bench_prefill,
     bench_decode_step,
     bench_engine_vs_legacy_generation,
+    bench_helpers_sync_vs_async,
 );
 criterion_main!(benches);

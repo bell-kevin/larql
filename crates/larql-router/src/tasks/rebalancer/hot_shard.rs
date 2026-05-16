@@ -1,7 +1,21 @@
-//! Hot-shard detection tick: marks ranges whose `req/sec` crosses
-//! the configured threshold as elevated, and demotes ranges that have
-//! cooled. The follow-on `check_under_replication` /
-//! `check_over_replication` ticks act on the new effective targets —
+//! Hot-shard detection tick with two-threshold hysteresis
+//! (ADR-0014 amendment, 2026-05-16).
+//!
+//! Marks slices whose `req/sec` crosses `threshold` as elevated and
+//! demotes elevated slices that have cooled below
+//! `threshold × demote_ratio`. The two-threshold pattern prevents
+//! the elevation flag from oscillating on tick-to-tick boundaries
+//! when traffic hovers around the elevation cutoff — a single
+//! threshold would mark+demote+mark+demote each tick at the
+//! boundary, churning replicas for no net change in load.
+//!
+//! With `demote_ratio = 0.8` (default), an elevation that fired at
+//! 200 req/s only reverses once the rate drops below 160 req/s.
+//! Real cool-downs (10× drop) demote immediately; noise around the
+//! threshold doesn't.
+//!
+//! The follow-on `check_under_replication` /
+//! `check_over_replication` ticks act on the new effective targets;
 //! this function does not send any messages itself.
 
 use std::collections::HashSet;
@@ -10,29 +24,68 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::grid::GridState;
+use crate::metrics::RouterMetrics;
 
-pub(super) async fn check_hot_shards(state: &Arc<RwLock<GridState>>, threshold: f32) {
+pub(super) async fn check_hot_shards(
+    state: &Arc<RwLock<GridState>>,
+    threshold: f32,
+    demote_ratio: f32,
+    metrics: Option<&RouterMetrics>,
+) {
     let mut guard = state.write().await;
-    let hot: HashSet<(String, u32, u32)> = guard.hot_layer_ranges(threshold).into_iter().collect();
-    let elevated: HashSet<(String, u32, u32)> =
+
+    // Slices currently exceeding the *elevation* threshold.
+    let hot: HashSet<(String, u32, u32, u32, u32)> =
+        guard.hot_layer_ranges(threshold).into_iter().collect();
+    let elevated: HashSet<(String, u32, u32, u32, u32)> =
         guard.elevated_ranges_snapshot().into_iter().collect();
 
-    for range in hot.difference(&elevated) {
-        guard.mark_elevated(&range.0, range.1, range.2);
+    // ADR-0014 amendment — hysteresis.
+    //   Elevate side  : slice crossed the *full* `threshold`.
+    //   Demote side   : slice fell below `threshold × demote_ratio`
+    //                   (i.e. it is *not* in `hot_at_demote_threshold`).
+    // The middle band (`threshold × demote_ratio` ≤ rate ≤ `threshold`)
+    // is the no-op zone: previously-elevated slices stay elevated,
+    // previously-non-elevated stay non-elevated.
+    let demote_threshold = threshold * demote_ratio;
+    let still_hot_for_demote_check: HashSet<(String, u32, u32, u32, u32)> = guard
+        .hot_layer_ranges(demote_threshold)
+        .into_iter()
+        .collect();
+
+    for slice in hot.difference(&elevated) {
+        guard.mark_elevated(&slice.0, slice.1, slice.2, slice.3, slice.4);
         tracing::info!(
-            model_id = %range.0,
-            layers = %format!("{}-{}", range.1, range.2),
+            model_id = %slice.0,
+            layers = %format!("{}-{}", slice.1, slice.2),
+            experts = %format!("{}-{}", slice.3, slice.4),
             threshold,
             "Rebalancer: hot shard detected — effective_target raised by 1"
         );
+        if let Some(m) = metrics {
+            m.rebalancer_actions_total
+                .with_label_values(&["elevate"])
+                .inc();
+        }
     }
-    for range in elevated.difference(&hot) {
-        guard.demote_elevated(&range.0, range.1, range.2);
+    // Demote only slices that have cooled BELOW the demote threshold.
+    // `elevated.difference(&still_hot_for_demote_check)` is exactly
+    // the set of elevated slices whose rate is now below
+    // `threshold × demote_ratio`.
+    for slice in elevated.difference(&still_hot_for_demote_check) {
+        guard.demote_elevated(&slice.0, slice.1, slice.2, slice.3, slice.4);
         tracing::info!(
-            model_id = %range.0,
-            layers = %format!("{}-{}", range.1, range.2),
+            model_id = %slice.0,
+            layers = %format!("{}-{}", slice.1, slice.2),
+            experts = %format!("{}-{}", slice.3, slice.4),
+            demote_threshold,
             "Rebalancer: hot shard cooled — effective_target restored"
         );
+        if let Some(m) = metrics {
+            m.rebalancer_actions_total
+                .with_label_values(&["demote"])
+                .inc();
+        }
     }
 }
 
@@ -44,6 +97,105 @@ mod tests {
     use larql_router_protocol::{RouterMessage, RouterPayload};
 
     #[tokio::test]
+    async fn check_hot_shards_bumps_elevate_demote_counters() {
+        // Drives both the elevate and demote metric branches in one test.
+        use crate::metrics::{encode_metrics_text, RouterMetrics};
+        let m = RouterMetrics::new();
+
+        let state = Arc::new(RwLock::new(GridState::default()));
+        {
+            let mut g = state.write().await;
+            let mut a = entry("a", "http://a", "m", 0, 4);
+            a.req_per_sec = 50.0;
+            g.register(a);
+        }
+        // Hot → elevate counter bumps to 1.
+        check_hot_shards(&state, 20.0, 0.8, Some(&m)).await;
+        // Cool the replica + re-run → demote counter bumps to 1.
+        {
+            let mut g = state.write().await;
+            g.update_heartbeat("a", 0.0, 0, 0, vec![], 0.0);
+        }
+        check_hot_shards(&state, 20.0, 0.8, Some(&m)).await;
+
+        let text = encode_metrics_text(&m).unwrap();
+        assert!(text.contains("larql_router_rebalancer_actions_total{action=\"elevate\"} 1"));
+        assert!(text.contains("larql_router_rebalancer_actions_total{action=\"demote\"} 1"));
+    }
+
+    /// ADR-0014 amended hysteresis: a slice that's elevated stays
+    /// elevated while its rate sits in the middle band
+    /// `(threshold × demote_ratio, threshold]`. Only falling below
+    /// the demote threshold reverses the elevation.
+    #[tokio::test]
+    async fn check_hot_shards_hysteresis_holds_in_middle_band() {
+        let state = Arc::new(RwLock::new(GridState::default()));
+        {
+            let mut g = state.write().await;
+            let mut a = entry("a", "http://a", "m", 0, 4);
+            a.req_per_sec = 25.0; // > threshold (20) → elevates
+            g.register(a);
+        }
+        // First tick: above 20, elevates.
+        check_hot_shards(&state, 20.0, 0.8, None).await;
+        {
+            let g = state.read().await;
+            assert_eq!(g.elevated_ranges_snapshot().len(), 1, "must elevate");
+        }
+        // Drop rate to 18 — *above* demote threshold (20 × 0.8 = 16)
+        // but below elevation threshold. Without hysteresis this
+        // would demote. With hysteresis it stays elevated.
+        {
+            let mut g = state.write().await;
+            g.update_heartbeat("a", 0.0, 0, 0, vec![], 18.0);
+        }
+        check_hot_shards(&state, 20.0, 0.8, None).await;
+        {
+            let g = state.read().await;
+            assert_eq!(
+                g.elevated_ranges_snapshot().len(),
+                1,
+                "hysteresis: middle-band rate must NOT demote"
+            );
+        }
+        // Drop below demote threshold (16) → now demotes.
+        {
+            let mut g = state.write().await;
+            g.update_heartbeat("a", 0.0, 0, 0, vec![], 10.0);
+        }
+        check_hot_shards(&state, 20.0, 0.8, None).await;
+        {
+            let g = state.read().await;
+            assert!(
+                g.elevated_ranges_snapshot().is_empty(),
+                "rate below demote threshold must demote"
+            );
+        }
+    }
+
+    /// Disabling hysteresis (`demote_ratio = 1.0`) reproduces the
+    /// pre-ADR-0014-amendment single-threshold behavior — any drop
+    /// below the elevation threshold demotes immediately.
+    #[tokio::test]
+    async fn check_hot_shards_ratio_one_disables_hysteresis() {
+        let state = Arc::new(RwLock::new(GridState::default()));
+        {
+            let mut g = state.write().await;
+            let mut a = entry("a", "http://a", "m", 0, 4);
+            a.req_per_sec = 50.0;
+            g.register(a);
+        }
+        check_hot_shards(&state, 20.0, 1.0, None).await; // elevate
+        {
+            let mut g = state.write().await;
+            g.update_heartbeat("a", 0.0, 0, 0, vec![], 19.999); // just below
+        }
+        check_hot_shards(&state, 20.0, 1.0, None).await; // demotes
+        let g = state.read().await;
+        assert!(g.elevated_ranges_snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn check_hot_shards_marks_newly_hot_ranges() {
         let state = Arc::new(RwLock::new(GridState::default()));
         {
@@ -52,11 +204,11 @@ mod tests {
             a.req_per_sec = 50.0;
             g.register(a);
         }
-        check_hot_shards(&state, 20.0).await;
+        check_hot_shards(&state, 20.0, 0.8, None).await;
         let g = state.read().await;
         assert_eq!(
             g.elevated_ranges_snapshot(),
-            vec![("m".to_string(), 0, 4)],
+            vec![("m".to_string(), 0, 4, 0, 0)],
             "range above threshold must be elevated"
         );
     }
@@ -70,9 +222,9 @@ mod tests {
             let mut a = entry("a", "http://a", "m", 0, 4);
             a.req_per_sec = 1.0;
             g.register(a);
-            assert!(g.mark_elevated("m", 0, 4));
+            assert!(g.mark_elevated("m", 0, 4, 0, 0));
         }
-        check_hot_shards(&state, 20.0).await;
+        check_hot_shards(&state, 20.0, 0.8, None).await;
         let g = state.read().await;
         assert!(
             g.elevated_ranges_snapshot().is_empty(),
@@ -95,10 +247,13 @@ mod tests {
             cool.req_per_sec = 1.0;
             g.register(cool);
         }
-        check_hot_shards(&state, 20.0).await;
-        check_hot_shards(&state, 20.0).await;
+        check_hot_shards(&state, 20.0, 0.8, None).await;
+        check_hot_shards(&state, 20.0, 0.8, None).await;
         let g = state.read().await;
-        assert_eq!(g.elevated_ranges_snapshot(), vec![("m".to_string(), 0, 4)],);
+        assert_eq!(
+            g.elevated_ranges_snapshot(),
+            vec![("m".to_string(), 0, 4, 0, 0)],
+        );
     }
 
     #[tokio::test]
@@ -119,8 +274,8 @@ mod tests {
             g.register_available("spare".into(), spare_tx, 1, 0, "/".into());
         }
         // Hot detection + spare pull (mirrors rebalancer_task ordering).
-        check_hot_shards(&state, 50.0).await;
-        check_under_replication(&state).await;
+        check_hot_shards(&state, 50.0, 0.8, None).await;
+        check_under_replication(&state, None).await;
 
         let pulled = spare_rx
             .try_recv()
@@ -144,8 +299,8 @@ mod tests {
             // Existing replica also cools.
             g.update_heartbeat("a", 0.0, 0, 0, vec![], 0.5);
         }
-        check_hot_shards(&state, 50.0).await;
-        check_over_replication(&state).await;
+        check_hot_shards(&state, 50.0, 0.8, None).await;
+        check_over_replication(&state, None).await;
 
         // Either of the two replicas (extra or a) is least-loaded; the
         // important thing is that one Unassign fires for layers 0-4. If

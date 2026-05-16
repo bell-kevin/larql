@@ -395,3 +395,316 @@ mod activation_support_tests {
         assert_metal_activation_supported(Activation::GeluTanh, "test");
     }
 }
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use crate::MetalBackend;
+    use larql_compute::QuantFormat;
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    fn fixture(
+        m: &MetalBackend,
+        seq_len: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> (
+        Buffer, // gate_buf / up_buf / down_buf (zeros; format-agnostic)
+        Buffer, // ffn_norm_out (f32 input)
+        Buffer, // ffn_q8_in
+        Buffer, // ffn_q8s_in
+        Buffer, // gate_scratch
+        Buffer, // up_scratch
+        Buffer, // act_scratch
+        Buffer, // down_out
+    ) {
+        let weight_bytes = vec![0u8; 1024 * 1024];
+        let gate_buf = m.bufs.transient_from_bytes(&weight_bytes);
+        let ffn_norm_out = m.bufs.transient_from_f32(&vec![0.0f32; seq_len * hidden]);
+        let ffn_q8_in = m.bufs.transient_from_i8(&vec![0i8; seq_len * hidden]);
+        let ffn_q8s_in = m
+            .bufs
+            .transient_from_f32(&vec![0.0f32; seq_len * (hidden / 32)]);
+        let gate_scratch = m.bufs.output((seq_len * inter * 4) as u64);
+        let up_scratch = m.bufs.output((seq_len * inter * 4) as u64);
+        let act_scratch = m.bufs.output((seq_len * inter * 4) as u64);
+        let down_out = m.bufs.output((seq_len * hidden * 4) as u64);
+        (
+            gate_buf,
+            ffn_norm_out,
+            ffn_q8_in,
+            ffn_q8s_in,
+            gate_scratch,
+            up_scratch,
+            act_scratch,
+            down_out,
+        )
+    }
+
+    fn pipes<'a>(m: &'a MetalBackend) -> quant_matvec::Pipelines<'a> {
+        quant_matvec::Pipelines {
+            q4kf_proj: Some(&m.attention.q4kf_proj_pipeline.state),
+            q4k_matvec_fallback: &m.quant.q4k_matvec_pipeline,
+            q6k_matvec: &m.quant.q6k_matvec_pipeline,
+            q4_matvec: &m.q4.matvec,
+            q4k_matmul: Some(&m.quant.q4k_matmul_pipeline),
+        }
+    }
+
+    fn empty_fused<'a>() -> FusedGegluDown<'a> {
+        FusedGegluDown {
+            q4k_silu: None,
+            q4k_gelu_tanh: None,
+            q6k_silu: None,
+            q6k_gelu_tanh: None,
+        }
+    }
+
+    /// `encode_gated` with `LARQL_FUSED_DOWN=0` falls through to the
+    /// separated GEGLU + format-aware down path.  Covers the long
+    /// tail of `encode_gated` past line 236.
+    #[test]
+    fn encode_gated_separated_path_silu() {
+        let m = backend();
+        let seq_len = 1usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let (gate_buf, _norm, q8_in, q8s_in, gate_s, up_s, act_s, down_out) =
+            fixture(&m, seq_len, hidden, inter);
+        let pipes = pipes(&m);
+
+        // Pre-populate gate/up scratch with a non-zero pre-GEGLU
+        // input so the activation kernel writes something.
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_gated(
+            enc,
+            &pipes,
+            &m.ffn.geglu_pipeline,
+            &m.ffn.geglu_gelu_tanh_pipeline,
+            empty_fused(),
+            QuantFormat::Q4_K, // gate format
+            QuantFormat::Q4_K, // up format
+            QuantFormat::Q4_K, // down format
+            Activation::Silu,
+            &gate_buf,
+            &gate_buf,
+            &gate_buf,
+            &_norm,
+            &q8_in,
+            &q8s_in,
+            &gate_s,
+            &up_s,
+            &act_s,
+            &down_out,
+            seq_len,
+            inter,
+            hidden,
+            (hidden * 4) as u64,
+            (inter * 4) as u64,
+            (hidden) as u64,
+            (hidden / 32 * 4) as u64,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    /// Same shape, GeluTanh activation — covers the `Activation::GeluTanh`
+    /// arms in both `geglu_pipeline_for` (line 57) and
+    /// `activation_pipeline_for` (line 71).
+    #[test]
+    fn encode_gated_separated_path_gelu_tanh() {
+        let m = backend();
+        let seq_len = 1usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let (gate_buf, _norm, q8_in, q8s_in, gate_s, up_s, act_s, down_out) =
+            fixture(&m, seq_len, hidden, inter);
+        let pipes = pipes(&m);
+
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_gated(
+            enc,
+            &pipes,
+            &m.ffn.geglu_pipeline,
+            &m.ffn.geglu_gelu_tanh_pipeline,
+            empty_fused(),
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            Activation::GeluTanh,
+            &gate_buf,
+            &gate_buf,
+            &gate_buf,
+            &_norm,
+            &q8_in,
+            &q8s_in,
+            &gate_s,
+            &up_s,
+            &act_s,
+            &down_out,
+            seq_len,
+            inter,
+            hidden,
+            (hidden * 4) as u64,
+            (inter * 4) as u64,
+            (hidden) as u64,
+            (hidden / 32 * 4) as u64,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    /// `encode_gated` with `LARQL_FUSED_DOWN=1` + Q4_K down dispatches
+    /// the fused `q4k_geglu_silu_down` kernel directly.  Covers lines
+    /// 206-235 (fused-kernel branch).
+    #[test]
+    fn encode_gated_fused_q4k_silu_path() {
+        let m = backend();
+        let seq_len = 1usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let (gate_buf, _norm, q8_in, q8s_in, gate_s, up_s, act_s, down_out) =
+            fixture(&m, seq_len, hidden, inter);
+        let pipes = pipes(&m);
+
+        let fused = FusedGegluDown {
+            q4k_silu: Some(&m.ffn.q4k_geglu_silu_down_pipeline),
+            q4k_gelu_tanh: Some(&m.ffn.q4k_geglu_gelu_tanh_down_pipeline),
+            q6k_silu: Some(&m.ffn.q6k_geglu_silu_down_pipeline),
+            q6k_gelu_tanh: Some(&m.ffn.q6k_geglu_gelu_tanh_down_pipeline),
+        };
+
+        unsafe {
+            std::env::set_var(larql_compute::options::ENV_FUSED_DOWN, "1");
+        }
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_gated(
+            enc,
+            &pipes,
+            &m.ffn.geglu_pipeline,
+            &m.ffn.geglu_gelu_tanh_pipeline,
+            fused,
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            Activation::Silu,
+            &gate_buf,
+            &gate_buf,
+            &gate_buf,
+            &_norm,
+            &q8_in,
+            &q8s_in,
+            &gate_s,
+            &up_s,
+            &act_s,
+            &down_out,
+            seq_len,
+            inter,
+            hidden,
+            (hidden * 4) as u64,
+            (inter * 4) as u64,
+            (hidden) as u64,
+            (hidden / 32 * 4) as u64,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        unsafe {
+            std::env::remove_var(larql_compute::options::ENV_FUSED_DOWN);
+        }
+    }
+
+    /// `encode_standard` (non-gated FFN): up → activation → down.
+    /// Covers lines 278-358 (the whole encode_standard body).
+    #[test]
+    fn encode_standard_path() {
+        let m = backend();
+        let seq_len = 1usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let (gate_buf, norm, q8_in, q8s_in, _gate_s, up_s, act_s, down_out) =
+            fixture(&m, seq_len, hidden, inter);
+        let pipes = pipes(&m);
+
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_standard(
+            enc,
+            &pipes,
+            &m.ffn.silu_pipeline,
+            &m.ffn.gelu_tanh_pipeline,
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            Activation::Silu,
+            &gate_buf,
+            &gate_buf,
+            &norm,
+            &q8_in,
+            &q8s_in,
+            &up_s,
+            &act_s,
+            &down_out,
+            seq_len,
+            inter,
+            hidden,
+            (hidden * 4) as u64,
+            (inter * 4) as u64,
+            (hidden) as u64,
+            (hidden / 32 * 4) as u64,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    /// `encode_standard` with `Activation::GeluTanh` — covers the
+    /// `GeluTanh` arm of `activation_pipeline_for`.
+    #[test]
+    fn encode_standard_gelu_tanh_path() {
+        let m = backend();
+        let seq_len = 1usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let (gate_buf, norm, q8_in, q8s_in, _gate_s, up_s, act_s, down_out) =
+            fixture(&m, seq_len, hidden, inter);
+        let pipes = pipes(&m);
+
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_standard(
+            enc,
+            &pipes,
+            &m.ffn.silu_pipeline,
+            &m.ffn.gelu_tanh_pipeline,
+            QuantFormat::Q4_K,
+            QuantFormat::Q4_K,
+            Activation::GeluTanh,
+            &gate_buf,
+            &gate_buf,
+            &norm,
+            &q8_in,
+            &q8s_in,
+            &up_s,
+            &act_s,
+            &down_out,
+            seq_len,
+            inter,
+            hidden,
+            (hidden * 4) as u64,
+            (inter * 4) as u64,
+            (hidden) as u64,
+            (hidden / 32 * 4) as u64,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+}

@@ -105,6 +105,75 @@ impl StandardEngine {
             })
             .sum()
     }
+
+    /// Shared prefill body — both `prefill` (index=None) and
+    /// `prefill_q4k` (index=Some) route through here. Matches on the
+    /// `BackendSlot` to pick sync vs async dispatch.
+    fn do_prefill(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        token_ids: &[u32],
+        index: Option<&larql_inference::larql_vindex::VectorIndex>,
+    ) -> Option<Array2<f32>> {
+        let (hidden, handles) = match &self.backend {
+            BackendSlot::Sync(b) => kv_prefill_via_dispatch(
+                b.as_ref(),
+                weights,
+                ffn,
+                token_ids,
+                self.window_size,
+                index,
+            )?,
+            BackendSlot::Async(b) => kv_prefill_via_dispatch_async(
+                b.as_ref(),
+                weights,
+                ffn,
+                token_ids,
+                self.window_size,
+                index,
+            )?,
+        };
+        self.handles = Some(handles);
+        self.abs_position = token_ids.len();
+        Some(hidden)
+    }
+
+    /// Shared decode-step body — both `decode_step` (index=None) and
+    /// `decode_step_q4k` (index=Some) route through here.
+    fn do_decode_step(
+        &mut self,
+        weights: &ModelWeights,
+        ffn: &dyn FfnBackend,
+        token_id: u32,
+        index: Option<&larql_inference::larql_vindex::VectorIndex>,
+    ) -> Option<Array2<f32>> {
+        let handles = self.handles.as_mut()?;
+        let hidden = match &self.backend {
+            BackendSlot::Sync(b) => kv_decode_step_via_dispatch(
+                b.as_ref(),
+                weights,
+                ffn,
+                handles,
+                token_id,
+                self.abs_position,
+                self.window_size,
+                index,
+            )?,
+            BackendSlot::Async(b) => kv_decode_step_via_dispatch_async(
+                b.as_ref(),
+                weights,
+                ffn,
+                handles,
+                token_id,
+                self.abs_position,
+                self.window_size,
+                index,
+            )?,
+        };
+        self.abs_position += 1;
+        Some(hidden)
+    }
 }
 
 impl KvEngine for StandardEngine {
@@ -135,21 +204,7 @@ impl KvEngine for StandardEngine {
         ffn: &dyn FfnBackend,
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
-        let (hidden, handles) = match &self.backend {
-            BackendSlot::Sync(b) => {
-                kv_prefill_via_dispatch(b.as_ref(), weights, ffn, token_ids, self.window_size)?
-            }
-            BackendSlot::Async(b) => kv_prefill_via_dispatch_async(
-                b.as_ref(),
-                weights,
-                ffn,
-                token_ids,
-                self.window_size,
-            )?,
-        };
-        self.handles = Some(handles);
-        self.abs_position = token_ids.len();
-        Some(hidden)
+        self.do_prefill(weights, ffn, token_ids, None)
     }
 
     fn decode_step(
@@ -158,29 +213,77 @@ impl KvEngine for StandardEngine {
         ffn: &dyn FfnBackend,
         token_id: u32,
     ) -> Option<Array2<f32>> {
-        let handles = self.handles.as_mut()?;
-        let hidden = match &self.backend {
-            BackendSlot::Sync(b) => kv_decode_step_via_dispatch(
-                b.as_ref(),
-                weights,
-                ffn,
-                handles,
-                token_id,
-                self.abs_position,
-                self.window_size,
-            )?,
-            BackendSlot::Async(b) => kv_decode_step_via_dispatch_async(
-                b.as_ref(),
-                weights,
-                ffn,
-                handles,
-                token_id,
-                self.abs_position,
-                self.window_size,
-            )?,
+        self.do_decode_step(weights, ffn, token_id, None)
+    }
+
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+        _backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        // Try the backend's coarse (fused) prefill intent first — this
+        // is the production-speed Q4K path on CPU (~24 tok/s on Gemma
+        // 3 4B vs ~0.4 tok/s through per-layer dispatch). Quant-agnostic:
+        // the backend inspects `index` to pick the right kernel.
+        let coarse = match &self.backend {
+            BackendSlot::Sync(b) => b.as_ref().coarse_prefill(weights, token_ids, Some(index)),
+            BackendSlot::Async(b) => b.as_ref().coarse_prefill(weights, token_ids, Some(index)),
         };
-        self.abs_position += 1;
-        Some(hidden)
+        if let Some((hidden, handle)) = coarse {
+            // Store as a single-element handles vec — the `KvHandle`
+            // wraps the backend's whole-model cache (not per-layer).
+            self.handles = Some(vec![handle]);
+            self.abs_position = token_ids.len();
+            return Some(hidden);
+        }
+        // Backend doesn't have a coarse path (e.g. f32 model, or
+        // hybrid-MoE / cross-layer-KV models that don't fit the cached
+        // shape). Fall back to per-layer dispatch with dequant.
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        self.do_prefill(weights, ffn, token_ids, Some(index))
+    }
+
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+        _backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        let handles = self.handles.as_mut()?;
+        // If prefill_q4k used the coarse path, `handles` is a one-element
+        // vec carrying the backend's whole-model cache. Try the coarse
+        // decode step first.
+        if handles.len() == 1 {
+            let handle = &mut handles[0];
+            let coarse = match &self.backend {
+                BackendSlot::Sync(b) => b.as_ref().coarse_decode_step(
+                    weights,
+                    token_id,
+                    Some(index),
+                    handle,
+                    self.abs_position,
+                ),
+                BackendSlot::Async(b) => b.as_ref().coarse_decode_step(
+                    weights,
+                    token_id,
+                    Some(index),
+                    handle,
+                    self.abs_position,
+                ),
+            };
+            if let Some(h) = coarse {
+                self.abs_position += 1;
+                return Some(h);
+            }
+        }
+        // Per-layer dispatch fallback.
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        self.do_decode_step(weights, ffn, token_id, Some(index))
     }
 
     fn memory_bytes(&self) -> usize {
@@ -476,5 +579,108 @@ mod tests {
             "expected backend name to start with \"cpu\", got {:?}",
             engine.info().backend
         );
+    }
+
+    /// Multi-step parity proof: 64 decode steps through both sync and
+    /// async dispatch, asserting that *every* intermediate hidden state
+    /// is bit-identical. Catches subtle drift that the short-run tests
+    /// above would miss — e.g. a one-time K/V append difference, a
+    /// per-step accumulating error, a divergence that only surfaces
+    /// after many steps.
+    ///
+    /// This is the accuracy proof for A5: with `Ready*`-wrapped CPU
+    /// async, the two paths must produce identical output over a long
+    /// generation, not just a 4-token sample.
+    #[test]
+    fn async_parity_long_run_no_drift() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt: Vec<u32> = (0..16).collect();
+        let max_steps = 64;
+
+        let mut sync_engine = StandardEngine::new(None);
+        let sync_h0 = sync_engine
+            .prefill(&weights, &ffn, &prompt)
+            .expect("sync prefill");
+
+        let backend: Box<dyn AsyncComputeBackend> = Box::new(CpuBackend);
+        let mut async_engine = StandardEngine::with_async_backend(None, backend);
+        let async_h0 = async_engine
+            .prefill(&weights, &ffn, &prompt)
+            .expect("async prefill");
+
+        assert_eq!(
+            sync_h0, async_h0,
+            "prefill hidden must match bit-for-bit between sync and async dispatch"
+        );
+
+        let mut token = 1u32;
+        for step in 0..max_steps {
+            let sync_h = sync_engine
+                .decode_step(&weights, &ffn, token)
+                .expect("sync decode_step");
+            let async_h = async_engine
+                .decode_step(&weights, &ffn, token)
+                .expect("async decode_step");
+            assert_eq!(
+                sync_h, async_h,
+                "hidden mismatch at decode step {step} (token={token})"
+            );
+            let logits = larql_inference::forward::hidden_to_raw_logits(&weights, &sync_h);
+            token = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+        assert_eq!(
+            sync_engine.window_tokens(),
+            async_engine.window_tokens(),
+            "post-run cache size must match"
+        );
+        assert_eq!(
+            sync_engine.memory_bytes(),
+            async_engine.memory_bytes(),
+            "post-run cache memory must match"
+        );
+    }
+
+    /// Sliding-window variant of the long-run parity test. Different
+    /// code path through `clip_kv` per step; same accuracy contract.
+    #[test]
+    fn async_parity_long_run_windowed_no_drift() {
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt: Vec<u32> = (0..8).collect();
+        let max_steps = 64;
+        let window = Some(4);
+
+        let mut sync_engine = StandardEngine::new(window);
+        sync_engine.prefill(&weights, &ffn, &prompt).unwrap();
+
+        let backend: Box<dyn AsyncComputeBackend> = Box::new(CpuBackend);
+        let mut async_engine = StandardEngine::with_async_backend(window, backend);
+        async_engine.prefill(&weights, &ffn, &prompt).unwrap();
+
+        let mut token = 1u32;
+        for step in 0..max_steps {
+            let sync_h = sync_engine.decode_step(&weights, &ffn, token).unwrap();
+            let async_h = async_engine.decode_step(&weights, &ffn, token).unwrap();
+            assert_eq!(
+                sync_h, async_h,
+                "windowed hidden mismatch at decode step {step}"
+            );
+            let logits = larql_inference::forward::hidden_to_raw_logits(&weights, &sync_h);
+            token = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+        }
+        // Sliding window clips at the helper level — both should end at
+        // the same window size.
+        assert_eq!(sync_engine.window_tokens(), async_engine.window_tokens());
     }
 }

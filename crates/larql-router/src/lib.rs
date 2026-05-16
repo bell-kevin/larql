@@ -5,5 +5,6 @@ pub mod cli_helpers;
 pub mod dispatch;
 pub mod grid;
 pub mod http;
+pub mod metrics;
 pub mod shards;
 pub mod tasks;

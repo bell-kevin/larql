@@ -247,7 +247,7 @@ LARQL_COMPUTE_COVERAGE_REPORT ?= coverage/larql-compute/summary.json
 # crates/larql-compute-metal/coverage-policy.json with current debt
 # baselines locked at floor(measured) — see the policy_note for the
 # multi-day arc to ratchet these toward 90 (the goal).
-LARQL_COMPUTE_METAL_COVERAGE_MIN ?= 50
+LARQL_COMPUTE_METAL_COVERAGE_MIN ?= 73
 LARQL_COMPUTE_METAL_COVERAGE_POLICY ?= crates/larql-compute-metal/coverage-policy.json
 LARQL_COMPUTE_METAL_COVERAGE_REPORT ?= coverage/larql-compute-metal/summary.json
 
@@ -359,10 +359,10 @@ larql-compute-ci: larql-compute-fmt-check larql-compute-lint larql-compute-test-
 # ─────────────────────────────────────────────────────────────────
 
 larql-compute-metal-test:
-	cargo test -p larql-compute-metal --lib
+	cargo test -p larql-compute-metal --lib -- --test-threads=1
 
 larql-compute-metal-test-tests:
-	cargo test -p larql-compute-metal --tests
+	cargo test -p larql-compute-metal --tests -- --test-threads=1
 
 larql-compute-metal-check:
 	cargo check -p larql-compute-metal --lib
@@ -393,7 +393,7 @@ larql-compute-metal-coverage:
 		echo "  cargo install cargo-llvm-cov"; \
 		exit 1; \
 	fi
-	cargo llvm-cov --package larql-compute-metal --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN)
+	cargo llvm-cov --package larql-compute-metal --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN) -- --test-threads=1
 	@mkdir -p coverage/larql-compute-metal
 	cargo llvm-cov report --package larql-compute-metal --json --summary-only --output-path $(LARQL_COMPUTE_METAL_COVERAGE_REPORT)
 	$(MAKE) larql-compute-metal-coverage-policy
@@ -404,7 +404,11 @@ larql-compute-metal-coverage-summary:
 		echo "  cargo install cargo-llvm-cov"; \
 		exit 1; \
 	fi
-	cargo llvm-cov --package larql-compute-metal --summary-only --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN)
+	# `--test-threads=1` serialises env-sensitive tests across lib + tests/.
+	# Many flag tests (LARQL_QKV_FUSED, LARQL_GATE_UP_*, DECODE_DEBUG, etc.)
+	# touch process-global env vars; cargo's default parallel test runner
+	# races on them and drops a coverage binary per cycle.
+	cargo llvm-cov --package larql-compute-metal --summary-only --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN) -- --test-threads=1
 	@mkdir -p coverage/larql-compute-metal
 	cargo llvm-cov report --package larql-compute-metal --json --summary-only --output-path $(LARQL_COMPUTE_METAL_COVERAGE_REPORT)
 	$(MAKE) larql-compute-metal-coverage-policy
@@ -413,7 +417,7 @@ larql-compute-metal-coverage-html:
 	@if ! command -v cargo-llvm-cov >/dev/null 2>&1; then \
 		echo "cargo-llvm-cov not installed."; exit 1; \
 	fi
-	cargo llvm-cov --package larql-compute-metal --html --output-dir coverage/larql-compute-metal --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN)
+	cargo llvm-cov --package larql-compute-metal --html --output-dir coverage/larql-compute-metal --fail-under-lines $(LARQL_COMPUTE_METAL_COVERAGE_MIN) -- --test-threads=1
 	cargo llvm-cov report --package larql-compute-metal --json --summary-only --output-path $(LARQL_COMPUTE_METAL_COVERAGE_REPORT)
 	$(MAKE) larql-compute-metal-coverage-policy
 	@echo "Report: coverage/larql-compute-metal/html/index.html"
@@ -609,7 +613,7 @@ larql-router-protocol-coverage-summary:
 		echo "  cargo install cargo-llvm-cov"; \
 		exit 1; \
 	fi
-	cargo llvm-cov --package larql-router-protocol --features quic --summary-only --fail-under-lines $(LARQL_ROUTER_PROTOCOL_COVERAGE_MIN)
+	cargo llvm-cov --package larql-router-protocol --features http3 --summary-only --fail-under-lines $(LARQL_ROUTER_PROTOCOL_COVERAGE_MIN)
 	@mkdir -p coverage/larql-router-protocol
 	cargo llvm-cov report --package larql-router-protocol --json --summary-only --output-path $(LARQL_ROUTER_PROTOCOL_COVERAGE_REPORT)
 	$(MAKE) larql-router-protocol-coverage-policy

@@ -47,6 +47,13 @@ message AnnounceMsg {
   uint64 ram_bytes   = 4;
   string listen_url  = 5;  // "http://server-a:8080"
   string vindex_hash = 6;
+  // ADR-0018 — MoE expert ownership. `expert_count == 0` (both fields
+  // defaulted) means "dense, every layer is monolithic." When nonzero
+  // these advertise the *contiguous expert ID range* this server owns
+  // across all the layers it covers. Backward-compatible — old
+  // dense-only clients will send 0/0 and route via the dense path.
+  uint32 expert_start = 7;  // inclusive (meaningful only when expert_count > 0)
+  uint32 expert_end   = 8;  // inclusive (meaningful only when expert_count > 0)
 }
 
 message AvailableMsg {
@@ -60,6 +67,10 @@ message ReadyMsg {
   uint32 layer_start = 2;
   uint32 layer_end   = 3;
   string listen_url  = 4;
+  // ADR-0018 — MoE expert ownership for the freshly-loaded shard.
+  // Defaults 0/0 for dense.
+  uint32 expert_start = 5;
+  uint32 expert_end   = 6;
 }
 
 message LayerLatency {
@@ -111,6 +122,10 @@ message AssignMsg {
   uint32 layer_end   = 3;
   string origin_url  = 4;
   string shard_hash  = 5;
+  // ADR-0018 — MoE expert range the spare is being asked to load.
+  // Defaults 0/0 for dense assignments.
+  uint32 expert_start = 6;
+  uint32 expert_end   = 7;
 }
 
 message UnassignMsg {

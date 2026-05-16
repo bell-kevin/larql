@@ -4,18 +4,22 @@
 //! now live in `larql-vindex`. This module provides only WalkFfn
 //! (the FFN backend that uses vindex KNN for feature selection).
 
+pub mod dequant;
 pub mod l1_cache;
 mod loader;
 mod q4k_forward;
 mod walk_config;
 mod walk_ffn;
 
+pub use dequant::ensure_attn_tensors_dequantised;
 pub use l1_cache::FfnL1Cache;
 pub use loader::{open_inference_vindex, ENV_VINDEX_PATH};
 pub(crate) use q4k_forward::generate_q4k_cpu_constrained_streaming_sampled_with_eos;
 pub use q4k_forward::{
-    generate_q4k_cpu, generate_q4k_cpu_constrained, generate_q4k_cpu_constrained_streaming,
+    attention_decode_step_native, ffn_decode_step_native, generate_q4k_cpu,
+    generate_q4k_cpu_constrained, generate_q4k_cpu_constrained_streaming,
     generate_q4k_cpu_constrained_streaming_sampled, generate_q4k_cpu_remote,
+    metal_fused_decode_step, metal_fused_prefill,
     insert_q4k_layer_tensors, is_end_of_turn, predict_q4k, predict_q4k_decode_step,
     predict_q4k_decode_step_direct, predict_q4k_hidden, predict_q4k_hidden_hooked,
     predict_q4k_hidden_with_ffn, predict_q4k_hidden_with_mapped_head_residual_delta,

@@ -5,15 +5,32 @@ Layer-sharding router for distributed `larql-server` deployments.
 ## What it does
 
 Fans out `POST /v1/walk-ffn` calls across multiple `larql-server`
-shards, each owning a contiguous range of transformer layers, and
-aggregates their results. The router is intentionally narrow — it
-exposes only the endpoints needed for layer-fanout operation, not a
-full transparent reverse proxy:
+shards. Two sharding shapes are supported in a single router:
+
+- **Dense (layer-pipeline)** — each shard owns a contiguous range
+  of transformer layers (e.g. layers 0-14 on shard-a, 15-29 on
+  shard-b). Requests carry `{layer: N}` or `{layers: [...]}` and
+  the router resolves each layer to its owning shard.
+- **MoE (per-expert-shard)** — each shard owns a contiguous range
+  of *experts* within a layer range. Requests carry
+  `{layer: N, experts: [E1, E2, ...]}` or
+  `{layer_experts: [{layer, experts}, ...]}` and the router fans
+  out per-token to the owning expert-shard. Designed for trillion-
+  parameter MoE models (DeepSeek-V3/V4, Kimi K2 / K2.6) where a
+  host typically loads one layer's slice of experts.
+
+The router is intentionally narrow — it exposes only the endpoints
+needed for the fan-out, not a full transparent reverse proxy:
 
 - `POST /v1/walk-ffn` — single-layer or multi-layer fan-out across
   the shard map. Multi-layer requests are dispatched in parallel
   to each owning shard and the results merged.
 - `GET /v1/health` — liveness + grid coverage summary.
+- `GET /metrics` — Prometheus text-format scrape endpoint (ADR-0017).
+  Gauges for grid state (server count, gaps, elevation), counters
+  for rebalancer actions / RTT probe outcomes / walk-ffn requests,
+  and a histogram for `walk-ffn` end-to-end latency. Bounded
+  cardinality — no `model_id` / `server_id` / `layer_id` labels.
 
 Other endpoints (`/v1/stats`, `/v1/walk`, `/v1/models`, etc.) live on
 the individual shards — clients can call them directly on a shard's
@@ -112,6 +129,10 @@ End-to-end walkthrough: [`docs/hot-shard-demo.md`](./docs/hot-shard-demo.md)
 prints the rebalancer's elevation/cool-down log lines). The
 companion script is `scripts/demo-hot-shard.sh`.
 
+For a real multi-host LAN deployment (router + two shards across
+three boxes, with `--grid-key`, firewall rules, and an optional
+QUIC variant), see [`docs/multi-host-demo.md`](./docs/multi-host-demo.md).
+
 ### Admin CLI
 
 The same binary doubles as an admin client:
@@ -155,7 +176,9 @@ reconnect, TLS 1.3, and BBRv2 congestion control. Real HTTP/3
 | `--rebalance-interval <SECS>` | Rebalancer tick cadence; `0` disables dynamic rebalancing. | 30 |
 | `--rebalance-threshold <RATIO>` | Latency-imbalance threshold (slowest replica / fastest) before the rebalancer evicts. | 2.0 |
 | `--hot-shard-rps <FRAC>` | Hot-shard load-rate replication: shards whose max `req_per_sec` across replicas exceeds this value are treated as effectively under-replicated until the rate subsides. | — (disabled) |
+| `--hot-shard-demote-ratio <FRAC>` | ADR-0014 hysteresis: an elevated shard demotes only when its rate falls below `ratio × --hot-shard-rps`. `1.0` disables hysteresis. Values outside `(0.0, 1.0]` clamp to the default. | 0.8 |
 | `--rtt-probe-interval-secs <N>` | Active-probe RTT cadence. When `>0`, the router periodically `GET`s `{listen_url}/v1/health` on every serving server and uses the recorded round-trip as a tie-breaker after GT3 per-layer latency in `route()`. | 0 (disabled) |
+| `--saturation-ceiling <N>` | ADR-0020 backpressure tier. Replicas whose `requests_in_flight ≥ N` are filtered out of `route()` before the GT3/RTT/in-flight comparator runs. When every owning replica is saturated, the router 503s with `Retry-After: 0.5` and bumps `larql_router_route_saturation_total` instead of forwarding to the least-bad replica. | — (disabled) |
 | `--log-level <LEVEL>` | Logging level. | info |
 
 Run `larql-router --help` for the full set, including the QUIC
@@ -206,6 +229,24 @@ sequential registrations (each triggers one rebuild over a growing
 set) into a single sample. The **single** `register()` row is the
 per-join cost a real grid pays.
 
+**ADR-0018 MoE expert routing** (`route_expert` / `route_all_experts`,
+post-ADR-0018 benches):
+
+| Op | Topology | Servers | Pairs | Time |
+|---|---|---|---|---|
+| `route_expert()` | Mixtral-style (1 layer × 4 expert-shards × 1 rep) | 4 | 1 | **121 ns** |
+| `route_expert()` | V3-shape (60 layers × 4 shards × 1 rep) | 240 | 1 | **143 ns** |
+| `route_expert()` | V3-shape with `target_replicas=2` | 480 | 1 | **196 ns** |
+| `route_all_experts()` | Mixtral 32 layers × top-2 | 256 | 64 | **10.6 µs** |
+| `route_all_experts()` | DeepSeek-V3 60 layers × top-6 | 240 | 360 | **61.7 µs** |
+| `route_all_experts()` | DeepSeek-V3 60 layers × top-8 (aggressive) | 240 | 480 | **84.1 µs** |
+| `route_all_experts()` | Kimi-K2-style 80 layers × top-8 | 320 | 640 | **112 µs** |
+
+So **K2.6-scale per-token expert routing is ~112 µs of routing
+work** against an inference compute budget orders of magnitude
+larger. Routing is not the bottleneck even at trillion-parameter
+MoE scale.
+
 ```bash
 make bench-routing     # criterion sweeps; see crates/larql-router/benches/routing.rs
 ```
@@ -226,12 +267,29 @@ Grid routing + rebalancing are covered by focused unit + integration tests:
 - stale-heartbeat eviction
 - gap-fill on `DroppingMsg` / disconnect
 - admin RPCs (`status` / `gaps` / `drain` / `assign`)
+- ADR-0018 MoE expert routing — `route_expert` / `route_all_experts`,
+  per-(layer, expert-range) replication keys, hot-shard elevation
+  per expert-shard, JSON `experts` / `layer_experts` HTTP shapes,
+  fan-out merge, dense regression (all 184 pre-MoE tests pass
+  unchanged)
+- ADR-0020 backpressure tier — saturation filter in `route()` /
+  `route_expert()`, dispatcher 503 vs 400 disambiguation via
+  `has_owners_for`, `Retry-After: 0.5` header, and counter increment
+  (`walk_ffn_returns_503_with_retry_after_when_replicas_saturated`)
+- Long-running chaos test (`tests/test_grid_chaos.rs`) — 5,000
+  randomised register/deregister/heartbeat/route ticks per variant
+  (one with `target_replicas=1`, one with `=2`); asserts ledger
+  consistency, coverage floor, and no `route()` panic on every tick
 
 ```bash
-cargo test -p larql-router                    # 132 lib + 38 integration = 170 tests
+cargo test -p larql-router                    # 163 lib + 47 integration = 210 tests
+                                               # (incl. MoE expert-routing, hot-shard hysteresis,
+                                               #  ADR-0020 saturation backpressure, grid chaos,
+                                               #  dense regression)
+cargo test -p larql-router --features http3    # 211 tests (+1 h3 fan-out integration)
 cargo test -p larql-router-protocol --features quic
                                                # 18 tests (15 unit + 3 QUIC integration)
-make larql-router-coverage-summary             # 92.81% total, 18/19 files ≥90%
+make larql-router-coverage-summary             # 93.21% total, 19/20 files ≥90%
                                                # (grid/service.rs at 88% — debt baseline)
 make larql-router-protocol-coverage-summary    # 91.36% total, 1/1 files ≥90%
 ```
@@ -244,7 +302,8 @@ Test counts as of 2026-05-16.
 src/
 ├── lib.rs                       # module declarations + public surface
 ├── main.rs                      # CLI entry, admin dispatch, server startup
-├── http.rs                      # axum handlers (/v1/walk-ffn, /v1/health, /v1/stats)
+├── http.rs                      # axum handlers (/v1/walk-ffn, /v1/health, /v1/stats, /metrics)
+├── metrics.rs                   # ADR-0017 Prometheus registry + RouterMetrics struct
 ├── dispatch.rs                  # multi-layer fan-out + response merge
 ├── shards.rs                    # static `--shards` parser + binary peek
 ├── admin.rs                     # admin client + status/gaps formatters

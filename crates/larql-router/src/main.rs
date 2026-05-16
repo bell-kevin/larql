@@ -37,6 +37,7 @@ fn spawn_quic_listener(
     cli: &Cli,
     state: Arc<RwLock<GridState>>,
     quic_port: u16,
+    metrics: Arc<larql_router::metrics::RouterMetrics>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use larql_router_protocol::transport::quic::{
         self_signed_tls, server_endpoint, spawn_accept_loop, SelfSignedTls,
@@ -83,7 +84,9 @@ fn spawn_quic_listener(
         .map_err(|e| format!("QUIC endpoint bind {quic_addr}: {e}"))?;
     info!("Grid QUIC server listening: {quic_addr}");
 
-    let svc = GridServiceServer::new(GridServiceImpl::new_with_key(state, cli.grid_key.clone()));
+    let svc = GridServiceServer::new(
+        GridServiceImpl::new_with_key(state, cli.grid_key.clone()).with_metrics(metrics),
+    );
     let rx = spawn_accept_loop(endpoint);
     let incoming = ReceiverStream::new(rx);
     tokio::spawn(async move {
@@ -224,6 +227,26 @@ struct Cli {
     #[arg(long)]
     hot_shard_rps: Option<f32>,
 
+    /// ADR-0020: per-replica in-flight saturation ceiling. When set,
+    /// `route()` filters out replicas whose `requests_in_flight` is
+    /// at or above this value before picking. If every owning
+    /// replica is saturated, the router 503s with `Retry-After: 0.5`
+    /// instead of piling more load onto a stuck shard.
+    /// Default disabled (matches pre-ADR-0020 behavior). Pick a
+    /// value with `2 × target_replicas × rps_per_replica × p99_s`
+    /// as a starting point.
+    #[arg(long)]
+    saturation_ceiling: Option<u32>,
+
+    /// ADR-0014 hysteresis: ratio of the elevation threshold below
+    /// which a hot shard demotes. Default `0.8` means elevate at
+    /// `--hot-shard-rps T`, demote only when the rate falls below
+    /// `0.8 × T`. Prevents oscillation at the boundary. Values
+    /// outside `(0.0, 1.0]` clamp to the default. `1.0` disables
+    /// hysteresis (elevate and demote at the same threshold).
+    #[arg(long, default_value = "0.8")]
+    hot_shard_demote_ratio: f32,
+
     /// Active-probe RTT: cadence (in seconds) at which the router
     /// issues `GET {listen_url}/v1/health` against every serving
     /// server. The measured round-trip lands on `ServerEntry.rtt_ms`
@@ -234,6 +257,30 @@ struct Cli {
     /// cross-region tie-breaking.
     #[arg(long, default_value = "0")]
     rtt_probe_interval_secs: u64,
+
+    /// ADR-0019: enable HTTP/3 shard transport. When set, MoE
+    /// expert fan-out (ADR-0018) dispatches through an h3 client
+    /// per shard host — each parallel sub-request runs as an
+    /// independent QUIC stream, escaping TCP HoL blocking on the
+    /// HTTP/2-over-TCP path. Requires building with
+    /// `--features http3` AND each `larql-server` shard listening
+    /// on `--http3-port` (server-side ADR-0019 wiring).
+    ///
+    /// Dense routing keeps the existing reqwest HTTP/2 path —
+    /// HTTP/3 only swings the needle for parallel per-token
+    /// fan-outs, which is the MoE workload.
+    #[arg(long, default_value = "false")]
+    #[cfg(feature = "http3")]
+    http3_shards: bool,
+
+    /// ADR-0019: SHA-256 fingerprint (hex) of each shard's
+    /// HTTP/3 TLS cert. Required when `--http3-shards` is set
+    /// unless the operator wants `AcceptAny` (LAN/dev).
+    /// Pin one fingerprint per process — all shards in the grid
+    /// must present the same cert.
+    #[arg(long)]
+    #[cfg(feature = "http3")]
+    shard_cert_fingerprint: Option<String>,
 
     /// Phase 4: number of replicas to maintain per shard range.
     /// 1 = no replication (default). >1 enables auto-replication: when fewer
@@ -404,6 +451,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         None
     };
 
+    // ADR-0017: build the metrics registry early so the rebalancer + RTT
+    // probe + HTTP route handlers all share one Arc<RouterMetrics>.
+    let metrics = larql_router::metrics::RouterMetrics::new();
+
     if let (Some(grid_port), Some(state)) = (cli.grid_port, &grid_state) {
         // Phase 4: install target_replicas before any servers register so
         // the first under-/over-replication check sees the right target.
@@ -414,11 +465,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "Replication: enabled"
             );
         }
+        // ADR-0020 — install the saturation ceiling. None = disabled.
+        state
+            .write()
+            .await
+            .set_saturation_ceiling(cli.saturation_ceiling);
+        if let Some(ceiling) = cli.saturation_ceiling {
+            info!(
+                ceiling,
+                "Saturation backpressure: enabled (route() 503s when every replica >= ceiling)"
+            );
+        }
 
-        let svc = GridServiceServer::new(GridServiceImpl::new_with_key(
-            state.clone(),
-            cli.grid_key.clone(),
-        ));
+        let svc = GridServiceServer::new(
+            GridServiceImpl::new_with_key(state.clone(), cli.grid_key.clone())
+                .with_metrics(metrics.clone()),
+        );
         let grpc_addr: SocketAddr = format!("{}:{}", cli.host, grid_port).parse()?;
         info!("Grid gRPC server listening: {grpc_addr}");
         tokio::spawn(async move {
@@ -435,7 +497,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // is set. Same gRPC service implementation, different transport.
         #[cfg(feature = "quic")]
         if let Some(quic_port) = cli.quic_port {
-            spawn_quic_listener(&cli, state.clone(), quic_port)?;
+            spawn_quic_listener(&cli, state.clone(), quic_port, metrics.clone())?;
         }
 
         // GT6: spawn dynamic rebalancer (disabled when interval == 0).
@@ -444,14 +506,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 cli.rebalance_interval,
                 cli.rebalance_threshold,
             )
-            .with_hot_shard_threshold(cli.hot_shard_rps);
+            .with_hot_shard_threshold(cli.hot_shard_rps)
+            .with_hot_shard_demote_ratio(cli.hot_shard_demote_ratio);
             info!(
                 interval_s = cli.rebalance_interval,
                 threshold = cli.rebalance_threshold,
                 hot_shard_rps = ?cli.hot_shard_rps,
                 "Rebalancer: enabled"
             );
-            rebalancer::spawn(state.clone(), rebalance_cfg);
+            rebalancer::spawn(state.clone(), rebalance_cfg, Some(metrics.clone()));
         }
 
         // Optional RTT probe loop — opt-in via --rtt-probe-interval-secs.
@@ -462,14 +525,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 interval_s = cli.rtt_probe_interval_secs,
                 "RTT probe: enabled"
             );
-            larql_router::tasks::rtt_probe::spawn(state.clone(), rtt_cfg);
+            larql_router::tasks::rtt_probe::spawn(state.clone(), rtt_cfg, Some(metrics.clone()));
         }
     }
+
+    // Snapshot grid gauges now so /metrics has values before the
+    // first rebalancer tick fires. The rebalancer tick (if enabled)
+    // keeps refreshing these every interval.
+    if let Some(g) = grid_state.as_ref() {
+        metrics.refresh_gauges(&*g.read().await);
+    }
+
+    // ADR-0019 — build the H3Client when `--http3-shards` is on.
+    // Held as an `Option`: dense routing keeps reqwest unchanged.
+    #[cfg(feature = "http3")]
+    let h3_client = if cli.http3_shards {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let h3 = larql_router_protocol::transport::h3::H3Client::new(
+            "0.0.0.0:0".parse().unwrap(),
+            cli.shard_cert_fingerprint.clone(),
+        )
+        .map_err(|e| format!("HTTP/3 client setup: {e}"))?;
+        info!(
+            fingerprint = ?cli.shard_cert_fingerprint,
+            "HTTP/3 shard transport: enabled"
+        );
+        Some(Arc::new(h3))
+    } else {
+        None
+    };
 
     let state = Arc::new(AppState {
         static_shards,
         grid: grid_state,
         client,
+        metrics: Some(metrics.clone()),
+        #[cfg(feature = "http3")]
+        h3_client,
     });
 
     let app = build_router(state);

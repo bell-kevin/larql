@@ -93,6 +93,47 @@ impl KvEngine for NoCacheEngine {
         Some(hidden)
     }
 
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        _ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+        backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        // Phase-1 pattern: dequant Q4K attn tensors into `weights.tensors`,
+        // then run the f32 prefill path. Q4K FFN dispatches through a
+        // `WalkFfn` constructed from the vindex (the bench passes
+        // `NullFfn` because Q4K FFN is engine-side; using `_ffn` would
+        // silently skip the FFN). See `kv-dispatch-quantization.md`.
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        let walk_ffn = larql_inference::vindex::WalkFfn::from_config(
+            weights,
+            index,
+            larql_inference::vindex::WalkFfnConfig::dense(weights.num_layers),
+        )
+        .with_backend(backend);
+        self.prefill(weights, &walk_ffn, token_ids)
+    }
+
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        _ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+        backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        let walk_ffn = larql_inference::vindex::WalkFfn::from_config(
+            weights,
+            index,
+            larql_inference::vindex::WalkFfnConfig::dense(weights.num_layers),
+        )
+        .with_backend(backend);
+        self.decode_step(weights, &walk_ffn, token_id)
+    }
+
     fn memory_bytes(&self) -> usize {
         // Only persistent state is the token-id list.
         self.tokens.len() * std::mem::size_of::<u32>()

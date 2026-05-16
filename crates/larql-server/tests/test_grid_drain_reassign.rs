@@ -69,6 +69,8 @@ async fn spawn_live_origin(
             ram_bytes: 1024 * 1024 * 1024,
             listen_url: listen_url.into(),
             vindex_hash: "live-origin-hash".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await

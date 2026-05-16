@@ -157,3 +157,142 @@ impl MetalBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_compute::pipeline::{
+        Activation, FfnType, FullPipelineLayer, NormType, QuantFormat, QuantWeight,
+    };
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    /// Build a minimal `FullPipelineLayer` whose `norms()` view drives
+    /// the `encode_post_ffn_residual` branches.  Pure CPU-side struct —
+    /// no quantised weights are read by the residual encoder.
+    fn layer_with(post_ffn_norm: Option<&[f32]>, has_post_norms: bool) -> FullPipelineLayer<'_> {
+        let empty_q4 = QuantWeight {
+            data: &[],
+            scales: None,
+            format: QuantFormat::Q4_K,
+        };
+        FullPipelineLayer {
+            wq: empty_q4,
+            wk: empty_q4,
+            wv: empty_q4,
+            wo: empty_q4,
+            gate: empty_q4,
+            up: empty_q4,
+            down: empty_q4,
+            input_norm: &[],
+            post_attn_norm: &[],
+            pre_ffn_norm: None,
+            post_ffn_norm,
+            input_norm_bias: None,
+            post_attn_norm_bias: None,
+            norm_offset: 1.0,
+            qk_norm_offset: 0.0,
+            eps: 1e-6,
+            has_post_norms,
+            norm_type: NormType::RmsNorm,
+            ffn_type: FfnType::Gated,
+            activation: Activation::Silu,
+            attn_scale: 0.125,
+            head_dim: 64,
+            num_q_heads: 4,
+            num_kv_heads: 4,
+            rope_base: 10000.0,
+            rotary_dim: 0,
+            sliding_window: 0,
+            has_v_norm: false,
+            layer_scalar: 0.0,
+            q_norm_weight: None,
+            k_norm_weight: None,
+            ffn_up_bias: None,
+            ffn_down_bias: None,
+            moe: None,
+            ffn_is_remote: false,
+            moe_combined_output_norm: false,
+            moe_outer_post_norm: None,
+            kv_shared_source: None,
+            ple_input_gate: None,
+            ple_projection: None,
+            ple_post_norm: None,
+        }
+    }
+
+    fn drive(m: &MetalBackend, layer: &FullPipelineLayer<'_>, hidden: usize, use_fused: bool) {
+        let down_out = m.bufs.transient_from_f32(&vec![0.5f32; hidden]);
+        let h_post_attn = m.bufs.transient_from_f32(&vec![0.25f32; hidden]);
+        let new_h = m.bufs.output((hidden * 4) as u64);
+        let normed_scratch = m.bufs.output((hidden * 4) as u64);
+
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        m.encode_post_ffn_residual(
+            enc,
+            layer,
+            PostFfnBufs {
+                down_out: &down_out,
+                h_post_attn: &h_post_attn,
+                new_h: &new_h,
+                normed_scratch: &normed_scratch,
+            },
+            hidden,
+            use_fused,
+            None,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let out = crate::buffers::read_buffer_f32(&new_h, hidden);
+        assert_eq!(out.len(), hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `has_post_norms == true` + `post_ffn_norm: Some` + `use_fused: true`
+    /// drives the fused `post_ffn_norm_residual_add` dispatch (lines 98-117).
+    #[test]
+    fn post_norms_with_weight_and_fused_dispatches_fused_kernel() {
+        let m = backend();
+        let hidden = 64usize;
+        let post_ffn = vec![1.0f32; hidden];
+        let layer = layer_with(Some(&post_ffn), true);
+        drive(&m, &layer, hidden, true);
+    }
+
+    /// Same shape, `use_fused: false` drives the unfused rms_norm +
+    /// residual_add chain (lines 118-137).
+    #[test]
+    fn post_norms_with_weight_and_unfused_dispatches_rms_then_add() {
+        let m = backend();
+        let hidden = 64usize;
+        let post_ffn = vec![1.0f32; hidden];
+        let layer = layer_with(Some(&post_ffn), true);
+        drive(&m, &layer, hidden, false);
+    }
+
+    /// `has_post_norms == true` + `post_ffn_norm: None` falls through
+    /// to the plain residual-add (lines 138-147).
+    #[test]
+    fn post_norms_without_weight_falls_back_to_residual_add() {
+        let m = backend();
+        let hidden = 64usize;
+        let layer = layer_with(None, true);
+        drive(&m, &layer, hidden, true);
+    }
+
+    /// `has_post_norms == false` — outer `else` branch, plain residual
+    /// add (lines 148-157).  Already exercised by the prefill_q4 tests
+    /// but pinned here too for symmetry with the post_norms tests.
+    #[test]
+    fn no_post_norms_dispatches_plain_residual_add() {
+        let m = backend();
+        let hidden = 64usize;
+        let layer = layer_with(None, false);
+        drive(&m, &layer, hidden, true);
+    }
+}

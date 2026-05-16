@@ -1523,6 +1523,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "h3"
+version = "0.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10872b55cfb02a821b69dc7cf8dc6a71d6af25eb9a79662bec4a9d016056b3be"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "h3-axum"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60560d71e2ecf73a9b7eb9e82197b65cfe9f2a30e3ce226237c83ded454b6d75"
+dependencies = [
+ "axum",
+ "bytes",
+ "h3",
+ "h3-quinn",
+ "http",
+ "http-body-util",
+ "tower",
+]
+
+[[package]]
+name = "h3-quinn"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b2e732c8d91a74731663ac8479ab505042fbf547b9a207213ab7fbcbfc4f8b4"
+dependencies = [
+ "bytes",
+ "futures",
+ "h3",
+ "quinn",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2267,6 +2310,7 @@ dependencies = [
  "futures",
  "futures-core",
  "larql-router-protocol",
+ "prometheus",
  "reqwest",
  "rustls",
  "serde",
@@ -2285,6 +2329,14 @@ dependencies = [
 name = "larql-router-protocol"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "bytes",
+ "futures",
+ "h3",
+ "h3-axum",
+ "h3-quinn",
+ "http",
+ "http-body-util",
  "hyper-util",
  "prost",
  "protobuf-src",
@@ -2292,12 +2344,14 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
  "tonic-build",
  "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -3186,6 +3240,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "prometheus"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d33c28a30771f7f96db69893f78b857f7450d7e0237e9c8fc6427a81bae7ed1"
+dependencies = [
+ "cfg-if",
+ "fnv",
+ "lazy_static",
+ "memchr",
+ "parking_lot",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3339,6 +3407,7 @@ checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
 dependencies = [
  "bytes",
  "cfg_aliases",
+ "futures-io",
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",

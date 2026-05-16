@@ -61,6 +61,29 @@ pub struct ServerEntry {
     /// `None` until the first probe completes. Used by `route()` as a
     /// tie-breaker when no GT3 per-layer latency data is available yet.
     pub rtt_ms: Option<f32>,
+    /// ADR-0018 — MoE expert ownership. Both `0` means the server is
+    /// dense (every layer monolithic). Both nonzero advertises the
+    /// contiguous expert ID range this server owns across its layer
+    /// range. Use [`Self::is_dense`] / [`Self::owns_expert`] rather
+    /// than reading these directly.
+    pub expert_start: u32, // inclusive (meaningful only when !is_dense)
+    pub expert_end: u32, // inclusive (meaningful only when !is_dense)
+}
+
+impl ServerEntry {
+    /// `true` when this server has no expert-level ownership — every
+    /// covered layer is monolithic. The proto3 default of 0/0 maps to
+    /// this case so old dense announces work unchanged.
+    pub fn is_dense(&self) -> bool {
+        self.expert_start == 0 && self.expert_end == 0
+    }
+
+    /// `true` if this server owns `expert_id` within its expert range,
+    /// OR if the server is dense (a dense server owns every expert
+    /// trivially because there is no expert dimension).
+    pub fn owns_expert(&self, expert_id: u32) -> bool {
+        self.is_dense() || (self.expert_start <= expert_id && expert_id <= self.expert_end)
+    }
 }
 
 // ── Mode B: available server entry ───────────────────────────────────────────
@@ -102,7 +125,18 @@ pub struct GridState {
     /// until the rate subsides. Rebalancer marks ranges on the hot-shard
     /// tick; under/over-replication checks read this set via
     /// `effective_target_for`.
-    elevated_ranges: HashSet<(String, u32, u32)>,
+    /// ADR-0018: keyed on the 5-tuple
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end)`.
+    /// Two slices that share a layer range but own different experts
+    /// can be elevated independently.
+    elevated_ranges: HashSet<(String, u32, u32, u32, u32)>,
+    /// ADR-0020 — per-replica in-flight saturation ceiling. `None`
+    /// (default) disables the filter. When set, `route()` /
+    /// `route_expert()` drop replicas where
+    /// `requests_in_flight >= saturation_ceiling` before running
+    /// the three-tier comparator; if every replica is saturated
+    /// they return `None` and the dispatcher 503s.
+    saturation_ceiling: Option<u32>,
 }
 
 impl Default for GridState {
@@ -115,11 +149,23 @@ impl Default for GridState {
             serving_senders: HashMap::new(),
             target_replicas: 1,
             elevated_ranges: HashSet::new(),
+            saturation_ceiling: None,
         }
     }
 }
 
 impl GridState {
+    /// ADR-0020: set the per-replica in-flight saturation ceiling.
+    /// `None` (default) disables filtering.
+    pub fn set_saturation_ceiling(&mut self, ceiling: Option<u32>) {
+        self.saturation_ceiling = ceiling;
+    }
+
+    /// ADR-0020: current saturation ceiling (read-only).
+    pub fn saturation_ceiling(&self) -> Option<u32> {
+        self.saturation_ceiling
+    }
+
     pub fn register(&mut self, entry: ServerEntry) {
         tracing::info!(
             server_id = %entry.server_id,

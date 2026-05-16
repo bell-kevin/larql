@@ -227,3 +227,210 @@ pub fn encode(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MetalBackend;
+    use larql_compute::QuantFormat;
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    /// Shared test fixture: minimal buffers + a Pipelines bundle.
+    fn fixture(
+        m: &MetalBackend,
+    ) -> (
+        Buffer, // w_buf (n*k*2 bytes — sized for Q6_K which is the biggest in this set)
+        Buffer, // f32_in
+        Buffer, // q8_in
+        Buffer, // q8s_in
+        Buffer, // out_buf
+        usize,  // n
+        usize,  // k
+    ) {
+        let n = 32usize;
+        let k = 256usize;
+        // 256 bytes of zeros is enough for any q-format superblock at k=256
+        // since this only exercises dispatch, not numeric correctness.
+        let w_buf = m.bufs.transient_from_bytes(&vec![0u8; n * 256]);
+        let f32_in = m.bufs.transient_from_f32(&vec![0.0f32; k]);
+        let q8_in = m.bufs.transient_from_i8(&vec![0i8; k]);
+        let q8s_in = m.bufs.transient_from_f32(&vec![0.0f32; k / 32]);
+        let out_buf = m.bufs.output((n * 4) as u64);
+        (w_buf, f32_in, q8_in, q8s_in, out_buf, n, k)
+    }
+
+    fn pipelines<'a>(m: &'a MetalBackend) -> Pipelines<'a> {
+        Pipelines {
+            q4kf_proj: Some(&m.attention.q4kf_proj_pipeline.state),
+            q4k_matvec_fallback: &m.quant.q4k_matvec_pipeline,
+            q6k_matvec: &m.quant.q6k_matvec_pipeline,
+            q4_matvec: &m.q4.matvec,
+            q4k_matmul: Some(&m.quant.q4k_matmul_pipeline),
+        }
+    }
+
+    fn run_with(format: QuantFormat, m: &MetalBackend, pipes: &Pipelines<'_>) {
+        let (w, f32_in, q8_in, q8s_in, out, n, k) = fixture(m);
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode(
+            enc, format, &w, &f32_in, 0, &q8_in, 0, &q8s_in, 0, &out, 0, pipes, n, k,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+    }
+
+    /// Q4_KF format dispatches the dedicated Q4_KF shader when the
+    /// `q4kf_proj` pipeline is bound (lines 119-131).
+    #[test]
+    fn q4kf_format_dispatches_q4kf_pipeline_when_present() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        run_with(QuantFormat::Q4_KF, &m, &pipes);
+    }
+
+    /// Q4_KF format falls back to `q4k_matvec_fallback` when no
+    /// `q4kf_proj` pipeline is bound (lines 132-143).
+    #[test]
+    fn q4kf_format_falls_back_when_q4kf_pipeline_absent() {
+        let m = backend();
+        let mut pipes = pipelines(&m);
+        pipes.q4kf_proj = None;
+        run_with(QuantFormat::Q4_KF, &m, &pipes);
+    }
+
+    /// Q4_K format dispatches the canonical Q4_K matvec (lines 161-171).
+    #[test]
+    fn q4k_format_dispatches_q4k_matvec_fallback() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        run_with(QuantFormat::Q4_K, &m, &pipes);
+    }
+
+    /// Setting `LARQL_DBG_QM=1` drives the diagnostic eprintln branch
+    /// of the Q4_K arm (lines 152-159).
+    #[test]
+    fn q4k_format_with_dbg_qm_env_prints_diagnostic() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        // SAFETY: env vars are process-global; set + run + unset
+        // serialises on this single test.  No other Q4_K-arm tests
+        // care about ENV_DBG_QM, so the leak window is contained.
+        unsafe {
+            std::env::set_var(larql_compute::options::ENV_DBG_QM, "1");
+        }
+        run_with(QuantFormat::Q4_K, &m, &pipes);
+        unsafe {
+            std::env::remove_var(larql_compute::options::ENV_DBG_QM);
+        }
+    }
+
+    /// Q6_K format dispatches `q6k_matvec` (lines 173-186).
+    #[test]
+    fn q6k_format_dispatches_q6k_matvec() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        run_with(QuantFormat::Q6_K, &m, &pipes);
+    }
+
+    /// Q4_0 format dispatches `q4_matvec` against the Q8 input (lines
+    /// 187-202).
+    #[test]
+    fn q4_0_format_dispatches_q4_matvec_with_q8_input() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        run_with(QuantFormat::Q4_0, &m, &pipes);
+    }
+
+    /// Q8_0 format panics — the generic dispatcher doesn't route Q8
+    /// weights, callers go through `quant.q8_matvec_pipeline` directly.
+    /// Covers the panic branch on line 215.
+    ///
+    /// We hand-unwind via `catch_unwind` because the panic happens
+    /// *before* `end_encoding`, and Metal aborts the process when a
+    /// command encoder goes out of scope without one.  Catching here
+    /// lets us close the encoder cleanly, then re-raise the original
+    /// panic for `#[should_panic]` to observe.
+    #[test]
+    #[should_panic(expected = "Q8_0 not yet routed")]
+    fn q8_0_format_panics_with_clear_message() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        let (w, f32_in, q8_in, q8s_in, out, n, k) = fixture(&m);
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            encode(
+                enc,
+                QuantFormat::Q8_0,
+                &w,
+                &f32_in,
+                0,
+                &q8_in,
+                0,
+                &q8s_in,
+                0,
+                &out,
+                0,
+                &pipes,
+                n,
+                k,
+            );
+        }));
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// Float formats are no-ops — the dispatcher silently returns
+    /// without setting any pipeline (line 222-227).  We pre-bind a
+    /// dummy dispatch to the encoder before calling `encode`, because
+    /// Metal panics on a release of a "naked" command encoder with
+    /// zero dispatches.  Production callers always feed a hot encoder
+    /// here.
+    #[test]
+    fn float_formats_are_dispatch_noops() {
+        let m = backend();
+        let pipes = pipelines(&m);
+        for fmt in [QuantFormat::F32, QuantFormat::F16, QuantFormat::BF16] {
+            let (w, f32_in, q8_in, q8s_in, out, n, k) = fixture(&m);
+            let cmd = m.queue.new_command_buffer();
+            let enc = cmd.new_compute_command_encoder();
+            // Hot-start the encoder with a Q4_K dispatch so its drop
+            // (after end_encoding below) doesn't hit Metal's
+            // "released without endEncoding" assertion when `encode`
+            // is a no-op for the float branch.
+            encode(
+                enc,
+                QuantFormat::Q4_K,
+                &w,
+                &f32_in,
+                0,
+                &q8_in,
+                0,
+                &q8s_in,
+                0,
+                &out,
+                0,
+                &pipes,
+                n,
+                k,
+            );
+            // Now exercise the float-format no-op branch on the same encoder.
+            encode(
+                enc, fmt, &w, &f32_in, 0, &q8_in, 0, &q8s_in, 0, &out, 0, &pipes, n, k,
+            );
+            enc.end_encoding();
+            cmd.commit();
+            cmd.wait_until_completed();
+        }
+    }
+}

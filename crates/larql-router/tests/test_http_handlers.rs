@@ -131,6 +131,9 @@ fn make_router(static_shards: &str) -> axum::Router {
         static_shards: shards,
         grid: None,
         client,
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
     });
     build_router(state)
 }
@@ -413,6 +416,8 @@ async fn walk_ffn_routes_via_grid_when_grid_state_is_set() {
         layer_latencies: HashMap::new(),
         req_per_sec: 0.0,
         rtt_ms: None,
+        expert_start: 0,
+        expert_end: 0,
     });
 
     let client = reqwest::Client::builder()
@@ -423,6 +428,9 @@ async fn walk_ffn_routes_via_grid_when_grid_state_is_set() {
         static_shards: parse_shards("99-100=http://unused:1").unwrap(),
         grid: Some(grid),
         client,
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
     });
     let app = build_router(state);
 
@@ -478,6 +486,9 @@ async fn walk_ffn_grid_layer_missing_falls_back_to_static_shards() {
         static_shards: parse_shards(&format!("0-9=http://{addr}")).unwrap(),
         grid: Some(grid),
         client,
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
     });
     let app = build_router(state);
 
@@ -510,4 +521,508 @@ async fn walk_ffn_500s_on_shard_connection_failure() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+// ── ADR-0017: /metrics endpoint ─────────────────────────────────────────────
+
+/// `/metrics` returns Prometheus text format when a registry is wired
+/// in. Every documented metric family appears in the output with a
+/// pre-touched zero value (so dashboards don't see "missing metric"
+/// for a freshly-started router).
+#[tokio::test]
+async fn metrics_endpoint_serves_prometheus_text_with_zero_values() {
+    use larql_router::metrics::RouterMetrics;
+
+    let shards = parse_shards("0-3=http://127.0.0.1:1").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let metrics = RouterMetrics::new();
+    let state = Arc::new(AppState {
+        static_shards: shards,
+        grid: None,
+        client,
+        metrics: Some(metrics.clone()),
+        #[cfg(feature = "http3")]
+        h3_client: None,
+    });
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/plain"),
+        "/metrics must serve text/plain, got {ct}"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    for required in [
+        "larql_router_build_info",
+        "larql_router_grid_servers",
+        "larql_router_grid_models",
+        "larql_router_grid_coverage_gaps",
+        "larql_router_grid_elevated_ranges",
+        "larql_router_target_replicas",
+        "larql_router_grid_registers_total",
+        "larql_router_grid_deregisters_total",
+        "larql_router_rebalancer_actions_total",
+        "larql_router_rtt_probes_total",
+        "larql_router_walk_ffn_requests_total",
+        "larql_router_walk_ffn_duration_seconds",
+    ] {
+        assert!(
+            text.contains(required),
+            "/metrics output missing {required}; got:\n{text}"
+        );
+    }
+}
+
+/// `/metrics` returns 503 when the AppState lacks a registry —
+/// integration tests sometimes build a router without one, and the
+/// handler shouldn't panic.
+#[tokio::test]
+async fn metrics_endpoint_returns_503_when_no_registry() {
+    let app = make_router("0-3=http://127.0.0.1:1");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ── ADR-0018: MoE expert routing dispatch ──────────────────────────────────
+
+/// MoE request with no grid configured 503s — there's no static-shard
+/// fallback path for expert routing.
+#[tokio::test]
+async fn moe_request_without_grid_returns_503() {
+    let app = make_router("0-3=http://127.0.0.1:1");
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"layer":0,"experts":[0,3]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["error"]
+        .as_str()
+        .unwrap()
+        .contains("MoE routing requires"));
+}
+
+/// MoE request against a grid with no shard owning the requested
+/// `(layer, expert)` returns 503.
+#[tokio::test]
+async fn moe_request_with_no_owner_returns_503() {
+    use larql_router::grid::{GridState, ServerEntry};
+    let grid = Arc::new(tokio::sync::RwLock::new(GridState::default()));
+    {
+        let mut g = grid.write().await;
+        g.register(ServerEntry {
+            server_id: "moe-a".into(),
+            listen_url: "http://moe-a".into(),
+            model_id: "m".into(),
+            layer_start: 0,
+            layer_end: 0,
+            vindex_hash: "h".into(),
+            cpu_pct: 0.0,
+            ram_used: 0,
+            requests_in_flight: 0,
+            last_seen: std::time::Instant::now(),
+            layer_latencies: std::collections::HashMap::new(),
+            req_per_sec: 0.0,
+            rtt_ms: None,
+            expert_start: 0,
+            expert_end: 3,
+        });
+    }
+    let shards = parse_shards("99-100=http://unused:1").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let state = Arc::new(AppState {
+        static_shards: shards,
+        grid: Some(grid),
+        client,
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
+    });
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"layer":0,"experts":[99],"model_id":"m"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["error"]
+        .as_str()
+        .unwrap()
+        .contains("(layer 0, expert 99)"));
+}
+
+/// MoE dispatch with two expert shards and an `experts` request —
+/// fans out to both shards, merges the responses.
+#[tokio::test]
+async fn moe_request_fans_out_to_owning_shards_and_merges() {
+    use larql_router::grid::{GridState, ServerEntry};
+
+    let (addr_lo, _calls_lo) = spawn_fake_shard().await;
+    let (addr_hi, _calls_hi) = spawn_fake_shard().await;
+
+    let grid = Arc::new(tokio::sync::RwLock::new(GridState::default()));
+    {
+        let mut g = grid.write().await;
+        g.register(ServerEntry {
+            server_id: "moe-lo".into(),
+            listen_url: format!("http://{addr_lo}"),
+            model_id: "m".into(),
+            layer_start: 0,
+            layer_end: 0,
+            vindex_hash: "h".into(),
+            cpu_pct: 0.0,
+            ram_used: 0,
+            requests_in_flight: 0,
+            last_seen: std::time::Instant::now(),
+            layer_latencies: std::collections::HashMap::new(),
+            req_per_sec: 0.0,
+            rtt_ms: None,
+            expert_start: 0,
+            expert_end: 3,
+        });
+        g.register(ServerEntry {
+            server_id: "moe-hi".into(),
+            listen_url: format!("http://{addr_hi}"),
+            model_id: "m".into(),
+            layer_start: 0,
+            layer_end: 0,
+            vindex_hash: "h".into(),
+            cpu_pct: 0.0,
+            ram_used: 0,
+            requests_in_flight: 0,
+            last_seen: std::time::Instant::now(),
+            layer_latencies: std::collections::HashMap::new(),
+            req_per_sec: 0.0,
+            rtt_ms: None,
+            expert_start: 4,
+            expert_end: 7,
+        });
+    }
+    let shards = parse_shards("99-100=http://unused:1").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let state = Arc::new(AppState {
+        static_shards: shards,
+        grid: Some(grid),
+        client,
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
+    });
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"layer":0,"experts":[0,3,5,7],"model_id":"m"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "MoE fan-out should merge two shard responses"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["results"].is_array(), "merged envelope must have results");
+}
+
+/// A walk-ffn call that 502s should increment the `error_5xx` counter
+/// on the registry. Proves the instrumentation hook in the handler
+/// fires on the error path.
+#[tokio::test]
+async fn walk_ffn_5xx_increments_error_counter() {
+    use larql_router::metrics::{encode_metrics_text, RouterMetrics};
+
+    let shards = parse_shards("0-3=http://127.0.0.1:1").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(1))
+        .build()
+        .unwrap();
+    let metrics = RouterMetrics::new();
+    let state = Arc::new(AppState {
+        static_shards: shards,
+        grid: None,
+        client,
+        metrics: Some(metrics.clone()),
+        #[cfg(feature = "http3")]
+        h3_client: None,
+    });
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"layer":0}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+
+    let text = encode_metrics_text(&metrics).unwrap();
+    assert!(
+        text.contains("larql_router_walk_ffn_requests_total{status=\"error_5xx\"} 1"),
+        "expected error_5xx=1, got:\n{text}"
+    );
+}
+
+// ── ADR-0019: HTTP/3 end-to-end smoke ────────────────────────────────────────
+//
+// Phase 4c: prove the full router→server h3 wire works.
+// 1. Spin up an h3 axum listener that records the MoE sub-request body.
+// 2. Configure AppState with the matching H3Client (no fingerprint pin —
+//    LAN/dev mode).
+// 3. Issue a MoE `experts` request to the router and assert the h3 server
+//    received the rewritten `layer_experts` payload.
+
+#[cfg(feature = "http3")]
+#[tokio::test]
+async fn moe_fanout_dispatches_through_h3_client_when_configured() {
+    use larql_router::grid::{GridState, ServerEntry};
+    use larql_router_protocol::transport::h3::{serve_axum, server_endpoint, H3Client};
+    use larql_router_protocol::transport::quic::self_signed_tls;
+    use tokio::sync::Mutex;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // ── Stand up a single h3 echo server that records every body it sees.
+    let recorded: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded_handler = recorded.clone();
+    let h3_app = axum::Router::new().route(
+        "/v1/walk-ffn",
+        axum::routing::post(move |body: axum::extract::Json<Value>| {
+            let recorded = recorded_handler.clone();
+            async move {
+                recorded.lock().await.push(body.0.clone());
+                axum::Json(json!({
+                    "results": [{"layer": 0, "expert": 0, "out": "ok"}],
+                    "latency_ms": 1.0
+                }))
+            }
+        }),
+    );
+    let tls = self_signed_tls("h3-shard").expect("self_signed_tls");
+    let endpoint = server_endpoint("127.0.0.1:0".parse().unwrap(), &tls).expect("server_endpoint");
+    let h3_addr = endpoint.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = serve_axum(endpoint, h3_app).await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // ── Grid: one MoE shard owning experts 0-7 of layer 0, listen URL
+    //    pointing at the h3 listener. The router's dispatch path will
+    //    parse `host:port` out of this and call H3Client::post_json.
+    let grid = Arc::new(tokio::sync::RwLock::new(GridState::default()));
+    {
+        let mut g = grid.write().await;
+        g.register(ServerEntry {
+            server_id: "moe-h3".into(),
+            listen_url: format!("http://127.0.0.1:{}", h3_addr.port()),
+            model_id: "m".into(),
+            layer_start: 0,
+            layer_end: 0,
+            vindex_hash: "h".into(),
+            cpu_pct: 0.0,
+            ram_used: 0,
+            requests_in_flight: 0,
+            last_seen: std::time::Instant::now(),
+            layer_latencies: std::collections::HashMap::new(),
+            req_per_sec: 0.0,
+            rtt_ms: None,
+            expert_start: 0,
+            expert_end: 7,
+        });
+    }
+
+    // ── Router AppState with the matching H3Client.
+    let shards = parse_shards("99-100=http://unused:1").unwrap();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let h3_client =
+        Arc::new(H3Client::new("127.0.0.1:0".parse().unwrap(), None).expect("h3 client"));
+    let state = Arc::new(AppState {
+        static_shards: shards,
+        grid: Some(grid),
+        client,
+        metrics: None,
+        h3_client: Some(h3_client),
+    });
+    let app = build_router(state);
+
+    // ── Issue a MoE request — four picked experts all on the same shard.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"layer":0,"experts":[0,3,5,7],"model_id":"m"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "router→shard h3 dispatch must return OK"
+    );
+
+    let recv = recorded.lock().await;
+    assert_eq!(recv.len(), 1, "h3 shard saw exactly one sub-request");
+    let layer_experts = recv[0]["layer_experts"].as_array().expect("layer_experts");
+    assert_eq!(layer_experts.len(), 1);
+    // The router groups all four picked experts onto the single shard
+    // that owns 0-7, so the sub-request payload lists all of them.
+    let experts = layer_experts[0]["experts"].as_array().expect("experts");
+    let ids: Vec<u64> = experts.iter().filter_map(|v| v.as_u64()).collect();
+    assert_eq!(ids, vec![0, 3, 5, 7]);
+}
+
+/// ADR-0020 — when every replica that owns the requested layer is at
+/// or above the configured saturation ceiling, the router must emit
+/// `503 Service Unavailable` (not `400 Bad Request`), set the
+/// `Retry-After` hint, and bump the `route_saturation_total` counter.
+#[tokio::test]
+async fn walk_ffn_returns_503_with_retry_after_when_replicas_saturated() {
+    use larql_router::grid::{GridState, ServerEntry};
+    use larql_router::metrics::{encode_metrics_text, RouterMetrics};
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    let grid = Arc::new(RwLock::new(GridState::default()));
+    // One owner, requests_in_flight already at the ceiling.
+    grid.write().await.register(ServerEntry {
+        server_id: "saturated".into(),
+        listen_url: "http://unreachable:9".into(),
+        model_id: "m".into(),
+        layer_start: 0,
+        layer_end: 9,
+        vindex_hash: "h".into(),
+        cpu_pct: 0.0,
+        ram_used: 0,
+        requests_in_flight: 8,
+        last_seen: std::time::Instant::now(),
+        layer_latencies: HashMap::new(),
+        req_per_sec: 0.0,
+        rtt_ms: None,
+        expert_start: 0,
+        expert_end: 0,
+    });
+    grid.write().await.set_saturation_ceiling(Some(8));
+
+    let metrics = RouterMetrics::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let state = Arc::new(AppState {
+        static_shards: parse_shards("99-100=http://unused:1").unwrap(),
+        grid: Some(grid),
+        client,
+        metrics: Some(metrics.clone()),
+        #[cfg(feature = "http3")]
+        h3_client: None,
+    });
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/walk-ffn")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model_id":"m","layer":3}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        resp.headers()
+            .get(header::RETRY_AFTER)
+            .map(|v| v.to_str().unwrap()),
+        Some("0.5"),
+        "Retry-After hint must be set on saturation 503s"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("saturation ceiling"),
+        "error body should explain saturation; got {}",
+        v["error"]
+    );
+
+    let text = encode_metrics_text(&metrics).unwrap();
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("larql_router_route_saturation_total ") && l.ends_with(" 1")),
+        "route_saturation_total must increment exactly once; got:\n{text}"
+    );
 }

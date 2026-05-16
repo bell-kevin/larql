@@ -401,6 +401,39 @@ impl KvEngine for ApolloEngine {
         Some(raw.h_pre_norm.slice(s![last..=last, ..]).to_owned())
     }
 
+    fn prefill_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        _ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_ids: &[u32],
+        _backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        // Apollo's prefill uses `forward_from_layer` / `forward_raw_logits`
+        // which expect both attention AND FFN tensors in `weights.tensors`
+        // (Apollo doesn't go through `FfnBackend`). Dequantise both.
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        for layer in 0..weights.num_layers {
+            let _ = larql_inference::vindex::insert_q4k_layer_tensors(weights, index, layer);
+        }
+        self.prefill(weights, _ffn, token_ids)
+    }
+
+    fn decode_step_q4k(
+        &mut self,
+        weights: &mut ModelWeights,
+        _ffn: &dyn FfnBackend,
+        index: &larql_inference::larql_vindex::VectorIndex,
+        token_id: u32,
+        _backend: &dyn larql_inference::ComputeBackend,
+    ) -> Option<Array2<f32>> {
+        larql_inference::vindex::ensure_attn_tensors_dequantised(weights, index);
+        for layer in 0..weights.num_layers {
+            let _ = larql_inference::vindex::insert_q4k_layer_tensors(weights, index, layer);
+        }
+        self.decode_step(weights, _ffn, token_id)
+    }
+
     fn memory_bytes(&self) -> usize {
         self.store.as_ref().map_or(0, |s| s.total_bytes())
     }

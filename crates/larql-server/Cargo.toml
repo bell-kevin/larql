@@ -84,6 +84,10 @@ metal-experts = ["dep:larql-compute-metal"]
 # to the router via `--join quic://router:PORT` when this is on. Forwards
 # to larql-router-protocol so all QUIC code paths share one feature flag.
 quic = ["larql-router-protocol/quic", "dep:rustls"]
+# ADR-0019: real HTTP/3 listener on `--http3-port`. Built on top of
+# `quic` (shares TLS/endpoint setup) plus the h3 framing layer in
+# `larql-router-protocol::transport::h3`.
+http3 = ["quic", "larql-router-protocol/http3"]
 
 [build-dependencies]
 tonic-build = "0.13"

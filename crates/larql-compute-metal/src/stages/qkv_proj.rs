@@ -303,4 +303,90 @@ mod tests {
         assert!(QkvFormatRoute::MixedQ4kQ6kV.is_fused());
         assert!(!QkvFormatRoute::PerProjection.is_fused());
     }
+
+    /// `FusedQkvKernel` discriminant geometry — both Q4k and Q4kf
+    /// arms must return their shader's compile-time constants.  Pin
+    /// the values so a future shader refactor that drifts ROWS_PER_TG
+    /// fails this test before it ships.
+    #[test]
+    fn fused_qkv_kernel_geometry_constants_match_shaders() {
+        assert_eq!(
+            FusedQkvKernel::Q4k.rows_per_tg(),
+            crate::shaders::q4k_qkv_proj::ROWS_PER_TG
+        );
+        assert_eq!(
+            FusedQkvKernel::Q4k.threads_per_tg(),
+            crate::shaders::q4k_qkv_proj::THREADS_PER_TG
+        );
+        assert_eq!(
+            FusedQkvKernel::Q4kf.rows_per_tg(),
+            crate::shaders::q4kf_qkv_proj::ROWS_PER_TG
+        );
+        assert_eq!(
+            FusedQkvKernel::Q4kf.threads_per_tg(),
+            crate::shaders::q4kf_qkv_proj::THREADS_PER_TG
+        );
+    }
+
+    /// `encode_fused_q8` end-to-end: dispatch the q8 QKV projection
+    /// kernel with synthetic Q8 inputs.  The numerical output isn't
+    /// asserted (synthetic zero weights produce zero output) — we
+    /// just pin that the dispatch completes and writes finite values.
+    #[test]
+    fn encode_fused_q8_dispatch_completes() {
+        let m = crate::MetalBackend::new().expect("Metal device available");
+        let hidden = 64usize;
+        let q_rows = 16usize;
+        let kv_rows = 8usize;
+
+        let zero_q8 = vec![0i8; (q_rows + kv_rows + kv_rows) * hidden];
+        let zero_f32 = vec![0.0f32; q_rows + kv_rows + kv_rows];
+        let wq_buf = m.bufs.transient_from_i8(&zero_q8[..q_rows * hidden]);
+        let wk_buf = m.bufs.transient_from_i8(&zero_q8[..kv_rows * hidden]);
+        let wv_buf = m.bufs.transient_from_i8(&zero_q8[..kv_rows * hidden]);
+        let wq_scale = m.bufs.transient_from_f32(&zero_f32[..q_rows]);
+        let wk_scale = m.bufs.transient_from_f32(&zero_f32[..kv_rows]);
+        let wv_scale = m.bufs.transient_from_f32(&zero_f32[..kv_rows]);
+        let q8_in = m.bufs.transient_from_i8(&vec![0i8; hidden]);
+        let q8s_in = m.bufs.transient_from_f32(&vec![0.0f32; hidden / 32]);
+        let q_out = m.bufs.output((q_rows * 4) as u64);
+        let k_out = m.bufs.output((kv_rows * 4) as u64);
+        let v_out = m.bufs.output((kv_rows * 4) as u64);
+
+        let cmd = m.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        encode_fused_q8(
+            enc,
+            &m.attention.q8_qkv_proj_pipeline.state,
+            &wq_buf,
+            &wq_scale,
+            &wk_buf,
+            &wk_scale,
+            &wv_buf,
+            &wv_scale,
+            &q8_in,
+            0,
+            &q8s_in,
+            0,
+            &q_out,
+            0,
+            &k_out,
+            0,
+            &v_out,
+            0,
+            q_rows,
+            kv_rows,
+            hidden,
+        );
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let q = crate::buffers::read_buffer_f32(&q_out, q_rows);
+        let k = crate::buffers::read_buffer_f32(&k_out, kv_rows);
+        let v = crate::buffers::read_buffer_f32(&v_out, kv_rows);
+        assert!(q.iter().all(|x| x.is_finite()));
+        assert!(k.iter().all(|x| x.is_finite()));
+        assert!(v.iter().all(|x| x.is_finite()));
+    }
 }

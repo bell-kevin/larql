@@ -57,8 +57,11 @@ impl KvDispatch for MetalBackend {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<Array2<f32>> {
-        CPU.attention_step(weights, query, kv, layer, abs_position)
+        // A3 scaffold delegates to CPU. A4/A6 will introduce a Q4K-native
+        // Metal path when `index` is `Some` and Q4K data is available.
+        CPU.attention_step(weights, query, kv, layer, abs_position, index)
     }
 
     fn attention_step_windowed(
@@ -69,8 +72,9 @@ impl KvDispatch for MetalBackend {
         layer: usize,
         abs_position: usize,
         window: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<Array2<f32>> {
-        CPU.attention_step_windowed(weights, query, kv, layer, abs_position, window)
+        CPU.attention_step_windowed(weights, query, kv, layer, abs_position, window, index)
     }
 
     fn attention_prefill(
@@ -79,8 +83,9 @@ impl KvDispatch for MetalBackend {
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
-        CPU.attention_prefill(weights, tokens_embedded, layer, window)
+        CPU.attention_prefill(weights, tokens_embedded, layer, window, index)
     }
 
     fn recompute_kv_from_residuals(
@@ -126,13 +131,76 @@ impl KvDispatch for MetalBackend {
     ) -> Array2<f32> {
         CPU.residual_norm_store(x, residual, norm_weights)
     }
+
+    // ── Coarse fused intents ────────────────────────────────────────
+    //
+    // Route through Metal's fused `prefill_q4` / `decode_token` kernels
+    // — the production Metal hot path that powers `larql bench` at
+    // ~87–100 tok/s on Gemma 3 4B Q4K. K/V cache state lives inside
+    // `MetalBackend`'s internal `kv_cache` mutex; the returned
+    // `KvHandle` is a sentinel since the engine doesn't manage the
+    // state directly.
+
+    fn coarse_prefill(
+        &self,
+        weights: &mut ModelWeights,
+        token_ids: &[u32],
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Option<(Array2<f32>, KvHandle)> {
+        let index = index?;
+        let hidden = crate::vindex::metal_fused_prefill(weights, index, token_ids, self)?;
+        Some((hidden, KvHandle::new(MetalCoarseHandle)))
+    }
+
+    fn coarse_decode_step(
+        &self,
+        weights: &mut ModelWeights,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+        _handle: &mut KvHandle,
+        _abs_position: usize,
+    ) -> Option<Array2<f32>> {
+        let index = index?;
+        // K/V state lives inside `MetalBackend`'s internal mutex — the
+        // `_handle` is a sentinel populated by `coarse_prefill`; we
+        // don't read from it. `_abs_position` is tracked by the backend
+        // via the K/V cache row count.
+        crate::vindex::metal_fused_decode_step(weights, index, token_id, self)
+    }
 }
 
-// `KvHandleInner` and `ResidualHandleInner` placeholders are not needed
-// at Step 4 — we reuse `CpuKvHandle` and `CpuResidualHandle` from the
-// CPU module since handles are host-resident. Step 5 will introduce
-// `MetalKvHandle` (wrapping `MTLBuffer`) and `MetalResidualHandle` once
-// real Metal compute lands.
+/// Sentinel `KvHandleInner` for `MetalBackend::coarse_prefill` — the
+/// actual K/V state lives in `MetalBackend`'s internal `kv_cache`
+/// mutex, populated by the fused `prefill_q4` / `decode_token` kernels.
+/// The handle exists to satisfy the trait shape; engines must treat it
+/// opaquely.
+pub struct MetalCoarseHandle;
+
+impl KvHandleInner for MetalCoarseHandle {
+    fn cached_len(&self) -> usize {
+        // Backend-side state; not exposed through the handle. Engines
+        // that need the cache length should query the backend directly.
+        0
+    }
+    fn kv_dim(&self) -> usize {
+        0
+    }
+    fn backend_name(&self) -> &'static str {
+        "metal-coarse"
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+// `KvHandleInner` and `ResidualHandleInner` placeholders for the
+// per-layer dispatch path are not needed at Step 4 — we reuse
+// `CpuKvHandle` and `CpuResidualHandle` from the CPU module since
+// handles are host-resident. Step 5 will introduce `MetalKvHandle`
+// (wrapping `MTLBuffer`) once real per-layer Metal compute lands.
 
 #[cfg(test)]
 mod tests {
@@ -180,9 +248,9 @@ mod tests {
             let ffn = crate::ffn::WeightFfn { weights: &weights };
             let prompt = vec![0u32, 1, 2];
 
-            let (h_metal, _) = kv_prefill_via_dispatch(&metal, &weights, &ffn, &prompt, None)
+            let (h_metal, _) = kv_prefill_via_dispatch(&metal, &weights, &ffn, &prompt, None, None)
                 .expect("metal prefill");
-            let (h_cpu, _) = kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None)
+            let (h_cpu, _) = kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None, None)
                 .expect("cpu prefill");
 
             assert_eq!(
@@ -200,9 +268,9 @@ mod tests {
             let prompt = vec![0u32, 1];
 
             let (_, mut metal_handles) =
-                kv_prefill_via_dispatch(&metal, &weights, &ffn, &prompt, None).unwrap();
+                kv_prefill_via_dispatch(&metal, &weights, &ffn, &prompt, None, None).unwrap();
             let (_, mut cpu_handles) =
-                kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None).unwrap();
+                kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None, None).unwrap();
 
             let h_metal = kv_decode_step_via_dispatch(
                 &metal,
@@ -211,6 +279,7 @@ mod tests {
                 &mut metal_handles,
                 2u32,
                 prompt.len(),
+                None,
                 None,
             )
             .expect("metal decode");
@@ -221,6 +290,7 @@ mod tests {
                 &mut cpu_handles,
                 2u32,
                 prompt.len(),
+                None,
                 None,
             )
             .expect("cpu decode");
@@ -291,15 +361,15 @@ mod tests {
             let weights = make_test_weights();
             let tokens = vec![0u32, 1, 2, 3];
             let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
-            let (_, mut kv_metal) = metal.attention_prefill(&weights, &h_in, 0, None).unwrap();
-            let (_, mut kv_cpu) = CPU.attention_prefill(&weights, &h_in, 0, None).unwrap();
+            let (_, mut kv_metal) = metal.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
+            let (_, mut kv_cpu) = CPU.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
             let h_new = crate::forward::embed_tokens_pub(&weights, &[4u32]);
 
             let h_metal = metal
-                .attention_step_windowed(&weights, &h_new, &mut kv_metal, 0, tokens.len(), 2)
+                .attention_step_windowed(&weights, &h_new, &mut kv_metal, 0, tokens.len(), 2, None)
                 .unwrap();
             let h_cpu = CPU
-                .attention_step_windowed(&weights, &h_new, &mut kv_cpu, 0, tokens.len(), 2)
+                .attention_step_windowed(&weights, &h_new, &mut kv_cpu, 0, tokens.len(), 2, None)
                 .unwrap();
             assert_eq!(h_metal, h_cpu);
             assert_eq!(kv_metal.cached_len(), 2);

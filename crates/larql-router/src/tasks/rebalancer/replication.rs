@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use larql_router_protocol::{RouterMessage, RouterPayload, UnassignMsg};
 
 use crate::grid::GridState;
+use crate::metrics::RouterMetrics;
 
 /// Phase 4: pull spares from the available pool to bring under-replicated
 /// ranges up to their effective target (`target_replicas`, plus the
@@ -27,13 +28,21 @@ use crate::grid::GridState;
 /// Note: this no longer short-circuits on `target_replicas <= 1` because
 /// the hot-shard tick can elevate a range's effective target above 1
 /// even when the static target is 1.
-pub(super) async fn check_under_replication(state: &Arc<RwLock<GridState>>) {
+pub(super) async fn check_under_replication(
+    state: &Arc<RwLock<GridState>>,
+    metrics: Option<&RouterMetrics>,
+) {
     let assigned = state.write().await.try_replicate_from_available();
     if assigned > 0 {
         tracing::info!(
             assigned,
             "Rebalancer: replicated under-replicated ranges from available pool"
         );
+        if let Some(m) = metrics {
+            m.rebalancer_actions_total
+                .with_label_values(&["replicate"])
+                .inc_by(assigned as u64);
+        }
     }
 }
 
@@ -41,25 +50,29 @@ pub(super) async fn check_under_replication(state: &Arc<RwLock<GridState>>) {
 /// `UnassignMsg` to the least-loaded server. Defensive — never drops below
 /// `target_replicas` (the over-replicated check already ensures the count is
 /// strictly greater).
-pub(super) async fn check_over_replication(state: &Arc<RwLock<GridState>>) {
-    // Snapshot ranges + chosen victims while holding only a read lock.
-    let plan: Vec<(String, String, u32, u32)> = {
+pub(super) async fn check_over_replication(
+    state: &Arc<RwLock<GridState>>,
+    metrics: Option<&RouterMetrics>,
+) {
+    // Snapshot slices + chosen victims while holding only a read lock.
+    // Tuple shape: (server_id, model_id, layer_start, layer_end, expert_start, expert_end).
+    let plan: Vec<(String, String, u32, u32, u32, u32)> = {
         let g = state.read().await;
         if g.target_replicas() == 0 {
             return;
         }
         g.over_replicated_ranges()
             .into_iter()
-            .filter_map(|(model_id, start, end, _surplus)| {
-                g.least_loaded_in_range(&model_id, start, end)
-                    .map(|e| (e.server_id.clone(), model_id, start, end))
+            .filter_map(|(model_id, ls, le, es, ee, _surplus)| {
+                g.least_loaded_in_range(&model_id, ls, le, es, ee)
+                    .map(|e| (e.server_id.clone(), model_id, ls, le, es, ee))
             })
             .collect()
     };
     if plan.is_empty() {
         return;
     }
-    for (server_id, model_id, start, end) in plan {
+    for (server_id, model_id, ls, le, _es, _ee) in plan {
         let tx = {
             let g = state.read().await;
             g.serving_sender(&server_id)
@@ -71,8 +84,8 @@ pub(super) async fn check_over_replication(state: &Arc<RwLock<GridState>>) {
         let msg = RouterMessage {
             payload: Some(RouterPayload::Unassign(UnassignMsg {
                 model_id: model_id.clone(),
-                layer_start: start,
-                layer_end: end,
+                layer_start: ls,
+                layer_end: le,
                 reason: "over_replicated".into(),
             })),
         };
@@ -80,9 +93,14 @@ pub(super) async fn check_over_replication(state: &Arc<RwLock<GridState>>) {
             tracing::info!(
                 server_id,
                 model_id,
-                layers = %format!("{start}-{end}"),
+                layers = %format!("{ls}-{le}"),
                 "Rebalancer: dropping over-replicated replica"
             );
+            if let Some(m) = metrics {
+                m.rebalancer_actions_total
+                    .with_label_values(&["drop"])
+                    .inc();
+            }
         } else {
             tracing::warn!(
                 server_id,
@@ -101,6 +119,52 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
+    async fn under_replication_bumps_replicate_counter() {
+        use crate::metrics::{encode_metrics_text, RouterMetrics};
+        let m = RouterMetrics::new();
+
+        let state = Arc::new(RwLock::new(GridState::default()));
+        let (spare_tx, _spare_rx) = mpsc::channel::<Result<RouterMessage, tonic::Status>>(4);
+        {
+            let mut g = state.write().await;
+            g.set_target_replicas(2);
+            g.register(entry("a", "http://a", "m", 0, 4));
+            g.register_available("spare".into(), spare_tx, 1, 0, "/".into());
+        }
+        check_under_replication(&state, Some(&m)).await;
+
+        let text = encode_metrics_text(&m).unwrap();
+        assert!(text.contains("larql_router_rebalancer_actions_total{action=\"replicate\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn over_replication_bumps_drop_counter() {
+        use crate::metrics::{encode_metrics_text, RouterMetrics};
+        let m = RouterMetrics::new();
+
+        // Two replicas of the same range, both with senders so HashMap
+        // iteration order can't pick a senderless victim. Distinct
+        // requests_in_flight values make least-loaded deterministic.
+        let state = Arc::new(RwLock::new(GridState::default()));
+        let (idle_tx, _idle_rx) = mpsc::channel::<Result<RouterMessage, tonic::Status>>(4);
+        let (busy_tx, _busy_rx) = mpsc::channel::<Result<RouterMessage, tonic::Status>>(4);
+        {
+            let mut g = state.write().await;
+            g.set_target_replicas(1);
+            let mut idle = entry("idle", "http://idle", "m", 0, 4);
+            idle.requests_in_flight = 0;
+            g.register_with_sender(idle, idle_tx);
+            let mut busy = entry("busy", "http://busy", "m", 0, 4);
+            busy.requests_in_flight = 5;
+            g.register_with_sender(busy, busy_tx);
+        }
+        check_over_replication(&state, Some(&m)).await;
+
+        let text = encode_metrics_text(&m).unwrap();
+        assert!(text.contains("larql_router_rebalancer_actions_total{action=\"drop\"} 1"));
+    }
+
+    #[tokio::test]
     async fn under_replication_dispatches_assignment_when_target_above_one() {
         let state = Arc::new(RwLock::new(GridState::default()));
         let (spare_tx, mut spare_rx) = mpsc::channel::<Result<RouterMessage, tonic::Status>>(4);
@@ -110,7 +174,7 @@ mod tests {
             g.register(entry("a", "http://a", "m", 0, 4));
             g.register_available("spare".into(), spare_tx, 1, 0, "/".into());
         }
-        check_under_replication(&state).await;
+        check_under_replication(&state, None).await;
         let msg = spare_rx
             .try_recv()
             .expect("spare should have been used")
@@ -129,7 +193,7 @@ mod tests {
             g.register(entry("a", "http://a", "m", 0, 4));
             g.register_available("spare".into(), tx, 1, 0, "/".into());
         }
-        check_under_replication(&state).await;
+        check_under_replication(&state, None).await;
         assert!(
             rx.try_recv().is_err(),
             "no assignment should fire at target=1"
@@ -160,6 +224,8 @@ mod tests {
                 layer_latencies: HashMap::new(),
                 req_per_sec: 0.0,
                 rtt_ms: None,
+                expert_start: 0,
+                expert_end: 0,
             };
             let busy_2 = ServerEntry {
                 requests_in_flight: 8,
@@ -178,7 +244,7 @@ mod tests {
             g.register(busy_2);
         }
 
-        check_over_replication(&state).await;
+        check_over_replication(&state, None).await;
 
         let received = rx_idle
             .try_recv()
@@ -215,7 +281,7 @@ mod tests {
             busy_2.requests_in_flight = 7;
             g.register_with_sender(busy_2, busy_tx);
         }
-        check_over_replication(&state).await;
+        check_over_replication(&state, None).await;
         // The "no sender" branch is taken; nothing observable on busy_tx
         // because the rebalancer picks `idle` as least-loaded and skips it.
         // Assert through state: no server was removed.

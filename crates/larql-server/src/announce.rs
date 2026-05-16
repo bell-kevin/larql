@@ -205,6 +205,10 @@ fn announce_message(cfg: &AnnounceConfig) -> ServerMessage {
             ram_bytes: cfg.ram_bytes,
             listen_url: cfg.listen_url.clone(),
             vindex_hash: cfg.vindex_hash.clone(),
+            // ADR-0018: dense by default. A future MoE-aware server
+            // CLI flag will surface these.
+            expert_start: 0,
+            expert_end: 0,
         })),
     }
 }
@@ -528,6 +532,8 @@ async fn run_available_loop(
                                         layer_start: assign.layer_start,
                                         layer_end: assign.layer_end,
                                         listen_url: cfg.listen_url.clone(),
+            expert_start: 0,
+            expert_end: 0,
                                     })),
                                 })
                                 .await;

@@ -17,6 +17,7 @@ use tracing::{debug, info};
 use larql_router_protocol::{RouterMessage, RouterPayload, UnassignMsg};
 
 use crate::grid::GridState;
+use crate::metrics::RouterMetrics;
 
 use super::config::RebalancerConfig;
 
@@ -45,6 +46,7 @@ pub(super) async fn check_imbalance(
     state: &Arc<RwLock<GridState>>,
     cfg: &RebalancerConfig,
     tracker: &mut ImbalanceTracker,
+    metrics: Option<&RouterMetrics>,
 ) {
     // Collect per-layer latency data across all servers.
     // Group by (model_id, layer) → Vec<(server_id, avg_ms)>.
@@ -103,6 +105,11 @@ pub(super) async fn check_imbalance(
                         "Rebalancer: sustained imbalance detected — sending UnassignMsg"
                     );
                     send_unassign(state, server_id, &model_id, layer).await;
+                    if let Some(m) = metrics {
+                        m.rebalancer_actions_total
+                            .with_label_values(&["unassign_imbalance"])
+                            .inc();
+                    }
                     tracker.clear(&key);
                 }
             } else {
@@ -183,7 +190,7 @@ mod tests {
             g.register(b);
             // No available pool registered — rebalancer must skip.
         }
-        check_imbalance(&state, &cfg, &mut tracker).await;
+        check_imbalance(&state, &cfg, &mut tracker, None).await;
         // Tracker stays empty — early return before recording.
         assert!(tracker.first_seen.is_empty());
     }
@@ -214,9 +221,10 @@ mod tests {
             sustained_window: Duration::from_secs(0),
             stale_heartbeat_timeout: Duration::from_secs(25),
             hot_shard_rps_threshold: None,
+            hot_shard_demote_ratio: 0.8,
         };
         let mut tracker = ImbalanceTracker::default();
-        check_imbalance(&state, &cfg, &mut tracker).await;
+        check_imbalance(&state, &cfg, &mut tracker, None).await;
         let msg = slow_rx
             .try_recv()
             .expect("slow replica should have been Unassigned")
@@ -251,7 +259,7 @@ mod tests {
         // Pre-populate as if an earlier observation flagged the layer; the
         // balanced state on this tick should clear it.
         tracker.first_seen.insert(("m".into(), 0), Instant::now());
-        check_imbalance(&state, &cfg, &mut tracker).await;
+        check_imbalance(&state, &cfg, &mut tracker, None).await;
         assert!(
             tracker.first_seen.is_empty(),
             "balanced layer should clear tracker entry"

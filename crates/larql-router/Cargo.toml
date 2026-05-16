@@ -30,6 +30,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = { workspace = true }
 futures = "0.3"
 futures-core = "0.3"
+# ADR-0017 — Prometheus /metrics endpoint. Pulled in unconditionally
+# (no feature flag) because metrics are a default-on operability
+# surface, not an opt-in transport.
+prometheus = { version = "0.13", default-features = false }
 
 # rustls is only used when the `quic` feature is on. Pulled in here so the
 # `spawn_quic_listener` helper can call `rustls::crypto::ring::default_provider()`
@@ -50,6 +54,10 @@ default = []
 # feature flag governs both the wire-format crate and the binary that
 # uses it. With this off, the router has no UDP socket or TLS code paths.
 quic = ["larql-router-protocol/quic", "dep:rustls"]
+# ADR-0019: real HTTP/3 shard transport. Routes MoE expert fan-out
+# (ADR-0018) through h3 instead of reqwest's HTTP/2-over-TCP. Opt-in
+# via the `--http3-shards` CLI flag at runtime.
+http3 = ["quic", "larql-router-protocol/http3"]
 
 [[bench]]
 name = "routing"

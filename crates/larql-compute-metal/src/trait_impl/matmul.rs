@@ -711,7 +711,9 @@ mod tests {
         let m = backend();
         // Build a column-major view (non-standard layout) by transposing.
         let raw: Vec<f32> = (0..16).map(|i| i as f32).collect();
-        let w_t = ndarray::Array2::from_shape_vec((4, 4), raw).unwrap().reversed_axes();
+        let w_t = ndarray::Array2::from_shape_vec((4, 4), raw)
+            .unwrap()
+            .reversed_axes();
         assert!(w_t.as_slice().is_none(), "test setup: non-standard layout");
         let x = vec![1.0f32; 4];
         let out = m
@@ -729,7 +731,7 @@ mod tests {
         assert!(m.f16_gemv(&w, &x, 4, 4).is_none());
         assert!(m.f16_gemv_force(&w, &x, 4, 4).is_none());
         // x.len() != k — even on `force`.
-        let w = larql_models::quant::half::encode_f16(&vec![0.0f32; 16]);
+        let w = larql_models::quant::half::encode_f16(&[0.0f32; 16]);
         let x = vec![0.0f32; 3];
         assert!(m.f16_gemv_force(&w, &x, 4, 4).is_none());
     }
@@ -738,7 +740,7 @@ mod tests {
     #[test]
     fn f16_gemv_falls_back_below_flop_threshold() {
         let m = backend();
-        let w_f16 = larql_models::quant::half::encode_f16(&vec![0.5f32; 4]);
+        let w_f16 = larql_models::quant::half::encode_f16(&[0.5f32; 4]);
         let x = vec![1.0f32; 2];
         assert!(m.f16_gemv(&w_f16, &x, 2, 2).is_none());
     }

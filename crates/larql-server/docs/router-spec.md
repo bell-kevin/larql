@@ -98,6 +98,7 @@ larql-server output/gemma3-4b-q4k.vindex \
 | `--rebalance-interval <SECS>` | 30 | GT6 rebalancer tick cadence. `0` disables dynamic rebalancing entirely. |
 | `--rebalance-threshold <RATIO>` | 2.0 | GT6 latency-imbalance trigger; the slowest replica must be this many times slower than the fastest. |
 | `--hot-shard-rps <FRAC>` | — | Hot-shard load-rate replication: a shard whose max `req_per_sec` across replicas exceeds this value is treated as effectively under-replicated (`target + 1`) until the rate subsides. Unset disables the check. |
+| `--hot-shard-demote-ratio <FRAC>` | 0.8 | ADR-0014 hysteresis. An elevated shard demotes only when its rate falls below `ratio × --hot-shard-rps`. Setting to `1.0` disables hysteresis (single-threshold mode). Values outside `(0.0, 1.0]` clamp to the default. |
 | `--rtt-probe-interval-secs <N>` | 0 | Active-probe RTT cadence. When `>0`, the router periodically `GET`s `{listen_url}/v1/health` on every serving server and uses the recorded round-trip as a tie-breaker after GT3 per-layer latency in `route()`. `0` disables probing (default — GT3 already subsumes RTT in steady state). |
 | `--log-level <LEVEL>` | info | Tracing log level. |
 
@@ -150,13 +151,40 @@ Omit for single-model deployments.
 {"layer": 5, "model_id": "gemma3-4b-q4k", "residual": [...]}
 ```
 
+**MoE expert routing (ADR-0018) — single layer + experts:**
+
+```json
+{"layer": 5, "experts": [0, 3, 7], "residual": [...]}
+→ {"results": [{"layer": 5, "expert": 0, ...}, ...], "latency_ms": 11.2}
+```
+
+The router fans out per `(layer, expert_id)` pair to the owning
+expert-shard, then merges the responses. Requires a grid
+(`--grid-port`); static `--shards` mode 503s on MoE bodies.
+
+**MoE expert routing — multi-layer + experts:**
+
+```json
+{"layer_experts": [
+   {"layer": 5, "experts": [0, 3]},
+   {"layer": 6, "experts": [1, 5]}
+ ], "residual": [...]}
+```
+
+The two shapes are mutually exclusive at parse time (`layer_experts`
+takes priority). `layer` / `layers` (dense) and `experts` /
+`layer_experts` (MoE) cannot be mixed in one request.
+
 **Error responses:**
 
 | Condition | HTTP | Body |
 |-----------|------|------|
 | Layer has no owning shard | 400 | `{"error": "layer N has no owning shard in this router"}` |
-| Neither `layer` nor `layers` | 400 | `{"error": "must provide 'layer' or 'layers'"}` |
-| Empty `layers` array | 400 | `{"error": "empty layer list"}` |
+| `(layer, expert_id)` has no owning MoE shard | 503 | `{"error": "no shard owns (layer N, expert E) in this router"}` |
+| MoE body against static-`--shards`-only router | 503 | `{"error": "MoE routing requires a self-assembling grid"}` |
+| Neither `layer` nor `layers` nor MoE shape | 400 | `{"error": "must provide 'layer' or 'layers'"}` |
+| `experts` array without `layer` | 400 | `{"error": "moe: 'experts' requires a 'layer' scalar"}` |
+| Empty `layers` / `experts` / `layer_experts` | 400 | `{"error": "empty layer list"}` |
 | Shard unreachable | 502 | `{"error": "shard http://...: ..."}` |
 | Shard returns error | forwarded | Shard status + body passed through |
 

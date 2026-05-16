@@ -53,6 +53,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         static_shards: shards,
         grid: None, // No self-assembling grid in this example.
         client,
+        // Metrics are optional; the example skips them for brevity.
+        // Production builds carry `Some(RouterMetrics::new())` here.
+        metrics: None,
+        #[cfg(feature = "http3")]
+        h3_client: None,
     });
 
     let app = build_router(state);

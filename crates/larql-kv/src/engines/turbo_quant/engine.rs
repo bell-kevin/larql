@@ -356,14 +356,27 @@ impl TurboQuantEngine {
         let mut h = embed_tokens_pub(weights, token_ids);
         self.layers.clear();
 
+        // Hoist WalkFfn — was rebuilt 34× per prefill.
+        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+            .with_backend(backend);
+
         for layer in 0..num_layers {
             let (h_post_attn, k, v) = run_attention_with_kv_backend(weights, &h, layer, be)?;
             self.layers
                 .push(CompressedLayer::compress(&(k, v), &self.tq));
 
-            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-                .with_backend(backend);
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            // Native-quantised FFN; falls back to WalkFfn → dense f32.
+            let h_out = larql_inference::vindex::ffn_decode_step_native(
+                weights,
+                index,
+                backend,
+                &h_post_attn,
+                layer,
+            )
+            .unwrap_or_else(|| {
+                let (h, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+                h
+            });
             h = h_out;
         }
 
@@ -383,16 +396,33 @@ impl TurboQuantEngine {
         let abs_position = self.abs_position;
         let mut h = embed_tokens_pub(weights, &[token_id]);
 
+        // Hoist WalkFfn — was rebuilt 34× per decode step.
+        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+            .with_backend(backend);
+
         for layer in 0..num_layers {
             let prior_kv = self.layers[layer].decompress(&self.tq);
-            let (h_post_attn, updated_kv) = run_attention_block_decode_step_backend(
-                weights,
-                &h,
-                layer,
-                Some(&prior_kv),
-                abs_position,
-                Some(backend),
-            )?;
+            // Try native-quantised attention helper; fall back to f32.
+            let (h_post_attn, updated_kv) =
+                larql_inference::vindex::attention_decode_step_native(
+                    weights,
+                    index,
+                    backend,
+                    &h,
+                    layer,
+                    Some(&prior_kv),
+                    abs_position,
+                )
+                .or_else(|| {
+                    run_attention_block_decode_step_backend(
+                        weights,
+                        &h,
+                        layer,
+                        Some(&prior_kv),
+                        abs_position,
+                        Some(backend),
+                    )
+                })?;
             let arch = &*weights.arch;
             let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
             self.layers[layer] = CompressedLayer {
@@ -402,9 +432,18 @@ impl TurboQuantEngine {
                 kv_dim,
                 head_dim: detect_head_dim(kv_dim),
             };
-            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-                .with_backend(backend);
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            // Native-quantised FFN; falls back to WalkFfn → dense f32.
+            let h_out = larql_inference::vindex::ffn_decode_step_native(
+                weights,
+                index,
+                backend,
+                &h_post_attn,
+                layer,
+            )
+            .unwrap_or_else(|| {
+                let (h, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+                h
+            });
             h = h_out;
         }
 

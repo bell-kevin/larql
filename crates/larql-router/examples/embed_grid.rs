@@ -34,6 +34,8 @@ fn server(
         layer_latencies: HashMap::new(),
         req_per_sec: 0.0,
         rtt_ms: None,
+        expert_start: 0,
+        expert_end: 0,
     }
 }
 
@@ -68,17 +70,18 @@ fn main() {
     // req/sec threshold the rebalancer raises its effective target by 1
     // so the under-replication tick will pull a spare.
     grid.set_target_replicas(1);
-    grid.mark_elevated("gemma3:4b", 0, 14);
+    // ADR-0018: dense shards pass 0/0 for the expert range.
+    grid.mark_elevated("gemma3:4b", 0, 14, 0, 0);
     println!("\n== Hot-shard elevation ==");
     println!(
         "  effective_target_for(0-14) = {}",
-        grid.effective_target_for("gemma3:4b", 0, 14)
+        grid.effective_target_for("gemma3:4b", 0, 14, 0, 0)
     );
     println!(
         "  under_replicated_ranges    = {:?}",
         grid.under_replicated_ranges()
     );
-    grid.demote_elevated("gemma3:4b", 0, 14);
+    grid.demote_elevated("gemma3:4b", 0, 14, 0, 0);
 
     // Coverage gaps + over/under-replication ledger.
     println!("\n== Coverage + replication ==");
@@ -104,5 +107,47 @@ fn main() {
             .find(|m| m.model_id == "gemma3:4b")
             .map(|m| m.shards.len())
             .unwrap_or(0)
+    );
+
+    // ── ADR-0018: MoE expert routing ────────────────────────────────────────
+    //
+    // Demo with a Mixtral-8x7B-shaped layer: 1 layer (call it layer 100),
+    // 8 experts split into 2 expert-shards (experts 0-3 + experts 4-7).
+    // Two physical hosts; each owns one expert-shard.
+    let mut moe_lo = server("moe-lo", "http://moe-lo:9101", "mixtral:8x7b", 100, 100);
+    moe_lo.expert_start = 0;
+    moe_lo.expert_end = 3;
+    let mut moe_hi = server("moe-hi", "http://moe-hi:9102", "mixtral:8x7b", 100, 100);
+    moe_hi.expert_start = 4;
+    moe_hi.expert_end = 7;
+    grid.register(moe_lo);
+    grid.register(moe_hi);
+
+    println!("\n== MoE routing ==");
+    println!(
+        "  route_expert(layer=100, expert=0) -> {:?}",
+        grid.route_expert(Some("mixtral:8x7b"), 100, 0)
+    );
+    println!(
+        "  route_expert(layer=100, expert=5) -> {:?}",
+        grid.route_expert(Some("mixtral:8x7b"), 100, 5)
+    );
+    println!(
+        "  route_expert(layer=100, expert=99 — out of range) -> {:?}",
+        grid.route_expert(Some("mixtral:8x7b"), 100, 99)
+    );
+    // Batched form — top-K fan-out for a single token.
+    let top_k_pairs = vec![(100usize, 0u32), (100, 3), (100, 5), (100, 7)];
+    println!(
+        "  route_all_experts(top-4) = {:?}",
+        grid.route_all_experts(Some("mixtral:8x7b"), &top_k_pairs)
+    );
+
+    // Dense routing still works unchanged — the gemma3:4b shards
+    // registered earlier respond to `route()` the way they always did.
+    println!("\n== Dense routing still works after MoE registration ==");
+    println!(
+        "  route(gemma3:4b, layer=5) -> {:?}",
+        grid.route(Some("gemma3:4b"), 5)
     );
 }

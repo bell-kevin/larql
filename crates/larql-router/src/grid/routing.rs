@@ -48,9 +48,16 @@ impl GridState {
             None => self.any_model_table.get(&layer),
         };
         ids.and_then(|server_ids| {
+            let ceiling = self.saturation_ceiling;
             server_ids
                 .iter()
                 .filter_map(|id| self.servers.get(id))
+                // ADR-0020 — drop replicas at or above the saturation
+                // ceiling before the comparator runs.
+                .filter(|e| match ceiling {
+                    Some(c) => e.requests_in_flight < c,
+                    None => true,
+                })
                 .min_by(|a, b| compare_servers_for_route(a, b, layer))
                 .map(|s| s.listen_url.clone())
         })
@@ -71,6 +78,81 @@ impl GridState {
                     out.insert(layer, url);
                 }
                 None => return Err(layer),
+            }
+        }
+        Ok(out)
+    }
+
+    /// ADR-0020 — does at least one server own the requested layer?
+    ///
+    /// Unlike [`Self::route`], this skips the three-tier comparator
+    /// AND the saturation filter — it only asks "is the topology
+    /// configured to cover this layer at all?" Lets the dispatcher
+    /// distinguish two failure modes:
+    ///
+    ///   * `route()` returns `None` AND `has_owners_for` returns
+    ///     `false` → **400** (no shard configured)
+    ///   * `route()` returns `None` AND `has_owners_for` returns
+    ///     `true` → **503** (all owning shards are saturated)
+    pub fn has_owners_for(&self, model_id: Option<&str>, layer: u32) -> bool {
+        let ids = match model_id {
+            Some(m) => self.route_table.get(&(m.to_owned(), layer)),
+            None => self.any_model_table.get(&layer),
+        };
+        ids.map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    /// ADR-0018 — pick the best replica that owns `(layer, expert_id)`.
+    ///
+    /// Filters the candidate set from the layer's route_table to
+    /// servers where `expert_start..=expert_end` contains `expert_id`,
+    /// then runs the three-tier comparator (ADR-0013) over the filter.
+    /// Dense servers (`expert_start == expert_end == 0`) match every
+    /// expert_id — so a dense model passes through unchanged.
+    pub fn route_expert(
+        &self,
+        model_id: Option<&str>,
+        layer: u32,
+        expert_id: u32,
+    ) -> Option<String> {
+        let ids = match model_id {
+            Some(m) => self.route_table.get(&(m.to_owned(), layer)),
+            None => self.any_model_table.get(&layer),
+        };
+        ids.and_then(|server_ids| {
+            let ceiling = self.saturation_ceiling;
+            server_ids
+                .iter()
+                .filter_map(|id| self.servers.get(id))
+                .filter(|e| e.owns_expert(expert_id))
+                // ADR-0020 — saturation filter applies on the MoE
+                // path too. If every owning expert-shard is at the
+                // ceiling, return None so the dispatcher 503s.
+                .filter(|e| match ceiling {
+                    Some(c) => e.requests_in_flight < c,
+                    None => true,
+                })
+                .min_by(|a, b| compare_servers_for_route(a, b, layer))
+                .map(|s| s.listen_url.clone())
+        })
+    }
+
+    /// Batched form of [`Self::route_expert`]. Returns
+    /// `Ok((layer, expert) → url)` or
+    /// `Err((layer, expert))` for the first pair with no owning server.
+    #[allow(dead_code)]
+    pub fn route_all_experts(
+        &self,
+        model_id: Option<&str>,
+        layer_experts: &[(usize, u32)],
+    ) -> Result<HashMap<(usize, u32), String>, (usize, u32)> {
+        let mut out = HashMap::with_capacity(layer_experts.len());
+        for &(layer, expert_id) in layer_experts {
+            match self.route_expert(model_id, layer as u32, expert_id) {
+                Some(url) => {
+                    out.insert((layer, expert_id), url);
+                }
+                None => return Err((layer, expert_id)),
             }
         }
         Ok(out)
@@ -224,6 +306,110 @@ mod tests {
         assert_eq!(
             compare_servers_for_route(&idle, &busy, 2),
             std::cmp::Ordering::Less,
+        );
+    }
+
+    // ─── ADR-0018: expert-level routing ──────────────────────────────────────
+
+    /// `route_expert` against a dense server returns the same URL as
+    /// `route`: dense servers own every expert_id trivially.
+    #[test]
+    fn route_expert_passthrough_for_dense_servers() {
+        let mut state = GridState::default();
+        state.register(entry("a", "http://a", "model-a", 0, 5));
+        // Dense by default — expert_start == expert_end == 0.
+        assert_eq!(
+            state.route_expert(Some("model-a"), 3, 7).as_deref(),
+            Some("http://a"),
+            "dense server must satisfy any expert_id"
+        );
+        assert_eq!(
+            state.route_expert(Some("model-a"), 3, 0).as_deref(),
+            Some("http://a"),
+        );
+        assert_eq!(
+            state.route_expert(Some("model-a"), 3, 999).as_deref(),
+            Some("http://a"),
+        );
+    }
+
+    /// Two MoE shards split layer 5's experts 0-3 / 4-7. `route_expert`
+    /// must pick the right one for each expert_id.
+    #[test]
+    fn route_expert_filters_by_expert_range() {
+        let mut state = GridState::default();
+        let mut lo = entry("lo", "http://lo", "moe", 5, 5);
+        lo.expert_start = 0;
+        lo.expert_end = 3;
+        let mut hi = entry("hi", "http://hi", "moe", 5, 5);
+        hi.expert_start = 4;
+        hi.expert_end = 7;
+        state.register(lo);
+        state.register(hi);
+
+        assert_eq!(
+            state.route_expert(Some("moe"), 5, 0).as_deref(),
+            Some("http://lo"),
+        );
+        assert_eq!(
+            state.route_expert(Some("moe"), 5, 3).as_deref(),
+            Some("http://lo"),
+        );
+        assert_eq!(
+            state.route_expert(Some("moe"), 5, 4).as_deref(),
+            Some("http://hi"),
+        );
+        assert_eq!(
+            state.route_expert(Some("moe"), 5, 7).as_deref(),
+            Some("http://hi"),
+        );
+        // No server owns expert 99 → miss.
+        assert!(state.route_expert(Some("moe"), 5, 99).is_none());
+    }
+
+    /// `route_all_experts` batches and short-circuits on the first
+    /// uncovered `(layer, expert)` pair.
+    #[test]
+    fn route_all_experts_short_circuits_on_first_uncovered_pair() {
+        let mut state = GridState::default();
+        let mut a = entry("a", "http://a", "moe", 0, 0);
+        a.expert_start = 0;
+        a.expert_end = 3;
+        state.register(a);
+
+        let ok = state.route_all_experts(Some("moe"), &[(0, 0), (0, 2)]);
+        assert!(matches!(ok, Ok(map) if map.len() == 2));
+
+        let miss = state.route_all_experts(Some("moe"), &[(0, 0), (0, 5), (0, 1)]);
+        assert_eq!(miss, Err((0, 5)));
+    }
+
+    /// MoE + dense replicas on the same layer: dense replicas serve
+    /// every expert_id, so adding a dense fallback alongside an MoE
+    /// shard means *every* expert is reachable. Useful for migration
+    /// scenarios.
+    #[test]
+    fn route_expert_dense_replica_serves_as_fallback() {
+        let mut state = GridState::default();
+        let mut moe_shard = entry("moe", "http://moe", "m", 5, 5);
+        moe_shard.expert_start = 0;
+        moe_shard.expert_end = 3;
+        // Dense replica covers everything.
+        let mut dense = entry("dense", "http://dense", "m", 5, 5);
+        dense.requests_in_flight = 100; // make it least-preferred so the MoE shard wins ties
+        state.register(moe_shard);
+        state.register(dense);
+
+        // Expert 2: both own it (MoE explicitly + dense by default).
+        // Comparator picks lowest in-flight → MoE shard (0 vs 100).
+        assert_eq!(
+            state.route_expert(Some("m"), 5, 2).as_deref(),
+            Some("http://moe"),
+        );
+        // Expert 99: MoE doesn't own it; dense wins.
+        assert_eq!(
+            state.route_expert(Some("m"), 5, 99).as_deref(),
+            Some("http://dense"),
         );
     }
 }

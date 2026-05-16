@@ -1,39 +1,18 @@
 {
-  "policy_note": "Default policy is 90% line coverage per source file. The per-file entries below are debt baselines locked at current measured coverage (floor(pct) - 1) so any regression fails the check and any test addition immediately ratchets the floor up. The 90% target is the goal — the multi-day coverage arc (tasks #34-#42) is sweeping these toward 90 file-by-file via the close-then-close strategy. Files NOT listed here already clear the 90% default.",
+  "policy_note": "Default policy is 90% line coverage per source file. The per-file entries below are debt baselines locked at current measured coverage (floor(pct) - 1) so any regression fails the check and any test addition immediately ratchets the floor up. The 90% target is the goal — the multi-day coverage arc is sweeping these toward 90 file-by-file via the close-then-close strategy. Files NOT listed here already clear the 90% default. Coverage runs use `--test-threads=1` (see Makefile) to serialise env-sensitive tests across lib + integration binaries. Session 6 (2026-05-16): 53 files at ≥90%, TOTAL 78.98%. decode_hybrid.rs (94.41%), decode/encode_attn.rs (99.53%), decode/encode_ffn.rs (92.86%) all cleared this session via BackendOptions-direct + PROFILE_SPLIT + non-gated FFN tests.",
   "include_globs": [
     "crates/larql-compute-metal/src/*.rs",
     "crates/larql-compute-metal/src/**/*.rs"
   ],
   "exclude_globs": [],
   "default_line_min_percent": 90.0,
-  "total_line_min_percent": 52.0,
+  "total_line_min_percent": 78.0,
   "per_file_line_min_percent": {
-    "crates/larql-compute-metal/src/decode/diag.rs": 8.0,
-    "crates/larql-compute-metal/src/decode/encode_attn.rs": 49.0,
-    "crates/larql-compute-metal/src/decode/encode_ffn.rs": 23.0,
-    "crates/larql-compute-metal/src/decode/encode_ple.rs": 0.0,
-    "crates/larql-compute-metal/src/decode/encode_post_ffn.rs": 68.0,
-    "crates/larql-compute-metal/src/decode/encode_qkv.rs": 46.0,
-    "crates/larql-compute-metal/src/decode/gpu_timing.rs": 34.0,
-    "crates/larql-compute-metal/src/decode/mod.rs": 59.0,
-    "crates/larql-compute-metal/src/decode/moe_combine.rs": 0.0,
-    "crates/larql-compute-metal/src/decode/moe_interleave.rs": 0.0,
-    "crates/larql-compute-metal/src/decode_hybrid.rs": 0.0,
+    "crates/larql-compute-metal/src/decode/diag.rs": 85.0,
     "crates/larql-compute-metal/src/diag/kernel_profile.rs": 0.0,
-    "crates/larql-compute-metal/src/diag/shader_bench.rs": 3.0,
-    "crates/larql-compute-metal/src/direct_ops.rs": 62.0,
-    "crates/larql-compute-metal/src/f32_ops.rs": 61.0,
+    "crates/larql-compute-metal/src/diag/shader_bench.rs": 4.0,
     "crates/larql-compute-metal/src/lib.rs": 0.0,
-    "crates/larql-compute-metal/src/moe_dispatch.rs": 29.0,
-    "crates/larql-compute-metal/src/ops/full_layer.rs": 0.0,
-    "crates/larql-compute-metal/src/ops/full_pipeline/dispatch.rs": 78.0,
-    "crates/larql-compute-metal/src/ops/full_pipeline/dump.rs": 41.0,
-    "crates/larql-compute-metal/src/ops/full_pipeline/stages.rs": 61.0,
-    "crates/larql-compute-metal/src/pipeline.rs": 13.0,
-    "crates/larql-compute-metal/src/stages/ffn.rs": 54.0,
-    "crates/larql-compute-metal/src/stages/qkv_proj.rs": 67.0,
-    "crates/larql-compute-metal/src/stages/quant_matvec.rs": 69.0,
-    "crates/larql-compute-metal/src/trait_impl/decode.rs": 20.0,
-    "crates/larql-compute-metal/src/trait_impl/matmul.rs": 80.0
+    "crates/larql-compute-metal/src/moe_dispatch.rs": 38.0,
+    "crates/larql-compute-metal/src/pipeline.rs": 26.0
   }
 }

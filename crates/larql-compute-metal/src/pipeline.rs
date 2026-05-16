@@ -163,3 +163,34 @@ impl MetalBackend {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    /// `multi_layer_q4_ffn` dispatches gate → up → GEGLU → down → Q8
+    /// per layer in a single command buffer.
+    #[test]
+    fn multi_layer_q4_ffn_dispatches_two_layers() {
+        let m = backend();
+        let block_bytes = 18usize;
+        let hidden = 32usize;
+        let inter = 64usize;
+        let blocks_per_row = hidden / 32;
+        let gate = vec![0u8; inter * blocks_per_row * block_bytes];
+        let up = vec![0u8; inter * blocks_per_row * block_bytes];
+        let down = vec![0u8; hidden * (inter / 32) * block_bytes];
+        let layers = vec![
+            (gate.as_slice(), up.as_slice(), down.as_slice()),
+            (gate.as_slice(), up.as_slice(), down.as_slice()),
+        ];
+        let x = vec![0.0f32; hidden];
+        let out = m.multi_layer_q4_ffn(&layers, &x, inter, hidden);
+        assert_eq!(out.len(), hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+}

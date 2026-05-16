@@ -1,6 +1,7 @@
 # ADR-0014 — Hot-Shard Load-Rate Replication
 
-**Status:** Accepted — shipped 2026-05-15.
+**Status:** Accepted — shipped 2026-05-15. **Amended 2026-05-16**
+with two-threshold hysteresis (see §"Cool-down" below).
 **Depends on:** ADR-0004 (self-assembling grid), ADR-0011
 (rebalancer + replication)
 **Implementation:** `crates/larql-router/src/grid/hot_shard.rs`,
@@ -121,7 +122,62 @@ as a config error), not match-everything. The `!(threshold > 0.0)`
 form returns true for NaN, zero, and negatives — all three
 correctly disable.
 
-### Cool-down: rebalancer tick handles both transitions
+### Cool-down: two-threshold hysteresis (amended 2026-05-16)
+
+The original spec used a **single threshold** — a slice was elevated
+whenever its rate exceeded `T` and demoted whenever it did not.
+This left a real oscillation risk at the boundary: traffic
+hovering at exactly `T ± noise` would mark/demote/mark/demote on
+each rebalancer tick, churning a replica pull-then-drop every 30 s
+for no net load change.
+
+The amended scheme uses **two thresholds**:
+
+```
+        rate
+         ▲
+         │  elevated
+   T  ───┼───────────────────  ← elevate when rate > T  (rising edge)
+         │                       (and not yet elevated)
+         │  middle band        ← no-op: previously-elevated stays
+0.8·T ───┼───────────────────    elevated; previously-non stays non
+         │                       (default ratio 0.8 → 20% headroom)
+         │  cool / not elevated← demote when rate < 0.8·T (falling)
+         │                       (only if previously elevated)
+         └─────────────────────▶ time
+```
+
+Implementation: `check_hot_shards` queries `hot_layer_ranges` **twice**
+per tick — once at the elevation threshold `T`, once at the demote
+threshold `T × demote_ratio`. The two-set difference gives the
+elevation and demotion candidates respectively.
+
+```rust
+let hot     = hot_layer_ranges(T);
+let still_hot_for_demote = hot_layer_ranges(T * demote_ratio);
+let elevated = elevated_ranges_snapshot();
+
+// rising-edge: in hot, not yet elevated
+for slice in hot.difference(&elevated)               { mark_elevated(...) }
+// falling-edge: was elevated, now below demote threshold
+for slice in elevated.difference(&still_hot_for_demote) { demote_elevated(...) }
+```
+
+**Default ratio:** `0.8` — 20% headroom below the elevation
+threshold before demotion. Trade-off:
+- **High ratio (≈ 1.0)** — single-threshold behaviour, prone to
+  oscillation but tracks real load closely.
+- **Low ratio (≈ 0.5)** — very stable, but a slice that briefly
+  hits the threshold stays elevated even after sustained cool-down.
+
+0.8 splits the difference and matches conventional load-shedding
+hysteresis (TCP's slow-start uses similar headroom).
+
+**CLI flag:** `--hot-shard-demote-ratio <FRAC>` (default `0.8`).
+Values outside `(0.0, 1.0]` clamp to the default. Setting to `1.0`
+disables hysteresis entirely (reverts to single-threshold).
+
+### Original cool-down (pre-amendment, retained for reference)
 
 The rebalancer's hot-shard tick runs **before** the replication
 ticks each interval:

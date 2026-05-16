@@ -30,6 +30,7 @@ use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::grid::GridState;
+use crate::metrics::RouterMetrics;
 
 /// Per-probe HTTP timeout. Independent of `--timeout-secs` (which
 /// gates fan-out traffic, much heavier than a HEAD probe).
@@ -64,7 +65,11 @@ impl RttProbeConfig {
 
 /// Spawn the probe task. Returns immediately; the task runs for the
 /// process lifetime.
-pub fn spawn(state: Arc<RwLock<GridState>>, cfg: RttProbeConfig) {
+pub fn spawn(
+    state: Arc<RwLock<GridState>>,
+    cfg: RttProbeConfig,
+    metrics: Option<Arc<RouterMetrics>>,
+) {
     let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
         Ok(c) => c,
         Err(e) => {
@@ -72,23 +77,32 @@ pub fn spawn(state: Arc<RwLock<GridState>>, cfg: RttProbeConfig) {
             return;
         }
     };
-    tokio::spawn(probe_task(state, cfg, client));
+    tokio::spawn(probe_task(state, cfg, client, metrics));
 }
 
-async fn probe_task(state: Arc<RwLock<GridState>>, cfg: RttProbeConfig, client: reqwest::Client) {
+async fn probe_task(
+    state: Arc<RwLock<GridState>>,
+    cfg: RttProbeConfig,
+    client: reqwest::Client,
+    metrics: Option<Arc<RouterMetrics>>,
+) {
     let mut interval = tokio::time::interval(cfg.interval);
     // Skip the immediate first tick — give the grid a moment to fill
     // before the first probe round.
     interval.tick().await;
     loop {
         interval.tick().await;
-        probe_round(&state, &client).await;
+        probe_round(&state, &client, metrics.as_deref()).await;
     }
 }
 
 /// One probe round: snapshot the current server list, hit each one
 /// in parallel, write results back under the write lock.
-async fn probe_round(state: &Arc<RwLock<GridState>>, client: &reqwest::Client) {
+async fn probe_round(
+    state: &Arc<RwLock<GridState>>,
+    client: &reqwest::Client,
+    metrics: Option<&RouterMetrics>,
+) {
     // Snapshot under a read lock so the probes run lock-free.
     let targets: Vec<(String, String)> = {
         let g = state.read().await;
@@ -101,7 +115,7 @@ async fn probe_round(state: &Arc<RwLock<GridState>>, client: &reqwest::Client) {
     }
     let probes = targets
         .into_iter()
-        .map(|(id, url)| probe_one(client.clone(), id, url));
+        .map(|(id, url)| probe_one(client.clone(), id, url, metrics));
     let results: Vec<(String, Option<f32>)> = futures::future::join_all(probes).await;
 
     // Write phase: single write lock, batch updates.
@@ -118,23 +132,28 @@ async fn probe_one(
     client: reqwest::Client,
     server_id: String,
     listen_url: String,
+    metrics: Option<&RouterMetrics>,
 ) -> (String, Option<f32>) {
     let url = format!("{}{}", listen_url.trim_end_matches('/'), HEALTH_PATH);
     let t0 = Instant::now();
-    match client.get(&url).send().await {
+    let outcome: (String, Option<f32>, &'static str) = match client.get(&url).send().await {
         Ok(r) if r.status().is_success() => {
             let elapsed_ms = t0.elapsed().as_secs_f32() * 1000.0;
-            (server_id, Some(elapsed_ms))
+            (server_id, Some(elapsed_ms), "success")
         }
         Ok(r) => {
             debug!(server_id, status = %r.status(), "RTT probe: non-2xx response");
-            (server_id, None)
+            (server_id, None, "non_2xx")
         }
         Err(e) => {
             debug!(server_id, error = %e, "RTT probe: request failed");
-            (server_id, None)
+            (server_id, None, "error")
         }
+    };
+    if let Some(m) = metrics {
+        m.rtt_probes_total.with_label_values(&[outcome.2]).inc();
     }
+    (outcome.0, outcome.1)
 }
 
 #[cfg(test)]
@@ -164,6 +183,7 @@ mod tests {
             client,
             "stub".into(),
             "http://127.0.0.1:1".into(), // never listened on
+            None,
         )
         .await;
         assert_eq!(id, "stub");
@@ -177,7 +197,7 @@ mod tests {
     async fn probe_round_is_noop_on_empty_grid() {
         let state = Arc::new(RwLock::new(GridState::default()));
         let client = reqwest::Client::builder().build().unwrap();
-        probe_round(&state, &client).await;
+        probe_round(&state, &client, None).await;
         // No assertions on side effects — the test passes if it
         // returns within the timeout, proving no lock deadlock and
         // no panic on the empty path.
@@ -214,6 +234,8 @@ mod tests {
             layer_latencies: std::collections::HashMap::new(),
             req_per_sec: 0.0,
             rtt_ms: None,
+            expert_start: 0,
+            expert_end: 0,
         }
     }
 
@@ -224,7 +246,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
-        let (id, rtt) = probe_one(client, "srv".into(), format!("http://{addr}")).await;
+        let (id, rtt) = probe_one(client, "srv".into(), format!("http://{addr}"), None).await;
         assert_eq!(id, "srv");
         let rtt = rtt.expect("2xx response must produce a rtt_ms");
         assert!((0.0..1000.0).contains(&rtt), "got {rtt} ms");
@@ -237,7 +259,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
-        let (id, rtt) = probe_one(client, "srv".into(), format!("http://{addr}")).await;
+        let (id, rtt) = probe_one(client, "srv".into(), format!("http://{addr}"), None).await;
         assert_eq!(id, "srv");
         assert!(rtt.is_none(), "non-2xx must surface None, got {rtt:?}");
     }
@@ -254,7 +276,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
-        probe_round(&state, &client).await;
+        probe_round(&state, &client, None).await;
         let g = state.read().await;
         let (_, entry) = g.servers().find(|(id, _)| **id == "srv").unwrap();
         let rtt = entry.rtt_ms.expect("probe_round must write rtt_ms");
@@ -274,7 +296,7 @@ mod tests {
             let cfg = RttProbeConfig {
                 interval: Duration::from_secs(3600),
             };
-            spawn(state, cfg);
+            spawn(state, cfg, None);
         });
     }
 }

@@ -133,6 +133,12 @@ pub fn rs_extend_from_checkpoint_q4k(
     let mut kv_cache: Vec<SharedKV> = prior_kv.to_vec();
     let mut last_hidden: Option<Array2<f32>> = None;
 
+    // Hoist WalkFfn out of both loops. Previously this rebuilt the
+    // WalkFfn once per (token, layer) — N×34 times per extend call.
+    // It's now once total. WalkFfn carries no per-(token,layer) state.
+    let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+        .with_backend(backend);
+
     for (i, &token_id) in token_ids.iter().enumerate() {
         let abs_position = abs_start + i;
         let mut h = embed_tokens_pub(weights, &[token_id]);
@@ -144,18 +150,43 @@ pub fn rs_extend_from_checkpoint_q4k(
                 None
             };
 
-            let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
+            // Try production native-quantised attention helper first;
+            // fall back to f32 path. Same pattern as MarkovResidual.
+            let (h_post_attn, new_kv) = larql_inference::vindex::attention_decode_step_native(
                 weights,
+                index,
+                backend,
                 &h,
                 layer,
                 kv_entry,
                 abs_position,
-                Some(backend),
-            )?;
+            )
+            .or_else(|| {
+                run_attention_block_decode_step_backend(
+                    weights,
+                    &h,
+                    layer,
+                    kv_entry,
+                    abs_position,
+                    Some(backend),
+                )
+            })?;
 
-            let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-                .with_backend(backend);
-            let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            // Native-quantised FFN; falls back to WalkFfn (which falls
+            // further to dense f32 if no sparse features). The native
+            // path is ~100× faster on Gemma 3 4B Q4K — see
+            // `bench/baselines/cpu/async-dispatch-2026-05-16.md`.
+            let h_out = larql_inference::vindex::ffn_decode_step_native(
+                weights,
+                index,
+                backend,
+                &h_post_attn,
+                layer,
+            )
+            .unwrap_or_else(|| {
+                let (h, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+                h
+            });
             h = h_out;
             *kv_slot = new_kv;
         }

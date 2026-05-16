@@ -34,6 +34,8 @@ fn make_entry(id: usize, layer_start: u32, layer_end: u32) -> ServerEntry {
         layer_latencies: HashMap::new(),
         req_per_sec: 0.0,
         rtt_ms: None,
+        expert_start: 0,
+        expert_end: 0,
     }
 }
 
@@ -182,6 +184,102 @@ fn bench_route_all_realistic(c: &mut Criterion) {
     group.finish();
 }
 
+// ── ADR-0018: MoE expert-routing benches ─────────────────────────────────────
+
+/// Build a per-(layer, expert-range) MoE topology mirroring real
+/// large-MoE deployments (DeepSeek-V3-style): one server per (layer,
+/// expert-subset) tuple, no layer overlap across servers.
+///
+/// Args:
+///   `n_layers`            — total layers in the model
+///   `n_expert_shards`     — how many expert shards split each layer
+///   `experts_per_shard`   — width of each expert range (sets the
+///                           total expert_count per layer = shards × width)
+///   `n_replicas`          — replicas per (layer, expert-range) tuple
+///
+/// Returns a `GridState` with
+/// `n_layers × n_expert_shards × n_replicas` servers registered.
+fn build_moe_state(
+    n_layers: usize,
+    n_expert_shards: usize,
+    experts_per_shard: u32,
+    n_replicas: usize,
+) -> GridState {
+    let mut state = GridState::default();
+    let mut sid = 0;
+    for layer in 0..n_layers as u32 {
+        for shard_idx in 0..n_expert_shards as u32 {
+            let expert_start = shard_idx * experts_per_shard;
+            let expert_end = expert_start + experts_per_shard - 1;
+            for _ in 0..n_replicas {
+                let mut entry = make_entry(sid, layer, layer);
+                entry.expert_start = expert_start;
+                entry.expert_end = expert_end;
+                state.register(entry);
+                sid += 1;
+            }
+        }
+    }
+    state
+}
+
+/// `route_expert()` against a single (layer, expert) — the hot path
+/// inside per-token MoE fan-out. K2 / DeepSeek-V3 style topologies.
+fn bench_route_expert_single(c: &mut Criterion) {
+    let mut group = c.benchmark_group("routing/route_expert_single");
+    let scenarios = &[
+        // (n_layers, n_expert_shards, experts_per_shard, n_replicas, label)
+        (1, 4, 64, 1, "1layer_4shards_x256experts"), // V3-like single layer
+        (1, 8, 16, 1, "1layer_8shards_x128experts"), // K2-like single layer
+        (60, 4, 64, 1, "60layers_4shards_x256experts_full_v3"),
+        (60, 4, 64, 2, "60layers_4shards_x256experts_x2"),
+    ];
+    for &(n_layers, n_expert_shards, experts_per_shard, n_replicas, label) in scenarios {
+        let state = build_moe_state(n_layers, n_expert_shards, experts_per_shard, n_replicas);
+        let total_servers = n_layers * n_expert_shards * n_replicas;
+        // Pick a middle expert from a middle layer for the lookup.
+        let target_layer = (n_layers / 2) as u32;
+        let target_expert = (n_expert_shards as u32 / 2) * experts_per_shard + 1;
+        group.bench_with_input(BenchmarkId::new(label, total_servers), &(), |b, _| {
+            b.iter(|| state.route_expert(Some("bench-model"), target_layer, target_expert));
+        });
+    }
+    group.finish();
+}
+
+/// `route_all_experts()` — batched per-token fan-out. Models a
+/// top-K expert selection across many layers.
+fn bench_route_all_experts(c: &mut Criterion) {
+    let mut group = c.benchmark_group("routing/route_all_experts");
+    let scenarios = &[
+        // (n_layers, n_expert_shards, experts_per_shard, top_k, label)
+        (32, 4, 2, 2, "32layers_top2_mixtral_8x"), // Mixtral 8×7B
+        (60, 4, 64, 6, "60layers_top6_v3"),        // DeepSeek-V3 (top-6 of 256)
+        (60, 4, 64, 8, "60layers_top8_v3_aggr"),   // V3 aggressive
+        (80, 4, 32, 8, "80layers_top8_kimi_style"), // K2-ish 80 layers
+    ];
+    for &(n_layers, n_expert_shards, experts_per_shard, top_k, label) in scenarios {
+        let state = build_moe_state(n_layers, n_expert_shards, experts_per_shard, 1);
+        // Build the (layer, expert_id) request list — top-K per layer.
+        // Spread the top-K samples across the full expert range so each
+        // one lands on a valid shard (avoiding bench short-circuits).
+        let total_experts_per_layer = n_expert_shards as u32 * experts_per_shard;
+        let stride = total_experts_per_layer / top_k as u32;
+        let layer_experts: Vec<(usize, u32)> = (0..n_layers)
+            .flat_map(|layer| (0..top_k as u32).map(move |k| (layer, k * stride)))
+            .collect();
+        let n_pairs = layer_experts.len();
+        group.bench_with_input(
+            BenchmarkId::new(label, n_pairs),
+            &layer_experts,
+            |b, layer_experts| {
+                b.iter(|| state.route_all_experts(Some("bench-model"), layer_experts));
+            },
+        );
+    }
+    group.finish();
+}
+
 // ── Single register: cost of one rebuild_route_table call ────────────────────
 
 /// Measure the cost of *one* server joining a grid of size N. Each
@@ -247,6 +345,8 @@ criterion_group!(
     bench_route_all,
     bench_route_single_realistic,
     bench_route_all_realistic,
+    bench_route_expert_single,
+    bench_route_all_experts,
     bench_heartbeat_update,
     bench_single_register,
     bench_register_cascade,

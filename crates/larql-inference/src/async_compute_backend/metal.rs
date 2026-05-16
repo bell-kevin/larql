@@ -40,11 +40,12 @@ impl AsyncComputeBackend for MetalBackend {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> AttentionHandle {
         // Handles are CPU-resident at Step A3. When Step A4's deferred
         // dispatch lands, this records the intent into an in-flight
         // `MTLCommandBuffer` and returns a `MetalAttentionHandle`.
-        CPU.attention_step_async(weights, query, kv, layer, abs_position)
+        CPU.attention_step_async(weights, query, kv, layer, abs_position, index)
     }
 
     fn attention_step_windowed_async(
@@ -55,8 +56,9 @@ impl AsyncComputeBackend for MetalBackend {
         layer: usize,
         abs_position: usize,
         window: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> AttentionHandle {
-        CPU.attention_step_windowed_async(weights, query, kv, layer, abs_position, window)
+        CPU.attention_step_windowed_async(weights, query, kv, layer, abs_position, window, index)
     }
 
     fn attention_prefill_async(
@@ -65,8 +67,9 @@ impl AsyncComputeBackend for MetalBackend {
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> (AttentionHandle, KvHandle) {
-        CPU.attention_prefill_async(weights, tokens_embedded, layer, window)
+        CPU.attention_prefill_async(weights, tokens_embedded, layer, window, index)
     }
 
     fn upload_boundary_residual_async(
@@ -130,10 +133,10 @@ mod tests {
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
         let (h_metal_handle, kv_metal) =
-            metal.attention_prefill_async(&weights, &h_in, 0, None);
+            metal.attention_prefill_async(&weights, &h_in, 0, None, None);
         let h_metal = h_metal_handle.read();
 
-        let (h_cpu_handle, kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None);
+        let (h_cpu_handle, kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None, None);
         let h_cpu = h_cpu_handle.read();
 
         use crate::kv_dispatch::KvDispatch;
@@ -158,17 +161,17 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
-        let (_, mut kv_metal) = metal.attention_prefill_async(&weights, &h_in, 0, None);
-        let (_, mut kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None);
+        let (_, mut kv_metal) = metal.attention_prefill_async(&weights, &h_in, 0, None, None);
+        let (_, mut kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None, None);
 
         let h_new = crate::forward::embed_tokens_pub(&weights, &[3u32]);
         let abs_position = tokens.len();
 
         let h_metal = metal
-            .attention_step_async(&weights, &h_new, &mut kv_metal, 0, abs_position)
+            .attention_step_async(&weights, &h_new, &mut kv_metal, 0, abs_position, None)
             .read();
         let h_cpu = CPU
-            .attention_step_async(&weights, &h_new, &mut kv_cpu, 0, abs_position)
+            .attention_step_async(&weights, &h_new, &mut kv_cpu, 0, abs_position, None)
             .read();
 
         assert_eq!(
@@ -198,18 +201,18 @@ mod tests {
         let tokens = vec![0u32, 1, 2, 3, 4];
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
-        let (_, mut kv_metal) = metal.attention_prefill_async(&weights, &h_in, 0, None);
-        let (_, mut kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None);
+        let (_, mut kv_metal) = metal.attention_prefill_async(&weights, &h_in, 0, None, None);
+        let (_, mut kv_cpu) = CPU.attention_prefill_async(&weights, &h_in, 0, None, None);
 
         let h_new = crate::forward::embed_tokens_pub(&weights, &[5u32]);
         let abs_position = tokens.len();
         let window = 3;
 
         let h_metal = metal
-            .attention_step_windowed_async(&weights, &h_new, &mut kv_metal, 0, abs_position, window)
+            .attention_step_windowed_async(&weights, &h_new, &mut kv_metal, 0, abs_position, window, None)
             .read();
         let h_cpu = CPU
-            .attention_step_windowed_async(&weights, &h_new, &mut kv_cpu, 0, abs_position, window)
+            .attention_step_windowed_async(&weights, &h_new, &mut kv_cpu, 0, abs_position, window, None)
             .read();
 
         assert_eq!(

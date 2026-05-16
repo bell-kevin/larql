@@ -20,8 +20,9 @@ use larql_router_protocol::{
 use tonic::transport::Server;
 
 async fn spawn_router() -> (std::net::SocketAddr, Arc<RwLock<GridState>>) {
+    let metrics = larql_router::metrics::RouterMetrics::new();
     let state = Arc::new(RwLock::new(GridState::default()));
-    let svc = GridServiceImpl::new(state.clone());
+    let svc = GridServiceImpl::new(state.clone()).with_metrics(metrics);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -60,6 +61,8 @@ async fn join_and_announce(
             ram_bytes: 1024 * 1024 * 1024,
             listen_url: listen_url.into(),
             vindex_hash: hash.into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await

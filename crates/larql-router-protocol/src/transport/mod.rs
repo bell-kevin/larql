@@ -12,5 +12,13 @@
 //!   * Per-stream independence is not a benefit here because each
 //!     `GridService.Join` call already uses a single bidirectional gRPC
 //!     stream; HoL on that one stream is unavoidable.
+//!
+//! ADR-0019 adds an `http3` feature on top of `quic` — real HTTP/3
+//! framing on the shard fan-out path so MoE per-token expert
+//! dispatch (ADR-0018) can issue parallel sub-requests as
+//! independent QUIC streams.
 
 pub mod quic;
+
+#[cfg(feature = "http3")]
+pub mod h3;

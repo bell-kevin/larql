@@ -42,6 +42,7 @@ pub fn kv_prefill_via_dispatch(
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, Vec<KvHandle>)> {
     if prompt_ids.is_empty() {
         return None;
@@ -51,7 +52,8 @@ pub fn kv_prefill_via_dispatch(
     let mut h = embed_tokens_pub(weights, prompt_ids);
 
     for layer in 0..num_layers {
-        let (h_post_attn, mut handle) = backend.attention_prefill(weights, &h, layer, window)?;
+        let (h_post_attn, mut handle) =
+            backend.attention_prefill(weights, &h, layer, window, index)?;
         if let Some(w) = window {
             backend.clip_kv(&mut handle, w);
         }
@@ -82,6 +84,7 @@ pub fn kv_decode_step_via_dispatch(
     token_id: u32,
     abs_position: usize,
     window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<Array2<f32>> {
     let num_layers = weights.num_layers;
     debug_assert_eq!(
@@ -93,8 +96,14 @@ pub fn kv_decode_step_via_dispatch(
     let mut h_step = h_new;
 
     for layer in 0..num_layers {
-        let h_post_attn =
-            backend.attention_step(weights, &h_step, &mut handles[layer], layer, abs_position)?;
+        let h_post_attn = backend.attention_step(
+            weights,
+            &h_step,
+            &mut handles[layer],
+            layer,
+            abs_position,
+            index,
+        )?;
         if let Some(w) = window {
             backend.clip_kv(&mut handles[layer], w);
         }
@@ -129,6 +138,7 @@ pub fn kv_prefill_via_dispatch_async(
     ffn: &dyn FfnBackend,
     prompt_ids: &[u32],
     window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<(Array2<f32>, Vec<KvHandle>)> {
     if prompt_ids.is_empty() {
         return None;
@@ -139,7 +149,7 @@ pub fn kv_prefill_via_dispatch_async(
 
     for layer in 0..num_layers {
         let (h_post_attn_handle, mut handle) =
-            backend.attention_prefill_async(weights, &h, layer, window);
+            backend.attention_prefill_async(weights, &h, layer, window, index);
         if let Some(w) = window {
             // Sync clip — backends with deferred dispatch must flush
             // before clip per spec §11.3.
@@ -169,6 +179,7 @@ pub fn kv_decode_step_via_dispatch_async(
     token_id: u32,
     abs_position: usize,
     window: Option<usize>,
+    index: Option<&larql_vindex::VectorIndex>,
 ) -> Option<Array2<f32>> {
     let num_layers = weights.num_layers;
     debug_assert_eq!(
@@ -180,8 +191,14 @@ pub fn kv_decode_step_via_dispatch_async(
     let mut h_step = h_new;
 
     for layer in 0..num_layers {
-        let h_post_attn_handle =
-            backend.attention_step_async(weights, &h_step, &mut handles[layer], layer, abs_position);
+        let h_post_attn_handle = backend.attention_step_async(
+            weights,
+            &h_step,
+            &mut handles[layer],
+            layer,
+            abs_position,
+            index,
+        );
         if let Some(w) = window {
             backend.clip_kv(&mut handles[layer], w);
         }
@@ -225,7 +242,7 @@ mod tests {
 
         // Trait dispatch.
         let (h_trait, _handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).expect("prefill");
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).expect("prefill");
 
         // Legacy direct.
         let (h_legacy, _cache) =
@@ -247,7 +264,7 @@ mod tests {
         let window = Some(2);
 
         let (h_trait, _handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window).expect("prefill");
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).expect("prefill");
 
         let (h_legacy, _cache) = kv_prefill_run(
             &weights,
@@ -274,7 +291,7 @@ mod tests {
 
         // Set up both paths with the same prefill state.
         let (_, mut handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
         let (_, mut cache) =
             kv_prefill_run(&weights, &ffn, &prompt, None, Some(&backend), &mut NoopHook).unwrap();
 
@@ -289,6 +306,7 @@ mod tests {
             &mut handles,
             next_token,
             abs_position,
+            None,
             None,
         )
         .expect("decode step trait");
@@ -320,7 +338,7 @@ mod tests {
         let prompt = vec![0u32, 1];
 
         let (_, mut handles) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
         let (_, mut cache) =
             kv_prefill_run(&weights, &ffn, &prompt, None, Some(&backend), &mut NoopHook).unwrap();
 
@@ -334,6 +352,7 @@ mod tests {
                 &mut handles,
                 token,
                 abs_position,
+                None,
                 None,
             )
             .expect("decode trait");
@@ -358,7 +377,7 @@ mod tests {
         let weights = make_test_weights();
         let backend = CpuBackend;
         let ffn = WeightFfn { weights: &weights };
-        let result = kv_prefill_via_dispatch(&backend, &weights, &ffn, &[], None);
+        let result = kv_prefill_via_dispatch(&backend, &weights, &ffn, &[], None, None);
         assert!(result.is_none());
     }
 
@@ -372,9 +391,9 @@ mod tests {
         let prompt = vec![0u32, 1, 2, 3];
 
         let (h_sync, handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
         let (h_async, handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
 
         assert_eq!(h_sync, h_async, "async prefill hidden must match sync");
         assert_eq!(handles_sync.len(), handles_async.len());
@@ -394,9 +413,9 @@ mod tests {
         let prompt = vec![0u32, 1, 2, 3, 4];
         let window = Some(2);
 
-        let (h_sync, _) = kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window).unwrap();
+        let (h_sync, _) = kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).unwrap();
         let (h_async, _) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, window).unwrap();
+            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, window, None).unwrap();
 
         assert_eq!(h_sync, h_async, "windowed async prefill must match sync");
     }
@@ -409,9 +428,9 @@ mod tests {
         let prompt = vec![0u32, 1, 2];
 
         let (_, mut handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
         let (_, mut handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
 
         let next_token = 3u32;
         let abs_position = prompt.len();
@@ -424,6 +443,7 @@ mod tests {
             next_token,
             abs_position,
             None,
+            None,
         )
         .unwrap();
         let h_async = kv_decode_step_via_dispatch_async(
@@ -433,6 +453,7 @@ mod tests {
             &mut handles_async,
             next_token,
             abs_position,
+            None,
             None,
         )
         .unwrap();
@@ -448,9 +469,9 @@ mod tests {
         let prompt = vec![0u32, 1];
 
         let (_, mut handles_sync) =
-            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, None, None).unwrap();
         let (_, mut handles_async) =
-            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None).unwrap();
+            kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, None, None).unwrap();
 
         for step in 0..3 {
             let token = (2 + step) as u32;
@@ -463,6 +484,7 @@ mod tests {
                 token,
                 abs_position,
                 None,
+                None,
             )
             .unwrap();
             let h_async = kv_decode_step_via_dispatch_async(
@@ -472,6 +494,7 @@ mod tests {
                 &mut handles_async,
                 token,
                 abs_position,
+                None,
                 None,
             )
             .unwrap();
@@ -484,7 +507,7 @@ mod tests {
         let weights = make_test_weights();
         let backend = CpuBackend;
         let ffn = WeightFfn { weights: &weights };
-        let result = kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &[], None);
+        let result = kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &[], None, None);
         assert!(result.is_none());
     }
 }

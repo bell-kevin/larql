@@ -1,4 +1,11 @@
-//! Q4K helpers — attention dequantisation and WalkFfn-backed forward paths.
+//! Q4K helpers — attention dequantisation re-export + WalkFfn-backed
+//! forward paths.
+//!
+//! `ensure_attn_tensors_dequantised` moved to
+//! [`larql_inference::vindex::dequant`] (2026-05-16) so the
+//! `KvDispatch` trait impls in `larql-inference::kv_dispatch::*` can
+//! call it without a `larql-kv → larql-inference → larql-kv` cycle.
+//! Re-exported here to keep existing call sites compiling.
 
 use larql_compute::ComputeBackend;
 use larql_vindex::VectorIndex;
@@ -12,53 +19,8 @@ use larql_inference::forward::{embed_tokens_pub, run_ffn};
 use larql_inference::model::ModelWeights;
 use larql_inference::vindex::{WalkFfn, WalkFfnConfig};
 
-/// Dequantise attention Q4K weights (Q, K, V, O) for all layers into
-/// `weights.tensors`. Idempotent — skips layers already present.
-pub fn ensure_attn_tensors_dequantised(weights: &mut ModelWeights, index: &VectorIndex) {
-    let num_layers = weights.num_layers;
-    for layer in 0..num_layers {
-        let arch = &*weights.arch;
-        let q_key = arch.attn_q_key(layer);
-        if weights.tensors.contains_key(&q_key) {
-            continue;
-        }
-        let Some(attn) = index.attn_q4k_layer_data(layer) else {
-            continue;
-        };
-        let num_q = arch.num_q_heads_for_layer(layer);
-        let num_kv = arch.num_kv_heads_for_layer(layer);
-        let hd = arch.head_dim_for_layer(layer);
-        let hidden = weights.hidden_size;
-        let q_dim = num_q * hd;
-        let kv_dim = num_kv * hd;
-        let k_key = arch.attn_k_key(layer);
-        let v_key = arch.attn_v_key(layer);
-        let o_key = arch.attn_o_key(layer);
-        let w_q = dequantize_matrix(attn[0].0, attn[0].1, q_dim, hidden);
-        let w_k = dequantize_matrix(attn[1].0, attn[1].1, kv_dim, hidden);
-        let w_v = dequantize_matrix(attn[2].0, attn[2].1, kv_dim, hidden);
-        let w_o = dequantize_matrix(attn[3].0, attn[3].1, hidden, q_dim);
-        weights.tensors.insert(q_key, w_q.into_shared());
-        weights.tensors.insert(k_key, w_k.into_shared());
-        weights.tensors.insert(v_key, w_v.into_shared());
-        weights.tensors.insert(o_key, w_o.into_shared());
-    }
-}
-
-fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Array2<f32> {
-    let n = rows * cols;
-    let padded = n.div_ceil(256) * 256;
-    let info = larql_vindex::quant::registry::lookup(format)
-        .unwrap_or_else(|| panic!("unsupported quant format: {format}"));
-    let floats =
-        (info.dequantize)(bytes, padded).unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
-    let truncated = if floats.len() > n {
-        floats[..n].to_vec()
-    } else {
-        floats
-    };
-    Array2::from_shape_vec((rows, cols), truncated).expect("shape mismatch")
-}
+/// Re-export — see [`larql_inference::vindex::dequant::ensure_attn_tensors_dequantised`].
+pub use larql_inference::vindex::ensure_attn_tensors_dequantised;
 
 /// Prefill using `WalkFfn` (Q4K FFN) instead of `BackendFfn` (f32 FFN).
 pub(super) fn rs_prefill_walk(
@@ -74,12 +36,17 @@ pub(super) fn rs_prefill_walk(
     let mut stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     let be = Some(backend);
 
+    // Hoist WalkFfn construction out of the per-layer loop. Previously
+    // this rebuilt the WalkFfn 34 times per prefill (once per layer);
+    // now once total. WalkFfn carries no per-layer state — it's the
+    // gate-index + backend pair, both stable across the loop.
+    let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+        .with_backend(backend);
+
     for layer in 0..num_layers {
         stored.push(h.clone());
         let (h_post_attn, _k, _v) = run_attention_with_kv_backend(weights, &h, layer, be)
             .expect("attention failed during MarkovRS Q4K prefill");
-        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-            .with_backend(backend);
         let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
         h = h_out;
     }
@@ -99,7 +66,7 @@ pub(super) fn rs_prefill_walk(
     if cold.first().map_or(0, |c| c.shape()[0]) > 0 {
         let cold_kv: Vec<SharedKV> = (0..num_layers)
             .map(|layer| {
-                recompute_kv(weights, &cold[layer], layer, 0, backend)
+                recompute_kv(weights, &cold[layer], layer, 0, backend, Some(index))
                     .expect("cold K/V pre-computation failed")
             })
             .collect();
@@ -127,19 +94,47 @@ pub(super) fn rs_decode_step_walk(
 ) -> Option<(Array2<f32>, RsStore)> {
     use ndarray::s;
 
+    let instrument = std::env::var("LARQL_INSTRUMENT_MARKOV").is_ok();
+
     let num_layers = weights.num_layers;
     let abs_position = rs.next_position;
     let mut h_new = embed_tokens_pub(weights, &[new_token_id]);
     let mut new_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
 
+    // Hoist WalkFfn out of the per-layer loop — see note in
+    // `rs_prefill_walk`. Was 34× construction per decode step.
+    let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
+        .with_backend(backend);
+
+    // Per-stage timing accumulators (only when LARQL_INSTRUMENT_MARKOV is set).
+    let mut t_recompute_kv = 0.0f64;
+    let mut t_concat = 0.0f64;
+    let mut t_attention = 0.0f64;
+    let mut t_ffn = 0.0f64;
+    let mut attn_helper_hits = 0usize;
+    let mut attn_helper_misses = 0usize;
+    let mut s_hot_first_layer = 0usize;
+
     for layer in 0..num_layers {
         let h_hot = &rs.stored[layer];
         let s_hot = h_hot.shape()[0];
+        if layer == 0 {
+            s_hot_first_layer = s_hot;
+        }
         let hot_abs_start = abs_position.saturating_sub(s_hot);
+
+        let t_kv_start = if instrument { Some(std::time::Instant::now()) } else { None };
 
         let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
             let (k_cold, v_cold) = &cold_kv[layer];
-            let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend)?;
+            let (k_hot, v_hot) =
+                recompute_kv(weights, h_hot, layer, hot_abs_start, backend, Some(index))?;
+            let kv_recompute_done = if instrument { Some(std::time::Instant::now()) } else { None };
+            if let (Some(start), Some(done)) = (t_kv_start, kv_recompute_done) {
+                t_recompute_kv += done.duration_since(start).as_secs_f64() * 1000.0;
+            }
+
+            let t_concat_start = if instrument { Some(std::time::Instant::now()) } else { None };
             let c = k_cold.shape()[0];
             let kv_dim = k_cold.shape()[1];
             let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
@@ -148,6 +143,9 @@ pub(super) fn rs_decode_step_walk(
             let mut v_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
             v_combined.slice_mut(s![..c, ..]).assign(v_cold);
             v_combined.slice_mut(s![c.., ..]).assign(&v_hot);
+            if let Some(start) = t_concat_start {
+                t_concat += start.elapsed().as_secs_f64() * 1000.0;
+            }
             (k_combined, v_combined)
         } else {
             let (h_full, full_abs_start) = match &rs.cold_residuals {
@@ -162,24 +160,84 @@ pub(super) fn rs_decode_step_walk(
                 }
                 _ => (h_hot.clone(), hot_abs_start),
             };
-            recompute_kv(weights, &h_full, layer, full_abs_start, backend)?
+            let pair = recompute_kv(weights, &h_full, layer, full_abs_start, backend, Some(index))?;
+            if let Some(start) = t_kv_start {
+                t_recompute_kv += start.elapsed().as_secs_f64() * 1000.0;
+            }
+            pair
         };
 
         new_stored.push(h_new.clone());
 
-        let (h_post_attn, _new_kv) =
-            larql_inference::attention::run_attention_block_decode_step_backend(
-                weights,
-                &h_new,
-                layer,
-                Some(&(k_full, v_full)),
-                abs_position,
-                Some(backend),
-            )?;
-        let walk_ffn = WalkFfn::from_config(weights, index, WalkFfnConfig::dense(num_layers))
-            .with_backend(backend);
-        let (h_out, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+        let t_attn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        let kv_pair = (k_full, v_full);
+        let native_result = larql_inference::vindex::attention_decode_step_native(
+            weights,
+            index,
+            backend,
+            &h_new,
+            layer,
+            Some(&kv_pair),
+            abs_position,
+        );
+        if instrument {
+            if native_result.is_some() {
+                attn_helper_hits += 1;
+            } else {
+                attn_helper_misses += 1;
+            }
+        }
+        let (h_post_attn, _new_kv) = native_result
+            .or_else(|| {
+                larql_inference::attention::run_attention_block_decode_step_backend(
+                    weights,
+                    &h_new,
+                    layer,
+                    Some(&kv_pair),
+                    abs_position,
+                    Some(backend),
+                )
+            })?;
+        if let Some(start) = t_attn_start {
+            t_attention += start.elapsed().as_secs_f64() * 1000.0;
+        }
+
+        let t_ffn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        // Try the production-path native-quantised FFN helper first —
+        // direct Q4K/Q6K matvec on the vindex's compact gate/up/down
+        // bytes. Falls back to WalkFfn (and then dense WeightFfn) when
+        // the backend doesn't have native quant support or the layer
+        // isn't direct-matvec-eligible.
+        //
+        // The fallback is the bottleneck: WalkFfn detects "zero features"
+        // for dense Gemma layers and dispatches to dense WeightFfn,
+        // which does f32 matmul on dequantised gate/up/down — ~70ms
+        // per layer × 34 = 2.4s per token. Native Q4K FFN is ~0.7ms
+        // per layer × 34 = ~25ms (matching the production CPU path).
+        let h_out = larql_inference::vindex::ffn_decode_step_native(
+            weights,
+            index,
+            backend,
+            &h_post_attn,
+            layer,
+        )
+        .unwrap_or_else(|| {
+            let (h, _) = run_ffn(weights, &h_post_attn, layer, &walk_ffn, false);
+            h
+        });
+        if let Some(start) = t_ffn_start {
+            t_ffn += start.elapsed().as_secs_f64() * 1000.0;
+        }
         h_new = h_out;
+    }
+
+    if instrument {
+        let total = t_recompute_kv + t_concat + t_attention + t_ffn;
+        eprintln!(
+            "[markov-rs/decode] s_hot={s_hot_first_layer} recompute_kv={t_recompute_kv:.2}ms \
+             concat={t_concat:.2}ms attention={t_attention:.2}ms ffn={t_ffn:.2}ms \
+             total={total:.2}ms (attn_helper hits/miss={attn_helper_hits}/{attn_helper_misses})"
+        );
     }
 
     let mut updated_stored: Vec<Array2<f32>> = Vec::with_capacity(num_layers);

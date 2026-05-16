@@ -21,8 +21,11 @@ use larql_router_protocol::{
 use tonic::transport::Server;
 
 async fn spawn_router(grid_key: Option<String>) -> (std::net::SocketAddr, Arc<RwLock<GridState>>) {
+    // Install a metrics registry so the service's instrumentation
+    // branches (`if let Some(m) = &metrics`) are exercised end-to-end.
+    let metrics = larql_router::metrics::RouterMetrics::new();
     let state = Arc::new(RwLock::new(GridState::default()));
-    let svc = GridServiceImpl::new_with_key(state.clone(), grid_key);
+    let svc = GridServiceImpl::new_with_key(state.clone(), grid_key).with_metrics(metrics);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let stream = tokio_stream::wrappers::TcpListenerStream::new(listener);
@@ -78,6 +81,8 @@ async fn announce_then_heartbeat_then_dropping() {
             ram_bytes: 1,
             listen_url: "http://srv".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -192,6 +197,8 @@ async fn available_followed_by_ready_registers_as_serving() {
             layer_start: 0,
             layer_end: 4,
             listen_url: "http://spare:9999".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -244,6 +251,8 @@ async fn status_rpc_returns_current_grid() {
             ram_bytes: 1,
             listen_url: "http://srv".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -273,6 +282,8 @@ async fn unassign_via_serving_sender_reaches_client() {
             ram_bytes: 1,
             listen_url: "http://srv".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -336,6 +347,8 @@ async fn available_with_under_replication_triggers_replicate() {
                 ram_bytes: 1,
                 listen_url: "http://serving".into(),
                 vindex_hash: "h".into(),
+                expert_start: 0,
+                expert_end: 0,
             })),
         })
         .await
@@ -395,6 +408,8 @@ async fn serving_disconnect_triggers_post_stream_replicate() {
             ram_bytes: 1,
             listen_url: "http://srv-a".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -408,6 +423,8 @@ async fn serving_disconnect_triggers_post_stream_replicate() {
             ram_bytes: 1,
             listen_url: "http://srv-b".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -459,6 +476,8 @@ async fn payload_none_is_silently_skipped() {
             ram_bytes: 1,
             listen_url: "http://srv".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -496,6 +515,8 @@ async fn dropping_under_replicated_shard_triggers_replicate_log() {
             ram_bytes: 1,
             listen_url: "http://srv-a".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -509,6 +530,8 @@ async fn dropping_under_replicated_shard_triggers_replicate_log() {
             ram_bytes: 1,
             listen_url: "http://srv-b".into(),
             vindex_hash: "h".into(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await

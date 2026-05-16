@@ -222,6 +222,14 @@ pub trait KvDispatch {
     /// that don't support fused attention return `None`; callers fall
     /// back to decomposed BLAS attention via [`larql_compute::MatMul`]
     /// + manual K/V management.
+    /// `index` is `Some` when the caller has a Q4K (or other
+    /// quantised) `VectorIndex` available alongside the f32 fallback
+    /// in `weights.tensors`. Backends with native Q4K kernels (e.g.
+    /// `MetalBackend` once A4 lands) use it directly; CPU backends
+    /// today expect the caller to have already populated `weights.tensors`
+    /// via [`crate::vindex::ensure_attn_tensors_dequantised`] when
+    /// the quantised source is present.
+    /// See `docs/specs/kv-dispatch-quantization.md`.
     fn attention_step(
         &self,
         weights: &ModelWeights,
@@ -229,8 +237,9 @@ pub trait KvDispatch {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<Array2<f32>> {
-        let _ = (weights, query, kv, layer, abs_position);
+        let _ = (weights, query, kv, layer, abs_position, index);
         None
     }
 
@@ -242,7 +251,8 @@ pub trait KvDispatch {
     /// Capability gate:
     /// [`larql_compute::Capability::WindowedAttentionStep`]. Default
     /// runs [`Self::attention_step`] then [`Self::clip_kv`] (correct
-    /// but not specialised).
+    /// but not specialised). `index` is forwarded to the underlying
+    /// `attention_step` call.
     fn attention_step_windowed(
         &self,
         weights: &ModelWeights,
@@ -251,8 +261,9 @@ pub trait KvDispatch {
         layer: usize,
         abs_position: usize,
         window: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<Array2<f32>> {
-        let h = self.attention_step(weights, query, kv, layer, abs_position)?;
+        let h = self.attention_step(weights, query, kv, layer, abs_position, index)?;
         self.clip_kv(kv, window);
         Some(h)
     }
@@ -265,14 +276,17 @@ pub trait KvDispatch {
     /// `window` selects the K/V cap: `None` = unbounded growth,
     /// `Some(W)` = sliding-window K/V (older positions evicted from
     /// the cache after the prefill).
+    ///
+    /// `index` follows the same convention as [`Self::attention_step`].
     fn attention_prefill(
         &self,
         weights: &ModelWeights,
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
-        let _ = (weights, tokens_embedded, layer, window);
+        let _ = (weights, tokens_embedded, layer, window, index);
         None
     }
 
@@ -327,6 +341,61 @@ pub trait KvDispatch {
         token_ids: &[u32],
     ) -> Option<Array2<f32>> {
         let _ = (weights, start_layer, residuals, token_ids);
+        None
+    }
+
+    // ── Coarse fused intents ────────────────────────────────────────
+    //
+    // Coarse-grained, **quantization-agnostic** intents for engines
+    // that want backend-fastest decode without per-layer control.
+    // The backend inspects `index` (or `weights.tensors`) and dispatches
+    // internally to whatever native kernel matches the weight format:
+    // Q4K matvec, Q6K matvec, f32 fused, future quant formats — all
+    // without changing this trait surface.
+    //
+    // Engines that DO need per-layer control (MarkovResidual,
+    // UnlimitedContext, TurboQuant — recompute, checkpoint, codec
+    // mechanisms) continue to use the per-layer `attention_prefill` /
+    // `attention_step` intents.
+    //
+    // Default returns `None` — engines that want a coarse path fall
+    // back to per-layer dispatch when the backend doesn't support it.
+
+    /// Coarse prefill: run the prompt through every layer using the
+    /// backend's fastest available kernel, populate a backend-specific
+    /// K/V cache, return last-row hidden + the populated handle.
+    ///
+    /// The returned `KvHandle` is opaque to the engine; pass it back to
+    /// [`Self::coarse_decode_step`] for subsequent steps. Backends are
+    /// free to use any internal cache shape (`CpuKvCache` on CPU,
+    /// `MTLBuffer` on Metal once Step A6 lands, etc.).
+    ///
+    /// `weights` is `&mut` because backends with cached-streaming Q4K
+    /// kernels may lazily insert dequantised f32 fallback tensors into
+    /// `weights.tensors` over the lifetime of the cache. The per-layer
+    /// `attention_prefill` keeps `&weights` because it can't grow
+    /// shared state.
+    fn coarse_prefill(
+        &self,
+        weights: &mut ModelWeights,
+        token_ids: &[u32],
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Option<(Array2<f32>, KvHandle)> {
+        let _ = (weights, token_ids, index);
+        None
+    }
+
+    /// One coarse decode step. `handle` must be the `KvHandle` returned
+    /// by a prior [`Self::coarse_prefill`] on the same backend.
+    fn coarse_decode_step(
+        &self,
+        weights: &mut ModelWeights,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+        handle: &mut KvHandle,
+        abs_position: usize,
+    ) -> Option<Array2<f32>> {
+        let _ = (weights, token_id, index, handle, abs_position);
         None
     }
 
@@ -538,7 +607,7 @@ mod tests {
         let mut handle = stub_kv_handle(0, weights.hidden_size);
         let query = Array2::zeros((1, weights.hidden_size));
         assert!(backend
-            .attention_step(&weights, &query, &mut handle, 0, 0)
+            .attention_step(&weights, &query, &mut handle, 0, 0, None)
             .is_none());
     }
 
@@ -552,7 +621,7 @@ mod tests {
         let mut handle = stub_kv_handle(0, weights.hidden_size);
         let query = Array2::zeros((1, weights.hidden_size));
         assert!(backend
-            .attention_step_windowed(&weights, &query, &mut handle, 0, 0, 4)
+            .attention_step_windowed(&weights, &query, &mut handle, 0, 0, 4, None)
             .is_none());
     }
 
@@ -561,7 +630,7 @@ mod tests {
         let backend = StubKvBackend;
         let weights = crate::test_utils::make_test_weights();
         let tokens = Array2::zeros((2, weights.hidden_size));
-        assert!(backend.attention_prefill(&weights, &tokens, 0, None).is_none());
+        assert!(backend.attention_prefill(&weights, &tokens, 0, None, None).is_none());
     }
 
     #[test]

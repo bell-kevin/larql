@@ -599,6 +599,22 @@ pub struct Cli {
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
 
+    /// ADR-0019: enable an HTTP/3 listener on this port. Routers
+    /// opting into the h3 shard transport (`--http3-shards`) connect
+    /// here for per-stream-independent fan-out (escapes TCP HoL
+    /// blocking on parallel MoE expert sub-requests). Requires
+    /// building with `--features http3`. Coexists with the HTTP/1.1
+    /// listener on `--port`; both serve the same axum::Router.
+    ///
+    /// TLS reuse: if `--tls-cert` and `--tls-key` are set, the h3
+    /// listener uses the same cert. Otherwise, an in-memory
+    /// self-signed cert is generated at startup and its SHA-256
+    /// fingerprint is logged — clients pin it via
+    /// `--shard-cert-fingerprint` on the router side.
+    #[arg(long)]
+    #[cfg(feature = "http3")]
+    pub http3_port: Option<u16>,
+
     /// Bind a Unix domain socket alongside the TCP listener for same-host
     /// MoE shard clients.  Skips the kernel TCP stack and saves ~50 µs/call
     /// on loopback.  Path is created at startup; pre-existing socket files
@@ -665,6 +681,72 @@ pub struct Cli {
 /// UDS / TLS / gRPC sockets) and run forever.
 ///
 /// `main` is a thin wrapper: parse `Cli`, init tracing, hand off here. Splitting
+/// ADR-0019 — spawn an HTTP/3 listener alongside the existing
+/// HTTP/1.1 TCP listener when `--http3-port` is set. Reuses the
+/// TLS cert from `--tls-cert`/`--tls-key` if both are set;
+/// otherwise auto-generates a self-signed leaf cert and prints its
+/// fingerprint so the router operator can pin it.
+///
+/// The h3 listener serves the same `axum::Router` as the dense
+/// path — handlers are identical, only the transport differs.
+#[cfg(feature = "http3")]
+async fn spawn_http3_listener_if_configured(
+    cli: &Cli,
+    app: axum::Router,
+) -> Result<(), BoxError> {
+    let Some(port) = cli.http3_port else {
+        return Ok(());
+    };
+
+    use larql_router_protocol::transport::h3 as h3_transport;
+    use larql_router_protocol::transport::quic as quic_transport;
+
+    // Install the rustls ring crypto provider once. Safe to call
+    // multiple times — second call is a no-op.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // TLS material: prefer `--tls-cert`/`--tls-key` (reuses the HTTPS
+    // pair); fall back to an auto-generated self-signed cert. We
+    // print the fingerprint either way so operators have one log
+    // line they can hand to the router's `--shard-cert-fingerprint`.
+    let tls = if let (Some(cert_path), Some(key_path)) = (&cli.tls_cert, &cli.tls_key) {
+        let cert_pem = std::fs::read_to_string(cert_path)
+            .map_err(|e| format!("read --tls-cert {}: {e}", cert_path.display()))?;
+        let key_pem = std::fs::read_to_string(key_path)
+            .map_err(|e| format!("read --tls-key {}: {e}", key_path.display()))?;
+        // Server name embedded in the cert isn't used by the router
+        // when fingerprint-pinning, but we keep the convention here.
+        quic_transport::SelfSignedTls {
+            cert_pem,
+            key_pem,
+            fingerprint: String::new(),
+            server_name: "larql-server".to_string(),
+        }
+    } else {
+        let generated = quic_transport::self_signed_tls("larql-server")
+            .map_err(|e| format!("self-signed cert generation: {e}"))?;
+        info!(
+            fingerprint = %generated.fingerprint,
+            "HTTP/3: generated self-signed cert. Routers must pin this \
+             fingerprint via --shard-cert-fingerprint when opting into \
+             --http3-shards."
+        );
+        generated
+    };
+
+    let addr: std::net::SocketAddr = format!("{}:{}", cli.host, port).parse()?;
+    let endpoint = h3_transport::server_endpoint(addr, &tls)
+        .map_err(|e| format!("h3 endpoint bind {addr}: {e}"))?;
+    info!("Listening: h3 (HTTP/3 over QUIC) on {addr}");
+
+    tokio::spawn(async move {
+        if let Err(e) = h3_transport::serve_axum(endpoint, app).await {
+            tracing::error!("h3 listener crashed: {e:#}");
+        }
+    });
+    Ok(())
+}
+
 /// the orchestration out lets integration tests drive boot without going
 /// through `clap::Parser::parse_from`.
 pub async fn serve(cli: Cli) -> Result<(), BoxError> {
@@ -1147,6 +1229,15 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                 uds_path.display()
             );
         }
+
+        // ADR-0019: optional HTTP/3 listener alongside the HTTP/1.1
+        // TCP listener. Spawned only when `--http3-port` is set and
+        // the crate is built with `--features http3`. Both listeners
+        // share the same `axum::Router`, so request handlers are
+        // identical regardless of transport — the only difference is
+        // per-stream independence on the wire.
+        #[cfg(feature = "http3")]
+        spawn_http3_listener_if_configured(&cli, app.clone()).await?;
 
         info!("Listening: http://{}", addr);
         // `set_nodelay(true)` on every accepted connection — disables

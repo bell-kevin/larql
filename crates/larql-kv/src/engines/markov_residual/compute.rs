@@ -1,6 +1,7 @@
 //! Core residual-stream compute: prefill, decode step, K/V recomputation.
 
-use larql_compute::{dot_proj_gpu, ComputeBackend};
+use larql_compute::{dot_proj_gpu, ComputeBackend, QuantFormat};
+use larql_vindex::VectorIndex;
 use ndarray::{s, Array2};
 
 use super::store::RsStore;
@@ -58,7 +59,7 @@ pub fn rs_prefill(
     if cold.first().map_or(0, |c| c.shape()[0]) > 0 {
         let cold_kv: Vec<SharedKV> = (0..num_layers)
             .map(|layer| {
-                recompute_kv(weights, &cold[layer], layer, 0, backend)
+                recompute_kv(weights, &cold[layer], layer, 0, backend, None)
                     .expect("cold K/V pre-computation failed")
             })
             .collect();
@@ -131,7 +132,8 @@ fn rs_decode_step_inner(
             } else {
                 None
             };
-            let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend)?;
+            let (k_hot, v_hot) =
+                recompute_kv(weights, h_hot, layer, hot_abs_start, backend, None)?;
             if let Some(t) = t_hot {
                 recompute_hot_us += t.elapsed().as_secs_f64() * 1e6;
             }
@@ -165,7 +167,7 @@ fn rs_decode_step_inner(
             } else {
                 None
             };
-            let (k, v) = recompute_kv(weights, &h_full, layer, full_abs_start, backend)?;
+            let (k, v) = recompute_kv(weights, &h_full, layer, full_abs_start, backend, None)?;
             if let Some(t) = t_cold {
                 recompute_cold_us += t.elapsed().as_secs_f64() * 1e6;
             }
@@ -263,12 +265,20 @@ fn rs_decode_step_inner(
 }
 
 /// Recompute K/V from stored pre-layer residuals using `backend` for projection matmuls.
+///
+/// `index: Some(idx)` enables the Q4K-native fast path: per-row Q4K matvec
+/// directly against the vindex's Q4K bytes, skipping the dequant-to-f32
+/// step that's otherwise 8× the memory bandwidth. Quant-agnostic — the
+/// backend's `quant_matvec` inspects the format byte and dispatches to
+/// the right kernel (Q4K today; Q6K / future formats slot in
+/// automatically). `None` keeps the f32 fallback for legacy callers.
 pub fn recompute_kv(
     weights: &ModelWeights,
     h_stored: &Array2<f32>,
     layer: usize,
     abs_start: usize,
     backend: &dyn ComputeBackend,
+    index: Option<&VectorIndex>,
 ) -> Option<(Array2<f32>, Array2<f32>)> {
     let arch = &*weights.arch;
     let head_dim = arch.head_dim_for_layer(layer);
@@ -287,16 +297,59 @@ pub fn recompute_kv(
         &arch.input_layernorm_key(layer),
         norm_offset,
     );
-    let w_k = weights.tensors.get(&arch.attn_k_key(layer))?;
-    let v_from_k = !weights.tensors.contains_key(&arch.attn_v_key(layer));
-    let w_v = if v_from_k {
-        w_k
-    } else {
-        weights.tensors.get(&arch.attn_v_key(layer))?
-    };
 
-    let mut k = dot_proj_gpu(&h_norm, w_k, Some(backend));
-    let mut v = dot_proj_gpu(&h_norm, w_v, Some(backend));
+    let kv_dim = num_kv * head_dim;
+    let hidden = weights.hidden_size;
+    let seq_len = h_norm.shape()[0];
+
+    // Q4K-native path: per-row matvec on the vindex's raw Q4K bytes.
+    // Saves the dequant-to-f32 cost (8× memory bandwidth) when the
+    // backend supports Q4K matvec and the vindex has Q4K attn data.
+    let q4k_path = index
+        .and_then(|idx| idx.attn_q4k_layer_data(layer))
+        .filter(|_| backend.has_q4());
+
+    let (mut k, mut v) = if let Some(attn_data) = q4k_path {
+        // attn_data: [(Q, fmt), (K, fmt), (V, fmt), (O, fmt)]
+        let (k_bytes, k_fmt) = attn_data[1];
+        let (v_bytes, v_fmt) = attn_data[2];
+        let k_format = parse_quant_format(k_fmt)?;
+        let v_format = parse_quant_format(v_fmt)?;
+
+        let mut k_out = Array2::<f32>::zeros((seq_len, kv_dim));
+        let mut v_out = Array2::<f32>::zeros((seq_len, kv_dim));
+        for row_idx in 0..seq_len {
+            let x_row = h_norm.row(row_idx);
+            let x_slice = x_row.as_slice()?;
+            let k_row =
+                backend.quant_matvec(k_format, k_bytes, x_slice, kv_dim, hidden)?;
+            let v_row =
+                backend.quant_matvec(v_format, v_bytes, x_slice, kv_dim, hidden)?;
+            k_out
+                .row_mut(row_idx)
+                .iter_mut()
+                .zip(k_row.iter())
+                .for_each(|(o, &i)| *o = i);
+            v_out
+                .row_mut(row_idx)
+                .iter_mut()
+                .zip(v_row.iter())
+                .for_each(|(o, &i)| *o = i);
+        }
+        (k_out, v_out)
+    } else {
+        // f32 fallback: read dequantised weights from `weights.tensors`.
+        let w_k = weights.tensors.get(&arch.attn_k_key(layer))?;
+        let v_from_k = !weights.tensors.contains_key(&arch.attn_v_key(layer));
+        let w_v = if v_from_k {
+            w_k
+        } else {
+            weights.tensors.get(&arch.attn_v_key(layer))?
+        };
+        let k = dot_proj_gpu(&h_norm, w_k, Some(backend));
+        let v = dot_proj_gpu(&h_norm, w_v, Some(backend));
+        (k, v)
+    };
 
     if let Some(bias) = arch
         .attn_k_bias_key(layer)
@@ -331,6 +384,15 @@ pub fn recompute_kv(
     Some((k_rope, v))
 }
 
+fn parse_quant_format(fmt: &str) -> Option<QuantFormat> {
+    match fmt {
+        "Q4_K" => Some(QuantFormat::Q4_K),
+        "Q4_KF" => Some(QuantFormat::Q4_KF),
+        "Q6_K" => Some(QuantFormat::Q6_K),
+        _ => None,
+    }
+}
+
 /// Equivalent Standard KV memory in bytes for `seq_len` tokens (FP16).
 pub fn kv_memory_bytes_for_seq(weights: &ModelWeights, seq_len: usize) -> usize {
     let arch = &*weights.arch;
@@ -359,7 +421,7 @@ mod tests {
     fn recompute_kv_returns_some_with_valid_weights() {
         let weights = make_test_weights();
         let h = Array2::from_elem((3, weights.hidden_size), 0.5f32);
-        let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend);
+        let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
         assert!(
             result.is_some(),
             "recompute_kv should return Some with valid weights"
@@ -371,7 +433,7 @@ mod tests {
         let weights = make_test_weights();
         let seq_len = 4;
         let h = Array2::from_elem((seq_len, weights.hidden_size), 1.0f32);
-        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
+        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None).unwrap();
         let kv_dim = weights.num_kv_heads * weights.head_dim;
         assert_eq!(k.shape(), &[seq_len, kv_dim], "K shape mismatch");
         assert_eq!(v.shape(), &[seq_len, kv_dim], "V shape mismatch");
@@ -381,7 +443,7 @@ mod tests {
     fn recompute_kv_output_is_finite() {
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.1f32);
-        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
+        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None).unwrap();
         assert!(
             k.iter().all(|v| v.is_finite()),
             "K contains non-finite values"
@@ -397,8 +459,8 @@ mod tests {
         let weights = make_test_weights();
         let h = Array2::from_elem((1, weights.hidden_size), 0.5f32);
         // Different abs_start should produce different RoPE-applied K
-        let (k0, _) = recompute_kv(&weights, &h, 0, 0, &CpuBackend).unwrap();
-        let (k5, _) = recompute_kv(&weights, &h, 0, 5, &CpuBackend).unwrap();
+        let (k0, _) = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None).unwrap();
+        let (k5, _) = recompute_kv(&weights, &h, 0, 5, &CpuBackend, None).unwrap();
         let diff: f32 = k0.iter().zip(k5.iter()).map(|(a, b)| (a - b).abs()).sum();
         assert!(
             diff > 0.0,

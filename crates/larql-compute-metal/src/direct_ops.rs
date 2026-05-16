@@ -126,3 +126,66 @@ impl MetalBackend {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    /// `full_layer_direct` wraps `ops::full_layer::dispatch` with the
+    /// backend's pipelines pre-bound.  Drive it with synthetic
+    /// (all-zero) weights at a small shape — the test pins that the
+    /// signature wiring is intact and the dispatch completes.
+    /// Numerical correctness is checked at higher levels.
+    #[test]
+    fn full_layer_direct_dispatches_with_synthetic_weights() {
+        let m = backend();
+        let hidden = 32usize;
+        let head_dim = 16usize;
+        let num_q_heads = 2usize;
+        let num_kv_heads = 2usize;
+        let inter = 64usize;
+        let seq_len = 1usize;
+
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let w_q = vec![0.0f32; q_dim * hidden];
+        let w_k = vec![0.0f32; kv_dim * hidden];
+        let w_v = vec![0.0f32; kv_dim * hidden];
+        let w_o = vec![0.0f32; hidden * q_dim];
+
+        // Q4_0 super-block stride (18 bytes per 32 elements).  Synth
+        // zeros: scale = f16(0) and nibbles = 0 means the layer
+        // contributes nothing — but that's fine for a wiring test.
+        let q4_blocks_per_row = hidden / 32;
+        let gate_q4 = vec![0u8; inter * q4_blocks_per_row * 18];
+        let up_q4 = vec![0u8; inter * q4_blocks_per_row * 18];
+        let down_t_q4 = vec![0u8; inter * q4_blocks_per_row * 18];
+
+        let x = vec![0.0f32; seq_len * hidden];
+
+        let out = m.full_layer_direct(
+            &w_q,
+            &w_k,
+            &w_v,
+            &w_o,
+            &gate_q4,
+            &up_q4,
+            &down_t_q4,
+            &x,
+            seq_len,
+            hidden,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            inter,
+            1.0 / (head_dim as f32).sqrt(),
+        );
+        assert_eq!(out.len(), seq_len * hidden);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+}

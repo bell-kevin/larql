@@ -293,6 +293,46 @@ fn tls13_signature_schemes() -> Vec<rustls::SignatureScheme> {
     ]
 }
 
+/// Build a rustls `ClientConfig` that pins the server cert to a
+/// SHA-256 fingerprint. ADR-0019's h3 module reuses this to layer
+/// its h3 ALPN override on top.
+pub(crate) fn client_rustls_config_with_fingerprint(
+    fp_hex: String,
+) -> Result<ClientConfig, String> {
+    client_config_with_fingerprint(fp_hex)
+}
+
+/// Build a rustls `ClientConfig` that skips cert verification.
+/// LAN / dev only. Exposed for ADR-0019's h3 module to layer its
+/// ALPN override on top.
+pub(crate) fn client_rustls_config_skip_verify() -> ClientConfig {
+    client_config_skip_verify()
+}
+
+/// Build a rustls `ServerConfig` from the workspace's
+/// [`SelfSignedTls`] pair. Exposed for ADR-0019's h3 module to
+/// layer its h3 ALPN override on top; the plain `quic` server
+/// path uses `quinn::ServerConfig::with_single_cert` directly
+/// without ALPN.
+pub(crate) fn server_rustls_config(tls: &SelfSignedTls) -> Result<rustls::ServerConfig, String> {
+    let mut cert_pem_bytes = tls.cert_pem.as_bytes();
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem_bytes)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("parse cert PEM: {e}"))?;
+    let mut key_pem_bytes = tls.key_pem.as_bytes();
+    let key: PrivatePkcs8KeyDer<'static> = rustls_pemfile::pkcs8_private_keys(&mut key_pem_bytes)
+        .next()
+        .ok_or_else(|| "no PKCS#8 key in --quic-key PEM".to_string())?
+        .map_err(|e| format!("parse key PEM: {e}"))?;
+    let provider = rustls::crypto::ring::default_provider();
+    rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("rustls ServerConfig: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(certs, key.into())
+        .map_err(|e| format!("rustls ServerConfig with_single_cert: {e}"))
+}
+
 fn client_config_with_fingerprint(fp_hex: String) -> Result<ClientConfig, String> {
     let expected = decode_hex(&fp_hex).map_err(|e| format!("--quic-cert-fingerprint: {e}"))?;
     let provider = rustls::crypto::ring::default_provider();

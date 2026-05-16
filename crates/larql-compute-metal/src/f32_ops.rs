@@ -169,3 +169,111 @@ impl F32Ops {
         Array2::from_shape_vec((m, n), c).unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MetalBackend;
+
+    fn backend() -> MetalBackend {
+        MetalBackend::new().expect("Metal device available on test host")
+    }
+
+    /// `dispatch_notrans` direct dispatch: A·B with contiguous inputs.
+    /// Exercises the encoder-and-dispatch path used by `matmul` when
+    /// the FLOP threshold says GPU.
+    #[test]
+    fn dispatch_notrans_runs_to_completion() {
+        let m = backend();
+        let mr = 8usize;
+        let nr = 16usize;
+        let kr = 32usize;
+        let a = vec![0.5f32; mr * kr];
+        let b = vec![0.25f32; kr * nr];
+        let out = m
+            .f32_ops
+            .dispatch_notrans(&m.queue, &m.bufs, &a, &b, mr, nr, kr);
+        assert_eq!(out.len(), mr * nr);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `dispatch_transb` direct dispatch: A·Bᵀ.
+    #[test]
+    fn dispatch_transb_runs_to_completion() {
+        let m = backend();
+        let mr = 8usize;
+        let nr = 16usize;
+        let kr = 32usize;
+        let a = vec![0.5f32; mr * kr];
+        let b_t = vec![0.25f32; nr * kr];
+        let out = m
+            .f32_ops
+            .dispatch_transb(&m.queue, &m.bufs, &a, &b_t, mr, nr, kr);
+        assert_eq!(out.len(), mr * nr);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `matmul` GPU path: force threshold = 1 so any non-trivial shape
+    /// dispatches GPU.  Covers lines 113-133 (the GPU branch).
+    #[test]
+    fn matmul_above_threshold_takes_gpu_path() {
+        let m = backend();
+        let a = Array2::<f32>::from_shape_vec((8, 16), vec![0.5f32; 128]).unwrap();
+        let b = Array2::<f32>::from_shape_vec((16, 32), vec![0.25f32; 512]).unwrap();
+        let out = m.f32_ops.matmul(&m.queue, &m.bufs, a.view(), b.view(), 1);
+        assert_eq!(out.shape(), &[8, 32]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `matmul_transb` GPU path: same shape pattern, transposed B.
+    /// Covers lines 149-169.
+    #[test]
+    fn matmul_transb_above_threshold_takes_gpu_path() {
+        let m = backend();
+        let a = Array2::<f32>::from_shape_vec((8, 16), vec![0.5f32; 128]).unwrap();
+        let b_t = Array2::<f32>::from_shape_vec((32, 16), vec![0.25f32; 512]).unwrap();
+        let out = m
+            .f32_ops
+            .matmul_transb(&m.queue, &m.bufs, a.view(), b_t.view(), 1);
+        assert_eq!(out.shape(), &[8, 32]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// `matmul` GPU path with non-contiguous inputs — covers the
+    /// `a.as_slice() == None` materialise branch (lines 118-121).
+    /// Built by transposing an Array2 to get a column-major view.
+    #[test]
+    fn matmul_gpu_path_handles_non_contiguous_inputs() {
+        let m = backend();
+        // Build a 16×8 standard-layout array, view it transposed (8×16
+        // but non-contiguous) and feed it as A.
+        let a_data: Vec<f32> = (0..16 * 8).map(|i| (i as f32) * 0.001).collect();
+        let a_owned = Array2::from_shape_vec((16, 8), a_data).unwrap();
+        let a_view = a_owned.t(); // (8, 16) non-contiguous
+        assert!(a_view.as_slice().is_none(), "view must be non-contiguous");
+        let b = Array2::<f32>::from_shape_vec((16, 4), vec![0.25f32; 64]).unwrap();
+        // B also non-contiguous by transposing a (4, 16) array.
+        let b_t_owned =
+            Array2::from_shape_vec((4, 16), (0..64).map(|i| i as f32 * 0.01).collect()).unwrap();
+        let b_view = b_t_owned.t();
+        assert!(b_view.as_slice().is_none());
+        let out = m.f32_ops.matmul(&m.queue, &m.bufs, a_view, b_view, 1);
+        assert_eq!(out.shape(), &[8, 4]);
+        // Compare via the standard b too (any output works — we're
+        // exercising the path).
+        let _ = b;
+    }
+
+    /// CPU fallback below the FLOP threshold (line 111-112).  Same
+    /// shape but threshold so high the dispatch never goes GPU.
+    #[test]
+    fn matmul_below_threshold_falls_back_to_cpu() {
+        let m = backend();
+        let a = Array2::<f32>::from_shape_vec((2, 2), vec![1.0f32; 4]).unwrap();
+        let b = Array2::<f32>::from_shape_vec((2, 2), vec![1.0f32; 4]).unwrap();
+        let out = m
+            .f32_ops
+            .matmul(&m.queue, &m.bufs, a.view(), b.view(), usize::MAX);
+        assert_eq!(out.shape(), &[2, 2]);
+    }
+}

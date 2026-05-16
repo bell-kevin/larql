@@ -116,7 +116,16 @@ pub(super) fn run_engine_q4k(
 ) -> Result<BenchRow, Box<dyn std::error::Error>> {
     let want_metal_q4k = args.backends.contains("metal");
     let backend_for_q4k: Box<dyn larql_inference::ComputeBackend> = if want_metal_q4k {
-        larql_inference::default_backend()
+        // Use the Metal-aware factory. `larql_inference::default_backend()`
+        // (= `larql_compute::default_backend()`) lost its Metal detection
+        // after the `larql-compute-metal` extraction and always returns
+        // CpuBackend now. Engines that look at `backend.has_q4()` to
+        // decide whether to route through `q4k_decode_token` / Metal's
+        // fused `decode_token` would get a CpuBackend with `has_q4()
+        // == true` and then `backend.decode_token()` returns None (CPU
+        // doesn't implement the fused kernel), silently falling back to
+        // the slow CPU path.
+        larql_inference::default_compute_backend()
     } else {
         larql_inference::cpu_backend()
     };

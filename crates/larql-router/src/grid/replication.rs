@@ -14,16 +14,34 @@ use larql_router_protocol::{AssignMsg, RouterMessage, RouterPayload};
 use super::{GridState, ServerEntry};
 
 impl GridState {
+    /// Find any currently-serving replica that owns the requested
+    /// `(model_id, layer_range, expert_range)` slice. "Owns" uses
+    /// covering semantics — a wider-range server is a valid origin
+    /// for a narrower-range gap. For dense gaps (`expert_start ==
+    /// expert_end == 0`) the expert dimension is ignored.
     pub fn find_origin_for(
         &self,
         model_id: &str,
         layer_start: u32,
         layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
     ) -> Option<(String, String)> {
+        let is_dense_gap = expert_start == 0 && expert_end == 0;
         self.servers
             .values()
             .find(|e| {
-                e.model_id == model_id && e.layer_start <= layer_start && e.layer_end >= layer_end
+                if e.model_id != model_id {
+                    return false;
+                }
+                if !(e.layer_start <= layer_start && e.layer_end >= layer_end) {
+                    return false;
+                }
+                if is_dense_gap {
+                    return true;
+                }
+                // MoE gap — origin must own at least the requested expert range.
+                e.is_dense() || (e.expert_start <= expert_start && e.expert_end >= expert_end)
             })
             .map(|e| (e.listen_url.clone(), e.vindex_hash.clone()))
     }
@@ -40,13 +58,17 @@ impl GridState {
         model_id: &str,
         layer_start: u32,
         layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
         min_ram_bytes: u64,
     ) -> bool {
-        let Some((origin_url, shard_hash)) = self.find_origin_for(model_id, layer_start, layer_end)
+        let Some((origin_url, shard_hash)) =
+            self.find_origin_for(model_id, layer_start, layer_end, expert_start, expert_end)
         else {
             tracing::warn!(
                 model_id = %model_id,
                 layers = %format!("{layer_start}-{layer_end}"),
+                experts = %format!("{expert_start}-{expert_end}"),
                 "Grid: cannot fill gap — no live replica to serve as origin"
             );
             return false;
@@ -55,6 +77,8 @@ impl GridState {
             model_id,
             layer_start,
             layer_end,
+            expert_start,
+            expert_end,
             &origin_url,
             &shard_hash,
             min_ram_bytes,
@@ -63,11 +87,14 @@ impl GridState {
 
     /// Lower-level assign that takes an explicit origin. Used by tests and by
     /// deployments that supply an external (non-grid) origin store.
+    #[allow(clippy::too_many_arguments)]
     pub fn try_assign_gap_with_origin(
         &mut self,
         model_id: &str,
         layer_start: u32,
         layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
         origin_url: &str,
         shard_hash: &str,
         min_ram_bytes: u64,
@@ -91,6 +118,8 @@ impl GridState {
                 layer_end,
                 origin_url: origin_url.to_owned(),
                 shard_hash: shard_hash.to_owned(),
+                expert_start,
+                expert_end,
             })),
         };
         if entry.sender.try_send(Ok(msg)).is_ok() {
@@ -98,6 +127,7 @@ impl GridState {
                 server_id = %server_id,
                 model_id = %model_id,
                 layers = %format!("{layer_start}-{layer_end}"),
+                experts = %format!("{expert_start}-{expert_end}"),
                 origin_url = %origin_url,
                 "Grid: Mode B assignment sent"
             );
@@ -120,14 +150,29 @@ impl GridState {
         self.target_replicas
     }
 
-    /// Effective replication target for a specific shard range.
-    /// Equal to `target_replicas`, plus 1 when the range is currently
-    /// marked elevated by the hot-shard tick.
-    pub fn effective_target_for(&self, model_id: &str, layer_start: u32, layer_end: u32) -> u32 {
-        let bump = if self
-            .elevated_ranges
-            .contains(&(model_id.to_owned(), layer_start, layer_end))
-        {
+    /// Effective replication target for a specific shard slice. Equal
+    /// to `target_replicas`, plus 1 when the slice is currently marked
+    /// elevated by the hot-shard tick.
+    ///
+    /// ADR-0018: keyed on the 5-tuple
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end)`.
+    /// Two slices that share a layer range but own different experts
+    /// are independent — elevating one doesn't affect the other.
+    pub fn effective_target_for(
+        &self,
+        model_id: &str,
+        layer_start: u32,
+        layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
+    ) -> u32 {
+        let bump = if self.elevated_ranges.contains(&(
+            model_id.to_owned(),
+            layer_start,
+            layer_end,
+            expert_start,
+            expert_end,
+        )) {
             1
         } else {
             0
@@ -135,30 +180,39 @@ impl GridState {
         self.target_replicas + bump
     }
 
-    /// Phase 4: ranges whose live replica count exceeds the effective
-    /// target. Hot ranges have effective target = target + 1, so the
+    /// Phase 4: slices whose live replica count exceeds the effective
+    /// target. Tuple shape:
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end, surplus)`.
+    /// Hot slices have effective target = target + 1, so the
     /// over-replication tick won't strip a freshly-pulled hot spare;
     /// once the hot signal clears, the elevated bump goes away and the
     /// surplus replica is dropped on the next tick.
-    pub fn over_replicated_ranges(&self) -> Vec<(String, u32, u32, u32)> {
-        let mut counts: HashMap<(String, u32, u32), u32> = HashMap::new();
+    pub fn over_replicated_ranges(&self) -> Vec<(String, u32, u32, u32, u32, u32)> {
+        let mut counts: HashMap<(String, u32, u32, u32, u32), u32> = HashMap::new();
         for e in self.servers.values() {
             *counts
-                .entry((e.model_id.clone(), e.layer_start, e.layer_end))
+                .entry((
+                    e.model_id.clone(),
+                    e.layer_start,
+                    e.layer_end,
+                    e.expert_start,
+                    e.expert_end,
+                ))
                 .or_default() += 1;
         }
         let mut out = Vec::new();
-        for ((model_id, start, end), count) in counts {
-            let effective = self.effective_target_for(&model_id, start, end);
+        for ((model_id, ls, le, es, ee), count) in counts {
+            let effective = self.effective_target_for(&model_id, ls, le, es, ee);
             if count > effective {
-                out.push((model_id, start, end, count - effective));
+                out.push((model_id, ls, le, es, ee, count - effective));
             }
         }
         out.sort();
         out
     }
 
-    /// Phase 4: among servers covering `(model_id, layer_start, layer_end)`,
+    /// Phase 4: among servers exactly matching the 5-tuple
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end)`,
     /// return the one with the lowest `requests_in_flight`. Used by the
     /// over-replication path to pick which replica to drop.
     pub fn least_loaded_in_range(
@@ -166,52 +220,66 @@ impl GridState {
         model_id: &str,
         layer_start: u32,
         layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
     ) -> Option<&ServerEntry> {
         self.servers
             .values()
             .filter(|e| {
-                e.model_id == model_id && e.layer_start == layer_start && e.layer_end == layer_end
+                e.model_id == model_id
+                    && e.layer_start == layer_start
+                    && e.layer_end == layer_end
+                    && e.expert_start == expert_start
+                    && e.expert_end == expert_end
             })
             .min_by_key(|e| e.requests_in_flight)
     }
 
-    /// Phase 4: ranges whose live replica count is below the effective
-    /// target (= `target_replicas` plus the hot-shard bump). Skips ranges
-    /// that have zero servers — those are handled by `coverage_gaps()` /
-    /// `try_fill_all_gaps()` because they need a different
-    /// origin-resolution story (no live replica → no origin).
-    pub fn under_replicated_ranges(&self) -> Vec<(String, u32, u32, u32)> {
-        // Group by (model_id, layer_start, layer_end) → count of servers.
-        let mut counts: HashMap<(String, u32, u32), u32> = HashMap::new();
+    /// Phase 4: slices whose live replica count is below the effective
+    /// target (= `target_replicas` plus the hot-shard bump). Skips
+    /// slices that have zero servers — those are handled by
+    /// `coverage_gaps()` / `try_fill_all_gaps()` because they need a
+    /// different origin-resolution story (no live replica → no origin).
+    /// Tuple shape:
+    /// `(model_id, layer_start, layer_end, expert_start, expert_end, deficit)`.
+    pub fn under_replicated_ranges(&self) -> Vec<(String, u32, u32, u32, u32, u32)> {
+        let mut counts: HashMap<(String, u32, u32, u32, u32), u32> = HashMap::new();
         for e in self.servers.values() {
             *counts
-                .entry((e.model_id.clone(), e.layer_start, e.layer_end))
+                .entry((
+                    e.model_id.clone(),
+                    e.layer_start,
+                    e.layer_end,
+                    e.expert_start,
+                    e.expert_end,
+                ))
                 .or_default() += 1;
         }
         let mut out = Vec::new();
-        for ((model_id, start, end), count) in counts {
-            let effective = self.effective_target_for(&model_id, start, end);
+        for ((model_id, ls, le, es, ee), count) in counts {
+            let effective = self.effective_target_for(&model_id, ls, le, es, ee);
             if count > 0 && count < effective {
-                out.push((model_id, start, end, effective - count));
+                out.push((model_id, ls, le, es, ee, effective - count));
             }
         }
         out.sort();
         out
     }
 
-    /// Phase 4: walk under-replicated ranges and dispatch one `AssignMsg`
-    /// per range to bring counts closer to `target_replicas`. Returns the
-    /// number of assignments sent.
+    /// Phase 4: walk under-replicated slices and dispatch one
+    /// `AssignMsg` per slice to bring counts closer to
+    /// `target_replicas`. Returns the number of assignments sent.
     ///
-    /// At most one assignment per range per call — a newly-assigned replica
-    /// won't register as serving until `ReadyMsg` arrives, so issuing more
-    /// than one assignment per range here would over-replicate. Callers run
-    /// this periodically (rebalancer) or after Ready/Available events.
+    /// At most one assignment per slice per call — a newly-assigned
+    /// replica won't register as serving until `ReadyMsg` arrives, so
+    /// issuing more than one assignment per slice here would
+    /// over-replicate. Callers run this periodically (rebalancer) or
+    /// after Ready/Available events.
     pub fn try_replicate_from_available(&mut self) -> usize {
-        let ranges = self.under_replicated_ranges();
+        let slices = self.under_replicated_ranges();
         let mut sent = 0;
-        for (model_id, start, end, _deficit) in ranges {
-            if self.try_assign_gap(&model_id, start, end, 0) {
+        for (model_id, ls, le, es, ee, _deficit) in slices {
+            if self.try_assign_gap(&model_id, ls, le, es, ee, 0) {
                 sent += 1;
             }
         }
@@ -225,12 +293,15 @@ impl GridState {
     ///
     /// Returns `Ok(())` on dispatch, `Err(msg)` when the server isn't in
     /// the available pool or its outbound channel rejected the message.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_assign_to_named_available(
         &mut self,
         server_id: &str,
         model_id: &str,
         layer_start: u32,
         layer_end: u32,
+        expert_start: u32,
+        expert_end: u32,
         origin_url: &str,
         shard_hash: &str,
     ) -> Result<(), String> {
@@ -245,6 +316,8 @@ impl GridState {
                 layer_end,
                 origin_url: origin_url.to_owned(),
                 shard_hash: shard_hash.to_owned(),
+                expert_start,
+                expert_end,
             })),
         };
         if let Err(e) = entry.sender.try_send(Ok(msg)) {
@@ -256,6 +329,7 @@ impl GridState {
             server_id,
             model_id,
             layers = %format!("{layer_start}-{layer_end}"),
+            experts = %format!("{expert_start}-{expert_end}"),
             origin_url,
             "Grid: admin-targeted AssignMsg sent"
         );
@@ -264,6 +338,10 @@ impl GridState {
 
     /// Scan current coverage gaps and try to fill each one from the available
     /// pool. Returns the number of assignments sent.
+    ///
+    /// ADR-0018: `coverage_gaps()` currently reports dense layer-gap
+    /// ranges only — gap-fill of expert-level holes is not modelled.
+    /// Each gap is filled with `expert_start = expert_end = 0` (dense).
     pub fn try_fill_all_gaps(&mut self) -> usize {
         let gaps = self.coverage_gaps();
         let mut sent = 0;
@@ -272,7 +350,7 @@ impl GridState {
             // alone, so fall back to a permissive 0 (any available server is
             // acceptable). Deployments that need RAM-aware placement should
             // call try_assign_gap_with_origin directly with a real estimate.
-            if self.try_assign_gap(&model_id, layer_start, layer_end, 0) {
+            if self.try_assign_gap(&model_id, layer_start, layer_end, 0, 0, 0) {
                 sent += 1;
             }
         }
@@ -297,6 +375,8 @@ mod tests {
                 "test-model",
                 10,
                 14,
+                0,
+                0,
                 "http://origin:8090",
                 "deadbeef",
             )
@@ -321,7 +401,16 @@ mod tests {
     fn send_assign_to_named_available_unknown_id_errors() {
         let mut state = GridState::default();
         let err = state
-            .send_assign_to_named_available("no-such", "test-model", 0, 4, "http://origin", "h")
+            .send_assign_to_named_available(
+                "no-such",
+                "test-model",
+                0,
+                4,
+                0,
+                0,
+                "http://origin",
+                "h",
+            )
             .unwrap_err();
         assert!(err.contains("not in the available pool"));
     }
@@ -335,7 +424,7 @@ mod tests {
         state.register_available("target".into(), tx, 1, 0, "/".into());
 
         let err = state
-            .send_assign_to_named_available("target", "m", 0, 4, "http://origin", "h")
+            .send_assign_to_named_available("target", "m", 0, 4, 0, 0, "http://origin", "h")
             .unwrap_err();
         assert!(err.contains("failed"));
         // Entry must still be in the pool for a follow-up retry.
@@ -349,13 +438,13 @@ mod tests {
         a.vindex_hash = "deadbeef".into();
         state.register(a);
 
-        let origin = state.find_origin_for("model-a", 0, 5);
+        let origin = state.find_origin_for("model-a", 0, 5, 0, 0);
         assert_eq!(origin, Some(("http://a:8080".into(), "deadbeef".into())));
 
         // Wrong model: no origin.
-        assert!(state.find_origin_for("other", 0, 5).is_none());
+        assert!(state.find_origin_for("other", 0, 5, 0, 0).is_none());
         // Range outside coverage: no origin.
-        assert!(state.find_origin_for("model-a", 6, 9).is_none());
+        assert!(state.find_origin_for("model-a", 6, 9, 0, 0).is_none());
     }
 
     #[test]
@@ -372,10 +461,10 @@ mod tests {
 
         // Pretend layers 6-10 became a gap and we need to fill it. There's no
         // live replica for that range, so the assignment should be refused.
-        assert!(!state.try_assign_gap("model-a", 6, 10, 0));
+        assert!(!state.try_assign_gap("model-a", 6, 10, 0, 0, 0));
 
         // Now ask to fill an existing range — must find http://a:8080 as origin.
-        assert!(state.try_assign_gap("model-a", 0, 5, 0));
+        assert!(state.try_assign_gap("model-a", 0, 5, 0, 0, 0));
         let sent = rx.try_recv().expect("AssignMsg should be queued");
         let Ok(RouterMessage {
             payload: Some(RouterPayload::Assign(assign)),
@@ -410,7 +499,7 @@ mod tests {
         state.register(entry("c", "http://c", "model-x", 5, 9));
 
         let ranges = state.under_replicated_ranges();
-        assert_eq!(ranges, vec![("model-x".to_string(), 0, 4, 1)]);
+        assert_eq!(ranges, vec![("model-x".to_string(), 0, 4, 0, 0, 1)]);
     }
 
     #[test]
@@ -425,7 +514,7 @@ mod tests {
         state.register(entry("d", "http://d", "model-x", 5, 9));
 
         let over = state.over_replicated_ranges();
-        assert_eq!(over, vec![("model-x".to_string(), 0, 4, 1)]);
+        assert_eq!(over, vec![("model-x".to_string(), 0, 4, 0, 0, 1)]);
     }
 
     #[test]
@@ -441,11 +530,13 @@ mod tests {
         state.register(b);
         state.register(c);
 
-        let pick = state.least_loaded_in_range("model-x", 0, 4).unwrap();
+        let pick = state.least_loaded_in_range("model-x", 0, 4, 0, 0).unwrap();
         assert_eq!(pick.server_id, "b");
 
         // Wrong range yields None.
-        assert!(state.least_loaded_in_range("model-x", 10, 14).is_none());
+        assert!(state
+            .least_loaded_in_range("model-x", 10, 14, 0, 0)
+            .is_none());
     }
 
     #[test]
@@ -457,7 +548,7 @@ mod tests {
         state.register(entry("a", "http://a", "model-y", 10, 14));
         // model-y[10-14] has 1/2 → under-replicated.
         let ranges = state.under_replicated_ranges();
-        assert_eq!(ranges, vec![("model-y".to_string(), 10, 14, 1)]);
+        assert_eq!(ranges, vec![("model-y".to_string(), 10, 14, 0, 0, 1)]);
     }
 
     #[test]

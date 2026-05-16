@@ -222,6 +222,8 @@ async fn ready_replica_satisfies_target() {
                 layer_start: assign.layer_start,
                 layer_end: assign.layer_end,
                 listen_url: "http://spare:9999".into(),
+            expert_start: 0,
+            expert_end: 0,
             })),
         })
         .await

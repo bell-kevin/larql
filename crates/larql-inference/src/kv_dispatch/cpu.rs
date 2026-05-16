@@ -156,6 +156,66 @@ fn cpu_residual(r: &ResidualHandle) -> &CpuResidualHandle {
         })
 }
 
+// ─── CpuQ4kCacheHandle — Q4K cached-decode handle ──────────────────────────
+//
+// Wraps the production `CpuKvCache` (per-layer K/V) so it can flow through
+// the dispatch trait's `KvHandle` shape. Cache populated by
+// `cached_prefill_q4k`; consumed by `cached_decode_step_q4k`.
+//
+// One handle per engine (not per layer), unlike the legacy `CpuKvHandle`
+// (one per layer for the f32 per-layer dispatch path). The two shapes
+// coexist because they serve different dispatch granularities.
+
+pub struct CpuQ4kCacheHandle {
+    cache: crate::vindex::CpuKvCache,
+}
+
+impl KvHandleInner for CpuQ4kCacheHandle {
+    fn cached_len(&self) -> usize {
+        self.cache
+            .iter()
+            .filter_map(|o| o.as_ref())
+            .map(|(k, _)| k.shape()[0])
+            .next()
+            .unwrap_or(0)
+    }
+
+    fn kv_dim(&self) -> usize {
+        self.cache
+            .iter()
+            .filter_map(|o| o.as_ref())
+            .map(|(k, _)| k.shape()[1])
+            .next()
+            .unwrap_or(0)
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "cpu-q4k"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+fn cpu_q4k_cache_mut(h: &mut KvHandle) -> &mut CpuQ4kCacheHandle {
+    let backend_name = h.backend_name();
+    h.as_inner_mut()
+        .as_any_mut()
+        .downcast_mut::<CpuQ4kCacheHandle>()
+        .unwrap_or_else(|| {
+            panic!(
+                "CpuBackend::cached_decode_step_q4k received a foreign handle \
+                 (backend={backend_name}); handles must be allocated by the same \
+                 backend that consumes them"
+            )
+        })
+}
+
 // ─── KvDispatch impl ────────────────────────────────────────────────────────
 
 impl KvDispatch for CpuBackend {
@@ -214,7 +274,15 @@ impl KvDispatch for CpuBackend {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
+        _index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<Array2<f32>> {
+        // CpuBackend reads f32 attention tensors out of `weights.tensors`.
+        // When the caller has a Q4K `VectorIndex`, it's expected to have
+        // already populated `weights.tensors` via
+        // `crate::vindex::ensure_attn_tensors_dequantised` before
+        // dispatching here. Until phase-3 CPU Q4K matvec kernels land,
+        // the `index` parameter is accepted for trait-shape compatibility
+        // but not consumed.
         let h = cpu_handle_mut(kv);
         let prior_kv = h.as_shared_kv().cloned();
         let (h_post_attn, new_kv) = run_attention_block_decode_step_backend(
@@ -225,8 +293,6 @@ impl KvDispatch for CpuBackend {
             abs_position,
             Some(self),
         )?;
-        // Mutate handle: new_kv now contains prior K/V + the current
-        // token's K/V appended. Bit-parity with the legacy decode loop.
         h.replace_state(new_kv);
         Some(h_post_attn)
     }
@@ -237,7 +303,9 @@ impl KvDispatch for CpuBackend {
         tokens_embedded: &Array2<f32>,
         layer: usize,
         _window: Option<usize>,
+        _index: Option<&larql_vindex::VectorIndex>,
     ) -> Option<(Array2<f32>, KvHandle)> {
+        // See `attention_step` doc for the `_index` convention.
         let (h_post_attn, k_rope, v) =
             run_attention_with_kv_backend(weights, tokens_embedded, layer, Some(self))?;
         let kv_dim = k_rope.shape()[1];
@@ -281,6 +349,71 @@ impl KvDispatch for CpuBackend {
     // trait defaults (decomposition / unimplemented). Step 3 engine
     // migration adds overrides when the engines that consume them
     // actually need a CPU body.
+
+    // ── Coarse fused intents ────────────────────────────────────────
+    //
+    // Route through the production cached-decode pipeline. Backend
+    // inspects `index` (when present) and `weights` to pick the right
+    // kernel — Q4K matvec today, future quant formats slot in without
+    // changing the trait surface or the engine call sites.
+
+    fn coarse_prefill(
+        &self,
+        weights: &mut ModelWeights,
+        token_ids: &[u32],
+        index: Option<&larql_vindex::VectorIndex>,
+    ) -> Option<(Array2<f32>, KvHandle)> {
+        if token_ids.is_empty() {
+            return None;
+        }
+        // The cached-decode path needs the vindex (where the quant
+        // weights live). For f32-only models, engines use the per-layer
+        // `attention_prefill` dispatch path; no coarse f32 path here.
+        let index = index?;
+        if !crate::vindex::supports_cached_decode(weights) {
+            // Hybrid MoE / cross-layer KV sharing models — the cached
+            // path doesn't apply. Engine falls back to per-layer dispatch.
+            return None;
+        }
+        let (h_full, cache, _timings) =
+            crate::vindex::predict_q4k_prefill(weights, token_ids, index);
+        let last = h_full.shape()[0] - 1;
+        let h = h_full.slice(ndarray::s![last..=last, ..]).to_owned();
+        let handle = KvHandle::new(CpuQ4kCacheHandle { cache });
+        Some((h, handle))
+    }
+
+    fn coarse_decode_step(
+        &self,
+        weights: &mut ModelWeights,
+        token_id: u32,
+        index: Option<&larql_vindex::VectorIndex>,
+        handle: &mut KvHandle,
+        abs_position: usize,
+    ) -> Option<Array2<f32>> {
+        let index = index?;
+        let inner = cpu_q4k_cache_mut(handle);
+        // Prefer direct-matvec (no per-layer dequant) when supported.
+        if crate::vindex::supports_direct_matvec_decode(weights, index) {
+            crate::vindex::predict_q4k_decode_step_direct(
+                weights,
+                token_id,
+                index,
+                self,
+                &mut inner.cache,
+                abs_position,
+            )
+        } else {
+            crate::vindex::predict_q4k_decode_step(
+                weights,
+                token_id,
+                index,
+                &mut inner.cache,
+                abs_position,
+            )
+            .map(|(h, _)| h)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -363,7 +496,7 @@ mod tests {
 
         // Trait dispatch.
         let (h_trait, handle) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("attention_prefill");
         let (k_trait, v_trait) = backend.read_kv_to_host(&handle).unwrap();
 
@@ -388,7 +521,7 @@ mod tests {
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
         // Populate handle via prefill.
-        let (_, mut handle) = backend.attention_prefill(&weights, &h_in, 0, None).unwrap();
+        let (_, mut handle) = backend.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
         let prior_len = handle.cached_len();
 
         // Snapshot prior K/V before the trait call mutates the handle.
@@ -401,7 +534,7 @@ mod tests {
 
         // Trait dispatch — mutates handle.
         let h_trait = backend
-            .attention_step(&weights, &h_new, &mut handle, 0, abs_position)
+            .attention_step(&weights, &h_new, &mut handle, 0, abs_position, None)
             .expect("attention_step");
 
         // Legacy: same prior K/V, same call.

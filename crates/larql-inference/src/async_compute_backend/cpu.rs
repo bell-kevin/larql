@@ -59,9 +59,18 @@ impl AsyncComputeBackend for CpuBackend {
         kv: &mut KvHandle,
         layer: usize,
         abs_position: usize,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> AttentionHandle {
-        let hidden = <Self as KvDispatch>::attention_step(self, weights, query, kv, layer, abs_position)
-            .expect("CpuBackend::attention_step returned None — unsupported layer or shape?");
+        let hidden = <Self as KvDispatch>::attention_step(
+            self,
+            weights,
+            query,
+            kv,
+            layer,
+            abs_position,
+            index,
+        )
+        .expect("CpuBackend::attention_step returned None — unsupported layer or shape?");
         AttentionHandle::ready(hidden)
     }
 
@@ -71,10 +80,17 @@ impl AsyncComputeBackend for CpuBackend {
         tokens_embedded: &Array2<f32>,
         layer: usize,
         window: Option<usize>,
+        index: Option<&larql_vindex::VectorIndex>,
     ) -> (AttentionHandle, KvHandle) {
-        let (hidden, handle) =
-            <Self as KvDispatch>::attention_prefill(self, weights, tokens_embedded, layer, window)
-                .expect("CpuBackend::attention_prefill returned None — unsupported layer or shape?");
+        let (hidden, handle) = <Self as KvDispatch>::attention_prefill(
+            self,
+            weights,
+            tokens_embedded,
+            layer,
+            window,
+            index,
+        )
+        .expect("CpuBackend::attention_prefill returned None — unsupported layer or shape?");
         (AttentionHandle::ready(hidden), handle)
     }
 
@@ -134,10 +150,10 @@ mod tests {
         // Populate two independent handles via the sync prefill — same
         // initial state for both sync and async decode-step paths.
         let (_, mut handle_sync) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("attention_prefill");
         let (_, mut handle_async) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("attention_prefill");
 
         let h_new = crate::forward::embed_tokens_pub(&weights, &[3u32]);
@@ -150,11 +166,12 @@ mod tests {
             &mut handle_sync,
             0,
             abs_position,
+            None,
         )
         .expect("sync attention_step");
 
         let h_async = backend
-            .attention_step_async(&weights, &h_new, &mut handle_async, 0, abs_position)
+            .attention_step_async(&weights, &h_new, &mut handle_async, 0, abs_position, None)
             .read();
 
         assert_eq!(
@@ -177,10 +194,10 @@ mod tests {
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
         let (h_sync, handle_sync) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("sync prefill");
         let (h_async_handle, handle_async) =
-            backend.attention_prefill_async(&weights, &h_in, 0, None);
+            backend.attention_prefill_async(&weights, &h_in, 0, None, None);
         let h_async = h_async_handle.read();
 
         assert_eq!(
@@ -246,23 +263,31 @@ mod tests {
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
         let (_, mut handle_step) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("prefill");
         let (_, mut handle_windowed) = backend
-            .attention_prefill(&weights, &h_in, 0, None)
+            .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("prefill");
 
         let h_new = crate::forward::embed_tokens_pub(&weights, &[5u32]);
         let abs_position = tokens.len();
 
         let h_step = backend
-            .attention_step_async(&weights, &h_new, &mut handle_step, 0, abs_position)
+            .attention_step_async(&weights, &h_new, &mut handle_step, 0, abs_position, None)
             .read();
         // After step, manually clip to window=3.
         backend.clip_kv(&mut handle_step, 3);
 
         let h_windowed = backend
-            .attention_step_windowed_async(&weights, &h_new, &mut handle_windowed, 0, abs_position, 3)
+            .attention_step_windowed_async(
+                &weights,
+                &h_new,
+                &mut handle_windowed,
+                0,
+                abs_position,
+                3,
+                None,
+            )
             .read();
 
         assert_eq!(
@@ -286,6 +311,7 @@ mod tests {
             ndarray::Array2::from_shape_vec((1, weights.hidden_size), vec![0.0; weights.hidden_size])
                 .unwrap();
         let _ = backend.recompute_kv_from_residuals_async(&weights, &residuals, 0);
+        // (recompute_kv_from_residuals_async signature unchanged at A3.)
     }
 
     #[test]

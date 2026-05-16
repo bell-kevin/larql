@@ -33,6 +33,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::grid::GridState;
+use crate::metrics::RouterMetrics;
 
 pub use config::RebalancerConfig;
 
@@ -43,26 +44,46 @@ use replication::{check_over_replication, check_under_replication};
 
 /// Spawn the rebalancer background task.
 /// Returns immediately; the task runs for the process lifetime.
-pub fn spawn(state: Arc<RwLock<GridState>>, cfg: RebalancerConfig) {
-    tokio::spawn(rebalancer_task(state, cfg));
+pub fn spawn(
+    state: Arc<RwLock<GridState>>,
+    cfg: RebalancerConfig,
+    metrics: Option<Arc<RouterMetrics>>,
+) {
+    tokio::spawn(rebalancer_task(state, cfg, metrics));
 }
 
-async fn rebalancer_task(state: Arc<RwLock<GridState>>, cfg: RebalancerConfig) {
+async fn rebalancer_task(
+    state: Arc<RwLock<GridState>>,
+    cfg: RebalancerConfig,
+    metrics: Option<Arc<RouterMetrics>>,
+) {
     let mut interval = tokio::time::interval(cfg.check_interval);
     let mut tracker = ImbalanceTracker::default();
 
     loop {
         interval.tick().await;
-        evict_stale_heartbeats(&state, cfg.stale_heartbeat_timeout).await;
+        evict_stale_heartbeats(&state, cfg.stale_heartbeat_timeout, metrics.as_deref()).await;
         // Hot-shard elevation runs before replica checks so newly hot
         // ranges look under-replicated in the same tick (and cooling
         // ranges look over-replicated, freeing the surplus replica).
         if let Some(threshold) = cfg.hot_shard_rps_threshold {
-            check_hot_shards(&state, threshold).await;
+            check_hot_shards(
+                &state,
+                threshold,
+                cfg.hot_shard_demote_ratio,
+                metrics.as_deref(),
+            )
+            .await;
         }
-        check_under_replication(&state).await;
-        check_over_replication(&state).await;
-        check_imbalance(&state, &cfg, &mut tracker).await;
+        check_under_replication(&state, metrics.as_deref()).await;
+        check_over_replication(&state, metrics.as_deref()).await;
+        check_imbalance(&state, &cfg, &mut tracker, metrics.as_deref()).await;
+        // ADR-0017: scrape-equivalent gauge refresh — fires once per
+        // rebalancer tick so /metrics responses between ticks see the
+        // latest values without needing per-mutation gauge plumbing.
+        if let Some(m) = metrics.as_deref() {
+            m.refresh_gauges(&*state.read().await);
+        }
     }
 }
 
@@ -84,7 +105,7 @@ mod tests {
             hot_shard_rps_threshold: Some(1.0),
             ..RebalancerConfig::default()
         };
-        spawn(state.clone(), cfg);
+        spawn(state.clone(), cfg, None);
         // tokio::time::interval fires immediately then on cadence, so two
         // 20 ms intervals plus scheduler slack covers two full passes
         // through the loop body.

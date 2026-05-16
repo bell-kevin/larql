@@ -33,6 +33,8 @@ use larql_router_protocol::{
     RouterPayload, ServerMessage, ServerPayload, StatusRequest, StatusResponse, UnassignMsg,
 };
 
+use crate::metrics::RouterMetrics;
+
 use super::{GridState, ServerEntry};
 
 pub struct GridServiceImpl {
@@ -40,6 +42,9 @@ pub struct GridServiceImpl {
     next_id: AtomicU64,
     /// If set, every incoming Join stream must present "Authorization: Bearer <key>".
     grid_key: Option<String>,
+    /// ADR-0017 — shared metrics registry. `None` skips observation
+    /// (used by integration tests that don't need the dependency).
+    metrics: Option<Arc<RouterMetrics>>,
 }
 
 impl GridServiceImpl {
@@ -49,6 +54,7 @@ impl GridServiceImpl {
             state,
             next_id: AtomicU64::new(1),
             grid_key: None,
+            metrics: None,
         }
     }
 
@@ -57,7 +63,15 @@ impl GridServiceImpl {
             state,
             next_id: AtomicU64::new(1),
             grid_key: key,
+            metrics: None,
         }
+    }
+
+    /// Builder-style setter — installs the shared metrics handle so
+    /// every Join stream the service handles bumps the right counters.
+    pub fn with_metrics(mut self, metrics: Arc<RouterMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     fn alloc_server_id(&self) -> String {
@@ -93,6 +107,7 @@ impl GridService for GridServiceImpl {
         }
 
         let state = self.state.clone();
+        let metrics = self.metrics.clone();
         let server_id = self.alloc_server_id();
         let (tx, rx) = mpsc::channel::<Result<RouterMessage, Status>>(32);
         let mut inbound = request.into_inner();
@@ -117,6 +132,8 @@ impl GridService for GridServiceImpl {
                             ram_bytes,
                             listen_url,
                             vindex_hash,
+                            expert_start,
+                            expert_end,
                         }) => {
                             let entry = ServerEntry {
                                 server_id: sid.clone(),
@@ -132,8 +149,13 @@ impl GridService for GridServiceImpl {
                                 layer_latencies: HashMap::new(),
                                 req_per_sec: 0.0,
                                 rtt_ms: None,
+                                expert_start,
+                                expert_end,
                             };
                             state.write().await.register_with_sender(entry, tx.clone());
+                            if let Some(m) = &metrics {
+                                m.grid_registers_total.inc();
+                            }
                             registered_model = Some((model_id, layer_start, layer_end));
 
                             let ack = RouterMessage {
@@ -176,6 +198,16 @@ impl GridService for GridServiceImpl {
                                 let r = guard.try_replicate_from_available();
                                 (f, r)
                             };
+                            if let Some(m) = &metrics {
+                                m.grid_deregisters_total
+                                    .with_label_values(&["dropping"])
+                                    .inc();
+                                if filled > 0 || replicated > 0 {
+                                    m.rebalancer_actions_total
+                                        .with_label_values(&["replicate"])
+                                        .inc_by((filled + replicated) as u64);
+                                }
+                            }
                             if filled > 0 || replicated > 0 {
                                 tracing::info!(
                                     filled,
@@ -212,10 +244,15 @@ impl GridService for GridServiceImpl {
                             let gaps = state.read().await.coverage_gaps();
                             let mut consumed = false;
                             for (model_id, layer_start, layer_end) in gaps {
+                                // ADR-0018: coverage gaps are dense layer-range
+                                // holes; the gap-fill path passes 0/0 for the
+                                // expert range (no expert-level holes here).
                                 let assigned = state.write().await.try_assign_gap(
                                     &model_id,
                                     layer_start,
                                     layer_end,
+                                    0,
+                                    0,
                                     av.ram_bytes,
                                 );
                                 if assigned {
@@ -261,8 +298,18 @@ impl GridService for GridServiceImpl {
                                 layer_latencies: HashMap::new(),
                                 req_per_sec: 0.0,
                                 rtt_ms: None,
+                                // ADR-0018: ReadyMsg carries the expert range
+                                // for the just-loaded shard. Mode B operators
+                                // can hand back a Ready with `0/0` (dense) or
+                                // a real expert range matching the originating
+                                // AssignMsg.
+                                expert_start: r.expert_start,
+                                expert_end: r.expert_end,
                             };
                             state.write().await.register_with_sender(entry, tx.clone());
+                            if let Some(m) = &metrics {
+                                m.grid_registers_total.inc();
+                            }
                             registered_model =
                                 Some((r.model_id.clone(), r.layer_start, r.layer_end));
                             is_available = false;
@@ -307,6 +354,16 @@ impl GridService for GridServiceImpl {
                     let r = guard.try_replicate_from_available();
                     (f, r)
                 };
+                if let Some(m) = &metrics {
+                    m.grid_deregisters_total
+                        .with_label_values(&["stream_close"])
+                        .inc();
+                    if filled > 0 || replicated > 0 {
+                        m.rebalancer_actions_total
+                            .with_label_values(&["replicate"])
+                            .inc_by((filled + replicated) as u64);
+                    }
+                }
                 if filled > 0 || replicated > 0 {
                     tracing::info!(
                         filled,
@@ -408,7 +465,11 @@ impl GridService for GridServiceImpl {
                 req.explicit_origin_hash.clone(),
             )
         } else {
-            match guard.find_origin_for(&req.model_id, req.layer_start, req.layer_end) {
+            // ADR-0018: admin `AssignRange` is dense-only today.
+            // The RPC proto doesn't carry expert_start/end on
+            // AssignRangeRequest yet — adding them is additive and
+            // tracked separately.
+            match guard.find_origin_for(&req.model_id, req.layer_start, req.layer_end, 0, 0) {
                 Some(o) => o,
                 None => {
                     return Ok(Response::new(AdminAck {
@@ -429,6 +490,8 @@ impl GridService for GridServiceImpl {
                 &req.model_id,
                 req.layer_start,
                 req.layer_end,
+                0,
+                0,
                 &origin_url,
                 &shard_hash,
                 /* min_ram */ 0,
@@ -439,6 +502,8 @@ impl GridService for GridServiceImpl {
                 &req.model_id,
                 req.layer_start,
                 req.layer_end,
+                0,
+                0,
                 &origin_url,
                 &shard_hash,
             ) {
