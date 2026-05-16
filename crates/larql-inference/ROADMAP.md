@@ -1693,7 +1693,7 @@ P0 validation" (SQ1, SQ2). Re-promotion conditions are recorded there.
 
 | # | Spec | Status | Why queued |
 |---|------|--------|------------|
-| SQ1 | [`markov-residual-engine.md`](docs/specs/markov-residual-engine.md) | reviewed, impl not started | Reference impl already works in `kv-cache-benchmark`; lifting it without first resolving the trait-vs-sibling shape against `UnlimitedContextEngine` / `ApolloEngine` risks forcing the other two engines into a shape that doesn't fit. V1/V2 also produce the measurement infrastructure that proves the migration didn't regress. |
+| SQ1 | [`markov-residual-engine.md`](docs/specs/markov-residual-engine.md) | ✅ shipped | Production impl lives in `larql_kv::engines::markov_residual`. The trait-vs-sibling question resolved via `KvEngine` + `KvDispatch`. The `kv-cache-benchmark` reference impl that the spec lifted from was retired in 2026-05-16. |
 | SQ2 | [`vindex-as-ffn.md`](docs/specs/vindex-as-ffn.md) | reviewed, impl not started | §5.4 cost model says it's a wash on typical decode K (256–1024) without large compiled-fact corpora. R6 (depth-fraction probe) needs to land before the per-arch layer policy is automated rather than hand-calibrated. No current video / research workflow needs the paraphrase-reach the lookup buys above the existing L1 i16 cos≥0.999 cache. |
 
 These are not P0/P1-active. Top-level roadmap is the source of truth

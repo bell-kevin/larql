@@ -27,7 +27,9 @@ pub fn predict_kquant_hidden_hooked(
     hook: &mut dyn LayerHook,
 ) -> Result<Array2<f32>, String> {
     if weights.arch.is_hybrid_moe() {
-        return Err("predict_kquant_hidden_hooked currently supports dense FFN vindexes only".into());
+        return Err(
+            "predict_kquant_hidden_hooked currently supports dense FFN vindexes only".into(),
+        );
     }
 
     let mut h = embed_tokens_pub(weights, token_ids);

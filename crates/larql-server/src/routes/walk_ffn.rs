@@ -493,7 +493,9 @@ pub(crate) fn run_full_output_core(
                     layer: usize,
                     x: &larql_vindex::ndarray::Array2<f32>,
                 ) -> larql_vindex::ndarray::Array2<f32> {
-                    larql_inference::vindex::kquant_ffn_forward_layer(self.arch, self.index, layer, x)
+                    larql_inference::vindex::kquant_ffn_forward_layer(
+                        self.arch, self.index, layer, x,
+                    )
                 }
                 fn forward_with_activation(
                     &self,

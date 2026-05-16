@@ -98,7 +98,10 @@ fn generate_q4k_cpu_produces_tokens_against_real_vindex() {
     let text: String = tokens.iter().map(|(t, _)| t.as_str()).collect();
     eprintln!("output: {text:?}");
 
-    assert!(!tokens.is_empty(), "generate_kquant_cpu produced zero tokens");
+    assert!(
+        !tokens.is_empty(),
+        "generate_kquant_cpu produced zero tokens"
+    );
     assert!(
         tokens.len() <= max_tokens,
         "generate_kquant_cpu exceeded max_tokens cap"

@@ -29,7 +29,6 @@ use crate::engines::markov_residual::ensure_attn_tensors_dequantised;
 use crate::{EngineInfo, KvEngine};
 use larql_inference::attention::SharedKV;
 use larql_inference::ffn::FfnBackend;
-use larql_inference::layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ;
 use larql_inference::model::ModelWeights;
 
 // ─── EngineStats ─────────────────────────────────────────────────────────────

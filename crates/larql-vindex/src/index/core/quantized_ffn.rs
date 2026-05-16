@@ -142,12 +142,8 @@ mod tests {
     fn flag_methods_false_on_empty() {
         let v = fresh();
         assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_q4(&v));
-        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_kquant(
-            &v
-        ));
-        assert!(!<VectorIndex as QuantizedFfnAccess>::has_down_features_kquant(
-            &v
-        ));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_interleaved_kquant(&v));
+        assert!(!<VectorIndex as QuantizedFfnAccess>::has_down_features_kquant(&v));
     }
 
     #[test]
@@ -163,7 +159,9 @@ mod tests {
         let v = fresh();
         assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_q4_mmap_ref(&v).is_none());
         assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_kquant_mmap_ref(&v).is_none());
-        assert!(<VectorIndex as QuantizedFfnAccess>::interleaved_kquant_layer_data(&v, 0).is_none());
+        assert!(
+            <VectorIndex as QuantizedFfnAccess>::interleaved_kquant_layer_data(&v, 0).is_none()
+        );
     }
 
     #[test]
@@ -214,7 +212,8 @@ mod tests {
         .is_none());
         // Backend=None path also covered.
         assert!(
-            <VectorIndex as QuantizedFfnAccess>::kquant_matmul_transb(&v, 0, 0, &x, 1, None).is_none()
+            <VectorIndex as QuantizedFfnAccess>::kquant_matmul_transb(&v, 0, 0, &x, 1, None)
+                .is_none()
         );
     }
 

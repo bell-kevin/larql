@@ -123,18 +123,30 @@ pub(super) fn rs_decode_step_walk(
         }
         let hot_abs_start = abs_position.saturating_sub(s_hot);
 
-        let t_kv_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        let t_kv_start = if instrument {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
 
         let (k_full, v_full) = if let Some(cold_kv) = &rs.cold_kv {
             let (k_cold, v_cold) = &cold_kv[layer];
             let (k_hot, v_hot) =
                 recompute_kv(weights, h_hot, layer, hot_abs_start, backend, Some(index))?;
-            let kv_recompute_done = if instrument { Some(std::time::Instant::now()) } else { None };
+            let kv_recompute_done = if instrument {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             if let (Some(start), Some(done)) = (t_kv_start, kv_recompute_done) {
                 t_recompute_kv += done.duration_since(start).as_secs_f64() * 1000.0;
             }
 
-            let t_concat_start = if instrument { Some(std::time::Instant::now()) } else { None };
+            let t_concat_start = if instrument {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let c = k_cold.shape()[0];
             let kv_dim = k_cold.shape()[1];
             let mut k_combined = Array2::<f32>::zeros((c + s_hot, kv_dim));
@@ -160,7 +172,14 @@ pub(super) fn rs_decode_step_walk(
                 }
                 _ => (h_hot.clone(), hot_abs_start),
             };
-            let pair = recompute_kv(weights, &h_full, layer, full_abs_start, backend, Some(index))?;
+            let pair = recompute_kv(
+                weights,
+                &h_full,
+                layer,
+                full_abs_start,
+                backend,
+                Some(index),
+            )?;
             if let Some(start) = t_kv_start {
                 t_recompute_kv += start.elapsed().as_secs_f64() * 1000.0;
             }
@@ -169,7 +188,11 @@ pub(super) fn rs_decode_step_walk(
 
         new_stored.push(h_new.clone());
 
-        let t_attn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        let t_attn_start = if instrument {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let kv_pair = (k_full, v_full);
         let native_result = larql_inference::vindex::attention_decode_step_native(
             weights,
@@ -187,22 +210,25 @@ pub(super) fn rs_decode_step_walk(
                 attn_helper_misses += 1;
             }
         }
-        let (h_post_attn, _new_kv) = native_result
-            .or_else(|| {
-                larql_inference::attention::run_attention_block_decode_step_backend(
-                    weights,
-                    &h_new,
-                    layer,
-                    Some(&kv_pair),
-                    abs_position,
-                    Some(backend),
-                )
-            })?;
+        let (h_post_attn, _new_kv) = native_result.or_else(|| {
+            larql_inference::attention::run_attention_block_decode_step_backend(
+                weights,
+                &h_new,
+                layer,
+                Some(&kv_pair),
+                abs_position,
+                Some(backend),
+            )
+        })?;
         if let Some(start) = t_attn_start {
             t_attention += start.elapsed().as_secs_f64() * 1000.0;
         }
 
-        let t_ffn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        let t_ffn_start = if instrument {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // Try the production-path native-quantised FFN helper first —
         // direct Q4K/Q6K matvec on the vindex's compact gate/up/down
         // bytes. Falls back to WalkFfn (and then dense WeightFfn) when

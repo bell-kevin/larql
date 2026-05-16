@@ -350,9 +350,7 @@ pub fn metal_fused_prefill(
     token_ids: &[u32],
     backend: &dyn ComputeBackend,
 ) -> Option<Array2<f32>> {
-    use crate::layer_graph::pipeline_layer::{
-        build_pipeline_layers, DEFAULT_GPU_KV_CACHE_MAX_SEQ,
-    };
+    use crate::layer_graph::pipeline_layer::{build_pipeline_layers, DEFAULT_GPU_KV_CACHE_MAX_SEQ};
     use larql_vindex::GateIndex;
 
     if !backend.has_q4() {

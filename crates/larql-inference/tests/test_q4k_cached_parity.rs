@@ -106,9 +106,14 @@ fn cached_decode_matches_uncached_tokens() {
     let mut cached_ids = vec![next_id];
     for step in 1..STEPS {
         let abs_position = prompt_ids.len() + (step - 1);
-        let (h_new, _) =
-            predict_kquant_decode_step(&mut weights_a, next_id, &q4_index, &mut cache, abs_position)
-                .expect("cached decode step");
+        let (h_new, _) = predict_kquant_decode_step(
+            &mut weights_a,
+            next_id,
+            &q4_index,
+            &mut cache,
+            abs_position,
+        )
+        .expect("cached decode step");
         next_id = argmax_token(&weights_a, &tokenizer, &h_new);
         cached_ids.push(next_id);
     }
@@ -167,7 +172,8 @@ fn direct_matvec_decode_matches_dequant_path() {
     let backend = CpuBackend;
 
     // ── Path A: cached prefill + direct-matvec decode ─────────────
-    let (h_prompt_a, mut cache_a, _) = predict_kquant_prefill(&mut weights_a, &prompt_ids, &q4_index);
+    let (h_prompt_a, mut cache_a, _) =
+        predict_kquant_prefill(&mut weights_a, &prompt_ids, &q4_index);
     let mut next_id = argmax_token(&weights_a, &tokenizer, &h_prompt_a);
     let mut direct_ids = vec![next_id];
     for step in 1..STEPS {
@@ -186,7 +192,8 @@ fn direct_matvec_decode_matches_dequant_path() {
     }
 
     // ── Path B: cached prefill + dequant decode ───────────────────
-    let (h_prompt_b, mut cache_b, _) = predict_kquant_prefill(&mut weights_b, &prompt_ids, &q4_index);
+    let (h_prompt_b, mut cache_b, _) =
+        predict_kquant_prefill(&mut weights_b, &prompt_ids, &q4_index);
     let mut next_id = argmax_token(&weights_b, &tokenizer, &h_prompt_b);
     let mut dequant_ids = vec![next_id];
     for step in 1..STEPS {

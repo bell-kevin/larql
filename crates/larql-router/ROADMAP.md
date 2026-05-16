@@ -816,24 +816,33 @@ worst-case bench scenarios.
 **Shipped:** Concurrent-route bench
 (`benches/routing.rs::bench_route_concurrent`, 2026-05-16) drives
 `route()` from 1 / 4 / 8 / 16 parallel tokio tasks against a single
-`Arc<tokio::sync::RwLock<GridState>>` (the lock shape
-`AppState::resolve_all` actually uses). Surfaced a clear contention
-plateau: throughput rises from 5.6 Melem/s @ 1 worker to 8.7 Melem/s
-@ 4, then collapses to 4.0 Melem/s @ 8 and 3.6 Melem/s @ 16. So a
-single router instance plateaus at ~4 concurrent in-flight `route()`
-readers before the lock acquisition cost dominates the ~110 ns
-critical section.
+`Arc<RwLock<GridState>>` — the lock shape `AppState::resolve_all`
+actually uses. **Lock primitive swap** (2026-05-16):
+`tokio::sync::RwLock<GridState>` → `parking_lot::RwLock<GridState>`
+across `larql-router` and its tests. Every grid critical section is
+short and sync (no `await` held across the lock), so the
+synchronous primitive is correct — and the compiler will catch any
+held-across-await pattern as `!Send` guards. Bench-driven
+verification:
 
-**P1 — bench-driven, surfaced by the new concurrent-route bench:**
+| Workers | tokio (before) | parking_lot (after) | Δ |
+|---|---|---|---|
+| 1 | 5.6 Melem/s | 6.4 Melem/s | +14% |
+| 4 | 8.7 Melem/s | 11.1 Melem/s | +28% |
+| 8 | 4.0 Melem/s | 7.2 Melem/s | **+80%** |
+| 16 | 3.6 Melem/s | 6.1 Melem/s | **+70%** |
 
-- **Lock primitive swap for the routing snapshot.** Replace
-  `tokio::sync::RwLock<GridState>` with either `arc_swap::ArcSwap`
-  (read-mostly snapshot, writers swap a fresh `Arc<GridState>`) or
-  `parking_lot::RwLock` (synchronous, cheap for short critical
-  sections). The concurrent-route bench is the regression gate;
-  target is monotonic scaling through 16 workers. ArcSwap is the
-  cleaner fit because reads happen on every request and writes only
-  on rebalancer ticks / heartbeats.
+The pathological 8-worker collapse (worse than 1 worker) is fixed;
+all worker counts now stay above the 1-worker baseline. Peak is at
+4 workers (M3 Max has 8 performance cores; past that we hit
+parking_lot's single-atomic read counter and E-core scheduling).
+220 tests still pass. ArcSwap remains a P3 if write traffic ever
+drops enough to amortise the copy-on-write cost; today's ~1k
+heartbeats/sec on a 100-server grid makes parking_lot the sweet
+spot.
+
+**P1 — bench-driven, queued for separate work:**
+
 - **Per-shard concurrency cap.** Hot-shard elevation reacts to
   `req_per_sec` but doesn't *cap* a shard. A misconfigured client
   flooding one shard can knock it over. Per-shard semaphore in the

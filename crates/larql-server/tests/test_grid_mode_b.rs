@@ -22,15 +22,17 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use larql_router::grid::{GridServiceImpl, GridState};
+use larql_router::grid::service::GridServiceImpl;
+use larql_router::grid::GridState;
 use larql_router_protocol::{
-    grid_service_server::GridServiceServer, AnnounceMsg, AvailableMsg, GridServiceClient,
-    ReadyMsg, RouterPayload, ServerMessage, ServerPayload,
+    grid_service_server::GridServiceServer, AnnounceMsg, AvailableMsg, GridServiceClient, ReadyMsg,
+    RouterPayload, ServerMessage, ServerPayload,
 };
 use tonic::transport::Server;
 
@@ -115,6 +117,8 @@ async fn announce_client(
             ram_bytes: 1024 * 1024 * 1024,
             listen_url,
             vindex_hash: vindex_hash.to_string(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -152,7 +156,7 @@ async fn mode_b_full_vertical_handoff() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-        let g = state.read().await;
+        let g = state.read();
         assert_eq!(
             g.status_response().servers.len(),
             2,
@@ -193,8 +197,8 @@ async fn mode_b_full_vertical_handoff() {
     //    rebalancer would use. The wire-level path (Available → Assign →
     //    download → Ready) is exactly the same.
     {
-        let mut g = state.write().await;
-        let sent = g.try_assign_gap("test-model", 0, 4, 0);
+        let mut g = state.write();
+        let sent = g.try_assign_gap("test-model", 0, 4, 0, 0, 0);
         assert!(
             sent,
             "try_assign_gap must succeed when a live replica exists as origin"
@@ -257,15 +261,15 @@ async fn mode_b_full_vertical_handoff() {
                 layer_start: assign.layer_start,
                 layer_end: assign.layer_end,
                 listen_url: "http://spare:9999".into(),
-            expert_start: 0,
-            expert_end: 0,
+                expert_start: 0,
+                expert_end: 0,
             })),
         })
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-        let g = state.read().await;
+        let g = state.read();
         let urls: Vec<String> = g
             .status_response()
             .servers
@@ -279,6 +283,108 @@ async fn mode_b_full_vertical_handoff() {
     }
 
     drop(donor_a_tx);
+}
+
+/// Drives the entire Mode B round-trip through
+/// `announce::try_once_available` — the same code path that
+/// `run_announce_available` (the daemon entry point) uses.
+/// `mode_b_full_vertical_handoff` above wires the gRPC stream
+/// manually and calls `shard_loader::download_and_load_shard`
+/// directly; this test asserts the *production* loop wires
+/// Available → Assign → download → Ready → Ack end-to-end.
+#[tokio::test]
+async fn mode_b_try_once_available_drives_full_handshake() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_test_writer()
+        .try_init();
+
+    let donor_http = spawn_shard_donor().await;
+    let donor_listen_url = format!("http://{donor_http}");
+    let (router_addr, state) = spawn_router().await;
+
+    // Donor announces with a placeholder hash — the only value the
+    // production `shard_loader` accepts without verifying a SHA-256 of
+    // the downloaded tar against the announce-time `vindex_hash`.
+    // The non-placeholder behaviour is a known production-side
+    // inconsistency tracked separately (vindex_identity_hash is a
+    // 16-hex model-identity tag, not a content hash — shard_loader
+    // expects the latter). See ROADMAP "GT5 hash verification"
+    // follow-up.
+    let (_donor_tx, _donor_inbound) = announce_client(
+        router_addr,
+        donor_listen_url.clone(),
+        "test-model".into(),
+        0,
+        4,
+        "",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(state.read().status_response().servers.len(), 1);
+
+    // Mode B config — production daemon path.
+    let tmp = TempDir::new().unwrap();
+    let store_path = tmp.path().to_string_lossy().to_string();
+    let cfg = larql_server::announce::AvailableConfig {
+        join_url: format!("http://{router_addr}"),
+        listen_url: "http://spare-via-try-once:9999".into(),
+        ram_bytes: 8 * 1024 * 1024 * 1024,
+        disk_bytes: 0,
+        store_path: store_path.clone(),
+        grid_key: None,
+        quic_cert_fingerprint: None,
+    };
+
+    // Spawn the real Mode B handshake. The task should return Ok(())
+    // once the spare receives AckMsg after sending ReadyMsg.
+    let handle =
+        tokio::spawn(async move { larql_server::announce::try_once_available(&cfg).await });
+
+    // Give the spare time to send AvailableMsg + register as available.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Trigger the assignment — same call the rebalancer would issue
+    // for an under-replicated range.
+    let sent = state.write().try_assign_gap("test-model", 0, 4, 0, 0, 0);
+    assert!(
+        sent,
+        "try_assign_gap should succeed: live origin exists + spare is available"
+    );
+
+    // The Mode B loop should download the shard and ack within 3s.
+    let res = tokio::time::timeout(Duration::from_secs(3), handle)
+        .await
+        .expect("try_once_available must complete within 3s")
+        .expect("task must not panic");
+    res.expect("Mode B handshake should succeed");
+
+    // Disk-side: the tar got unpacked at the expected path.
+    let dest = std::path::PathBuf::from(&store_path)
+        .join("test-model")
+        .join("layers-0-4");
+    assert!(
+        dest.is_dir(),
+        "shard must be unpacked at {dest:?} by the spare's run_available_loop"
+    );
+    let body = std::fs::read(dest.join("index.json")).unwrap();
+    assert_eq!(body, b"{\"shard\":\"donor\"}");
+
+    // Router-side: the spare must appear as serving with its listen_url.
+    let urls: Vec<String> = state
+        .read()
+        .status_response()
+        .servers
+        .iter()
+        .map(|s| s.listen_url.clone())
+        .collect();
+    assert!(
+        urls.contains(&"http://spare-via-try-once:9999".to_string()),
+        "spare must register as serving after ReadyMsg; got servers: {urls:?}"
+    );
 }
 
 #[tokio::test]
@@ -330,14 +436,13 @@ async fn no_assign_when_gap_has_no_surviving_origin() {
     // empty because shards adjacency check requires multiple shards) but
     // even if it were detected, find_origin_for would return None. Either
     // way: the spare must not receive an AssignMsg.
-    let result =
-        tokio::time::timeout(Duration::from_millis(300), spare_inbound.next()).await;
+    let result = tokio::time::timeout(Duration::from_millis(300), spare_inbound.next()).await;
     assert!(
         result.is_err(),
         "spare must not receive AssignMsg without a live origin: got {result:?}"
     );
 
     // Confirm the route table no longer holds the dead donor.
-    let g = state.read().await;
+    let g = state.read();
     assert_eq!(g.status_response().servers.len(), 0);
 }

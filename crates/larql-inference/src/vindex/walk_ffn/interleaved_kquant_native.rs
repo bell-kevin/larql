@@ -80,9 +80,9 @@ impl<'a> WalkFfn<'a> {
 
         // Down (component 2) — [hidden, intermediate], output [seq_len, hidden].
         let act_flat = activation.as_slice()?;
-        let down_flat = self
-            .index
-            .kquant_matmul_transb(layer, 2, act_flat, seq_len, self.backend)?;
+        let down_flat =
+            self.index
+                .kquant_matmul_transb(layer, 2, act_flat, seq_len, self.backend)?;
         let out = Array2::from_shape_vec((seq_len, hidden), down_flat).ok()?;
 
         self.trace_path(layer, "interleaved_kquant:native");
@@ -113,7 +113,9 @@ mod tests {
     fn input(seq: usize, hidden: usize) -> Array2<f32> {
         Array2::from_shape_vec(
             (seq, hidden),
-            (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.001).collect(),
+            (0..seq * hidden)
+                .map(|i| (i as f32 + 1.0) * 0.001)
+                .collect(),
         )
         .unwrap()
     }

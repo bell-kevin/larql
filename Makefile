@@ -84,7 +84,7 @@ larql-models-fmt-check:
 	cargo fmt -p larql-models -- --check
 
 larql-models-lint:
-	cargo clippy -p larql-models --all-targets -- -D warnings
+	cargo clippy -p larql-models --all-targets --no-deps -- -D warnings
 
 larql-models-bench-test:
 	cargo test -p larql-models --benches
@@ -93,7 +93,7 @@ larql-models-bench-test:
 #
 # Per-file 90% floor, total at floor(current) - see
 # crates/larql-models/coverage-policy.json for current debt baselines.
-LARQL_MODELS_COVERAGE_MIN ?= 92
+LARQL_MODELS_COVERAGE_MIN ?= 94
 LARQL_MODELS_COVERAGE_POLICY ?= crates/larql-models/coverage-policy.json
 LARQL_MODELS_COVERAGE_REPORT ?= coverage/larql-models/summary.json
 
@@ -346,7 +346,7 @@ larql-compute-fmt-check:
 	cargo fmt -p larql-compute -- --check
 
 larql-compute-lint:
-	cargo clippy -p larql-compute --all-targets -- -D warnings
+	cargo clippy -p larql-compute --all-targets --no-deps -- -D warnings
 
 larql-compute-coverage-policy:
 	@if [ ! -f "$(LARQL_COMPUTE_COVERAGE_REPORT)" ]; then \
@@ -387,7 +387,7 @@ larql-compute-coverage-html:
 	$(MAKE) larql-compute-coverage-policy
 	@echo "Report: coverage/larql-compute/html/index.html"
 
-larql-compute-ci: larql-compute-fmt-check larql-compute-lint larql-compute-test-fast
+larql-compute-ci: larql-compute-fmt-check larql-compute-lint larql-compute-test-fast larql-compute-coverage
 
 # ─────────────────────────────────────────────────────────────────
 # larql-compute-metal — Metal GPU backend (Apple Silicon).
@@ -459,7 +459,7 @@ larql-compute-metal-coverage-html:
 	$(MAKE) larql-compute-metal-coverage-policy
 	@echo "Report: coverage/larql-compute-metal/html/index.html"
 
-larql-compute-metal-ci: larql-compute-metal-fmt-check larql-compute-metal-lint larql-compute-metal-test
+larql-compute-metal-ci: larql-compute-metal-fmt-check larql-compute-metal-lint larql-compute-metal-test larql-compute-metal-coverage
 
 # larql-boundary — confidence-gated BOUNDARY ref codec
 larql-boundary-test:

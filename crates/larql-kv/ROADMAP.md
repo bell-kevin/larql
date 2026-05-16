@@ -9,7 +9,7 @@
   fast paths (`prefill_q4k`, `decode_step_q4k`).
 - Consumers wired:
   - `larql-cli bench --engine <spec>` (selector dispatch)
-  - `kv-cache-benchmark` (criterion comparison vs Standard KV / Graph Walk)
+  - in-crate `benches/engine_decode.rs` (criterion: dispatch helpers + Standard parity)
 - Coverage policy: 90 % line coverage per source file (see
   `coverage-policy.json`); CI gate at `make larql-kv-coverage-policy`.
   Total line coverage is **85.13 %** as of 2026-05-10 (up from 67.44 % at
@@ -63,11 +63,15 @@
 
 ### P2 — research / sequencing
 
-- **Cross-engine comparator.** `kv-cache-benchmark` compares each engine
-  against Standard KV individually. The synthesis question is: which
-  engine wins for which prompt regime (long-context QA vs short-prompt
-  multi-turn vs streaming generation)? A criterion harness sweeping
-  prompt length × decode length × batch size would surface this.
+- **Cross-engine comparator.** Today `larql bench --engine <spec>` runs one
+  engine at a time and `benches/engine_decode.rs` exercises Standard vs the
+  parity oracle. The synthesis question is: which engine wins for which
+  prompt regime (long-context QA vs short-prompt multi-turn vs streaming
+  generation)? A criterion harness sweeping prompt length × decode length ×
+  batch size against the production `KvEngine` impls would surface this —
+  the retired `kv-cache-benchmark::kv_strategies` synthetic comparator
+  measured the wrong thing (encode/decode of random vectors, not real
+  decode steady-state).
 - **Compositional engines.** `apollo + turbo_quant` would put quantised
   K/V inside the boundary windows; `markov_residual + apollo` would let
   the residual recompute path read pre-projected boundary residuals.

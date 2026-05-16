@@ -302,21 +302,18 @@ async fn unassign_via_serving_sender_reaches_client() {
         let id = g.servers().next().map(|(id, _)| id.clone()).unwrap();
         id
     };
-    {
-        let g = state.read();
-        let sender = g.serving_sender(&server_id).unwrap();
-        sender
-            .send(Ok(RouterMessage {
-                payload: Some(RouterPayload::Unassign(UnassignMsg {
-                    model_id: "m".into(),
-                    layer_start: 0,
-                    layer_end: 4,
-                    reason: "test".into(),
-                })),
-            }))
-            .await
-            .unwrap();
-    }
+    let sender = state.read().serving_sender(&server_id).unwrap();
+    sender
+        .send(Ok(RouterMessage {
+            payload: Some(RouterPayload::Unassign(UnassignMsg {
+                model_id: "m".into(),
+                layer_start: 0,
+                layer_end: 4,
+                reason: "test".into(),
+            })),
+        }))
+        .await
+        .unwrap();
 
     // Client must observe the Unassign.
     let observed = tokio::time::timeout(Duration::from_secs(1), inbound.next())

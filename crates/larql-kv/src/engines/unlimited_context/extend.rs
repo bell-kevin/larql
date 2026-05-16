@@ -155,7 +155,11 @@ pub fn rs_extend_from_checkpoint_q4k(
 
     for (i, &token_id) in token_ids.iter().enumerate() {
         let abs_position = abs_start + i;
-        let t_embed_start = if instrument { Some(std::time::Instant::now()) } else { None };
+        let t_embed_start = if instrument {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let mut h = embed_tokens_pub(weights, &[token_id]);
         if let Some(start) = t_embed_start {
             t_embed += start.elapsed().as_secs_f64() * 1000.0;
@@ -170,7 +174,11 @@ pub fn rs_extend_from_checkpoint_q4k(
 
             // Try production native-quantised attention helper first;
             // fall back to f32 path. Same pattern as MarkovResidual.
-            let t_attn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+            let t_attn_start = if instrument {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let attn_native = larql_inference::vindex::attention_decode_step_native(
                 weights,
                 index,
@@ -183,17 +191,16 @@ pub fn rs_extend_from_checkpoint_q4k(
             if attn_native.is_none() && instrument {
                 t_attn_helper_misses += 1;
             }
-            let (h_post_attn, new_kv) = attn_native
-                .or_else(|| {
-                    run_attention_block_decode_step_backend(
-                        weights,
-                        &h,
-                        layer,
-                        kv_entry,
-                        abs_position,
-                        Some(backend),
-                    )
-                })?;
+            let (h_post_attn, new_kv) = attn_native.or_else(|| {
+                run_attention_block_decode_step_backend(
+                    weights,
+                    &h,
+                    layer,
+                    kv_entry,
+                    abs_position,
+                    Some(backend),
+                )
+            })?;
             if let Some(start) = t_attn_start {
                 t_attention += start.elapsed().as_secs_f64() * 1000.0;
             }
@@ -202,7 +209,11 @@ pub fn rs_extend_from_checkpoint_q4k(
             // further to dense f32 if no sparse features). The native
             // path is ~100× faster on Gemma 3 4B Q4K — see
             // `bench/baselines/cpu/async-dispatch-2026-05-16.md`.
-            let t_ffn_start = if instrument { Some(std::time::Instant::now()) } else { None };
+            let t_ffn_start = if instrument {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let ffn_native = larql_inference::vindex::ffn_decode_step_native(
                 weights,
                 index,

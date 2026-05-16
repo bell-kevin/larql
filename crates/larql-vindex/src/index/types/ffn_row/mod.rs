@@ -170,7 +170,8 @@ pub trait FfnRowAccess: NativeFfnAccess + QuantizedFfnAccess + Fp4FfnAccess {
                 if self.kquant_down_feature_scaled_add(layer, feat, alpha, out) {
                     return true;
                 }
-                return self.kquant_ffn_row_scaled_add_via_cache(layer, component, feat, alpha, out);
+                return self
+                    .kquant_ffn_row_scaled_add_via_cache(layer, component, feat, alpha, out);
             }
             return self.kquant_ffn_row_scaled_add(layer, component, feat, alpha, out);
         }

@@ -102,10 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (vindex_path, n_tokens, prompt) = parse_args();
 
     if !vindex_path.exists() {
-        eprintln!(
-            "vindex not found at {}; skipping",
-            vindex_path.display()
-        );
+        eprintln!("vindex not found at {}; skipping", vindex_path.display());
         return Ok(());
     }
 
@@ -173,7 +170,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     eprintln!("  ✓ all {n_tokens} tokens bit-identical between sync and async paths");
-    eprintln!("  Emitted tokens: {:?}", &sync_tokens[..sync_tokens.len().min(8)]);
+    eprintln!(
+        "  Emitted tokens: {:?}",
+        &sync_tokens[..sync_tokens.len().min(8)]
+    );
 
     let overhead = (async_decode - sync_decode) / sync_decode * 100.0;
     eprintln!(

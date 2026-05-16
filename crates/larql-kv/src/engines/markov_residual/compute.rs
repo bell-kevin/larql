@@ -132,8 +132,7 @@ fn rs_decode_step_inner(
             } else {
                 None
             };
-            let (k_hot, v_hot) =
-                recompute_kv(weights, h_hot, layer, hot_abs_start, backend, None)?;
+            let (k_hot, v_hot) = recompute_kv(weights, h_hot, layer, hot_abs_start, backend, None)?;
             if let Some(t) = t_hot {
                 recompute_hot_us += t.elapsed().as_secs_f64() * 1e6;
             }
@@ -321,10 +320,8 @@ pub fn recompute_kv(
         for row_idx in 0..seq_len {
             let x_row = h_norm.row(row_idx);
             let x_slice = x_row.as_slice()?;
-            let k_row =
-                backend.quant_matvec(k_format, k_bytes, x_slice, kv_dim, hidden)?;
-            let v_row =
-                backend.quant_matvec(v_format, v_bytes, x_slice, kv_dim, hidden)?;
+            let k_row = backend.quant_matvec(k_format, k_bytes, x_slice, kv_dim, hidden)?;
+            let v_row = backend.quant_matvec(v_format, v_bytes, x_slice, kv_dim, hidden)?;
             k_out
                 .row_mut(row_idx)
                 .iter_mut()

@@ -6,6 +6,61 @@ The format follows the conventions of [Keep a Changelog](https://keepachangelog.
 with dated entries (`YYYY-MM-DD`) instead of semantic versions during the
 pre-1.0 phase. Forward-looking work lives in [`ROADMAP.md`](ROADMAP.md).
 
+## [2026-05-16] — Mode B / QUIC ROADMAP backfill + GT5 end-to-end test
+
+ROADMAP-drift sweep: three G-MODEB / G-TRANSPORT items previously
+listed as "Not started" were actually shipped between 2026-05-13 and
+2026-05-15 (on the router side) and earlier on the server side. The
+server ROADMAP was updated to reflect reality and the missing
+end-to-end test was added.
+
+### Fixed
+
+- **GT5 (Mode B gap-fill) — server-side ROADMAP corrected + new
+  end-to-end test.** `announce.rs::run_available_loop` had been wired
+  end-to-end (`AvailableMsg` → handle `AssignMsg` →
+  `shard_loader::download_and_load_shard` → `ReadyMsg` /
+  `RefuseMsg` → loop until `AckMsg`) since 2026-05-13, but no
+  integration test drove the *production* loop —
+  `mode_b_full_vertical_handoff` inlined the protocol in the test
+  body. New test
+  `mode_b_try_once_available_drives_full_handshake` spawns the real
+  loop via the newly-public `announce::try_once_available` entry
+  point against an in-process router fixture and asserts Available →
+  Assign → download → Ready → Ack lands in <3s.
+- **Misleading Mode A AssignMsg log.** `announce.rs:413` used to log
+  `"Received AssignMsg but Mode B not implemented — ignoring"` when
+  a Mode A (already-serving) stream received an unexpected AssignMsg.
+  Mode B *is* implemented, in `run_available_loop`; the stub message
+  was misleading. Now logs a descriptive warning calling out that
+  the router shouldn't target Mode A streams with AssignMsg.
+- **Three stale ROADMAP entries marked shipped.** GT5, GT6 (dynamic
+  rebalancing / drain-then-reassign — ADR-0011 §Phase B2), and GT7
+  (QUIC transport — ADR-0010) all moved from `Not started` →
+  `✅ Shipped` with code pointers and test references.
+- **Three integration tests un-bit-rotted.**
+  `tests/test_grid_mode_b.rs`, `tests/test_grid_replication.rs`,
+  `tests/test_grid_drain_reassign.rs` had been broken since
+  ADR-0018 (MoE expert routing) widened `try_assign_gap` to take
+  `expert_start` / `expert_end` and moved `GridServiceImpl` to
+  `larql_router::grid::service`. Patched all three (new
+  signatures + import paths + `parking_lot::RwLock` for `GridState`
+  to mirror the router's 2026-05-16 lock primitive swap). 9 tests in
+  3 files all pass.
+- **`parking_lot` added as a server dev-dependency.** Mirrors the
+  router's `GridState` lock primitive so test fixtures can construct
+  an `Arc<parking_lot::RwLock<GridState>>` directly.
+
+### Known follow-up
+
+- **GT5 hash-verification mismatch (P1).** `vindex_identity_hash`
+  emits a 16-hex model-identity tag, but `shard_loader` expects a
+  SHA-256 content hash on `AssignMsg.shard_hash`. Today deployments
+  must pass an empty/placeholder hash so the verification is
+  skipped. Real content hashing wants a new optional
+  `shard_content_sha256` field on `AnnounceMsg` distinct from
+  `vindex_hash`. See `ROADMAP.md` G-MODEB §GT5 "Known follow-up".
+
 ## [2026-05-10] — Code-review P0 sweep + coverage scaffolding
 
 Five P0 fixes from the in-tree code review (REV1–REV5 in `ROADMAP.md`)

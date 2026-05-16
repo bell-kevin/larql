@@ -20,12 +20,14 @@ pub fn kquant_ffn_forward_layer(
     let hidden = x.shape()[1];
     let intermediate = index.num_features(layer);
 
-    let ffn = index.interleaved_kquant_layer_data(layer).unwrap_or_else(|| {
-        panic!(
-            "interleaved_q4k layer data missing for layer {layer} - \
+    let ffn = index
+        .interleaved_kquant_layer_data(layer)
+        .unwrap_or_else(|| {
+            panic!(
+                "interleaved_q4k layer data missing for layer {layer} - \
              server must call `load_interleaved_q4k` before serving walk-ffn"
-        )
-    });
+            )
+        });
 
     let gate = if let Some(arc) = index.kquant_ffn_layer_once(layer, 0) {
         let w_gate =
@@ -91,12 +93,14 @@ pub fn kquant_ffn_forward_layer_q8k(
     let hidden = h_q8k.qs.len(); // = n_blocks * 256
     let intermediate = index.num_features(layer);
 
-    let ffn = index.interleaved_kquant_layer_data(layer).unwrap_or_else(|| {
-        panic!(
-            "interleaved_q4k layer data missing for layer {layer} - \
+    let ffn = index
+        .interleaved_kquant_layer_data(layer)
+        .unwrap_or_else(|| {
+            panic!(
+                "interleaved_q4k layer data missing for layer {layer} - \
              server must call `load_interleaved_q4k` before serving walk-ffn-q8k"
-        )
-    });
+            )
+        });
 
     // gate + up via the fused Q4K×Q8K kernel (shared activation load).
     let mut gate_flat = vec![0.0f32; intermediate];

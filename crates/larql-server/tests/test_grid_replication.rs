@@ -10,21 +10,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::RwLock;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
-use larql_router::grid::{GridServiceImpl, GridState};
+use larql_router::grid::service::GridServiceImpl;
+use larql_router::grid::GridState;
 use larql_router_protocol::{
-    grid_service_server::GridServiceServer, AnnounceMsg, AvailableMsg, GridServiceClient,
-    ReadyMsg, RouterPayload, ServerMessage, ServerPayload,
+    grid_service_server::GridServiceServer, AnnounceMsg, AvailableMsg, GridServiceClient, ReadyMsg,
+    RouterPayload, ServerMessage, ServerPayload,
 };
 use tonic::transport::Server;
 
 async fn spawn_router(target_replicas: u32) -> (std::net::SocketAddr, Arc<RwLock<GridState>>) {
     let state = Arc::new(RwLock::new(GridState::default()));
-    state.write().await.set_target_replicas(target_replicas);
+    state.write().set_target_replicas(target_replicas);
     let svc = GridServiceImpl::new(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -66,6 +68,8 @@ async fn announce(
             ram_bytes: 1024 * 1024 * 1024,
             listen_url: listen_url.to_string(),
             vindex_hash: hash.to_string(),
+            expert_start: 0,
+            expert_end: 0,
         })),
     })
     .await
@@ -113,8 +117,7 @@ async fn spare_replicates_under_replicated_range() {
 
     // Spare joins.
     let tmp = TempDir::new().unwrap();
-    let (_spare_tx, mut spare_inbound) =
-        available(addr, 8, &tmp.path().to_string_lossy()).await;
+    let (_spare_tx, mut spare_inbound) = available(addr, 8, &tmp.path().to_string_lossy()).await;
 
     // Spare must receive AssignMsg for layers 0-4 with donor as origin.
     let assign = tokio::time::timeout(Duration::from_secs(2), async {
@@ -141,7 +144,7 @@ async fn spare_replicates_under_replicated_range() {
 
     // Confirm the available pool drained.
     {
-        let g = state.read().await;
+        let g = state.read();
         assert!(
             !g.has_available_servers(),
             "spare must have been consumed by replication"
@@ -165,7 +168,7 @@ async fn second_spare_not_assigned_after_target_met() {
         announce(addr, "http://donor-2:8080", (0, 4), "donor2-hash").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     {
-        let g = state.read().await;
+        let g = state.read();
         assert_eq!(g.status_response().servers.len(), 2);
         assert!(g.under_replicated_ranges().is_empty());
     }
@@ -173,8 +176,7 @@ async fn second_spare_not_assigned_after_target_met() {
     // Now a spare joins — replicas already at target, so no AssignMsg
     // should fire.
     let tmp = TempDir::new().unwrap();
-    let (_spare_tx, mut spare_inbound) =
-        available(addr, 8, &tmp.path().to_string_lossy()).await;
+    let (_spare_tx, mut spare_inbound) = available(addr, 8, &tmp.path().to_string_lossy()).await;
 
     let result = tokio::time::timeout(Duration::from_millis(300), spare_inbound.next()).await;
     assert!(
@@ -183,7 +185,7 @@ async fn second_spare_not_assigned_after_target_met() {
     );
 
     // Spare must remain in the available pool.
-    let g = state.read().await;
+    let g = state.read();
     assert!(g.has_available_servers());
 }
 
@@ -195,8 +197,7 @@ async fn ready_replica_satisfies_target() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let tmp = TempDir::new().unwrap();
-    let (spare_tx, mut spare_inbound) =
-        available(addr, 8, &tmp.path().to_string_lossy()).await;
+    let (spare_tx, mut spare_inbound) = available(addr, 8, &tmp.path().to_string_lossy()).await;
 
     // Spare gets AssignMsg.
     let assign = tokio::time::timeout(Duration::from_secs(2), async {
@@ -222,8 +223,8 @@ async fn ready_replica_satisfies_target() {
                 layer_start: assign.layer_start,
                 layer_end: assign.layer_end,
                 listen_url: "http://spare:9999".into(),
-            expert_start: 0,
-            expert_end: 0,
+                expert_start: 0,
+                expert_end: 0,
             })),
         })
         .await
@@ -231,7 +232,7 @@ async fn ready_replica_satisfies_target() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     {
-        let g = state.read().await;
+        let g = state.read();
         assert_eq!(g.status_response().servers.len(), 2);
         assert!(g.under_replicated_ranges().is_empty());
     }

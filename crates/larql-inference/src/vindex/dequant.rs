@@ -68,8 +68,8 @@ fn dequantize_matrix(bytes: &[u8], format: &str, rows: usize, cols: usize) -> Ar
     let padded = n.div_ceil(256) * 256;
     let info = larql_vindex::quant::registry::lookup(format)
         .unwrap_or_else(|| panic!("unsupported quant format: {format}"));
-    let floats = (info.dequantize)(bytes, padded)
-        .unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
+    let floats =
+        (info.dequantize)(bytes, padded).unwrap_or_else(|e| panic!("{format} dequant failed: {e}"));
     let truncated = if floats.len() > n {
         floats[..n].to_vec()
     } else {

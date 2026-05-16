@@ -406,7 +406,9 @@ mod tests {
     //! crosses 90%.
 
     use super::*;
-    use crate::kv_dispatch::{KvDispatch, KvHandle, KvHandleInner, ResidualHandle, ResidualHandleInner};
+    use crate::kv_dispatch::{
+        KvDispatch, KvHandle, KvHandleInner, ResidualHandle, ResidualHandleInner,
+    };
     use ndarray::{array, ArrayView2};
 
     // ── Supertrait-satisfying stub ───────────────────────────────────
@@ -450,7 +452,10 @@ mod tests {
     fn default_attention_step_async_panics() {
         let backend = StubAsyncBackend;
         let weights = crate::test_utils::make_test_weights();
-        let mut kv = KvHandle::new(StubKvInner { len: 0, dim: weights.hidden_size });
+        let mut kv = KvHandle::new(StubKvInner {
+            len: 0,
+            dim: weights.hidden_size,
+        });
         let query = Array2::zeros((1, weights.hidden_size));
         let _ = backend.attention_step_async(&weights, &query, &mut kv, 0, 0, None);
     }
@@ -490,7 +495,10 @@ mod tests {
         // panics on the stub). Documents the decomposition shape.
         let backend = StubAsyncBackend;
         let weights = crate::test_utils::make_test_weights();
-        let mut kv = KvHandle::new(StubKvInner { len: 0, dim: weights.hidden_size });
+        let mut kv = KvHandle::new(StubKvInner {
+            len: 0,
+            dim: weights.hidden_size,
+        });
         let query = Array2::zeros((1, weights.hidden_size));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = backend.attention_step_windowed_async(&weights, &query, &mut kv, 0, 0, 4, None);
@@ -535,7 +543,10 @@ mod tests {
     #[test]
     fn stub_backend_compute_methods() {
         let backend = StubAsyncBackend;
-        assert_eq!(<StubAsyncBackend as larql_compute::ComputeBackend>::name(&backend), "stub-async");
+        assert_eq!(
+            <StubAsyncBackend as larql_compute::ComputeBackend>::name(&backend),
+            "stub-async"
+        );
         let any = <StubAsyncBackend as larql_compute::ComputeBackend>::as_any(&backend);
         assert!(any.downcast_ref::<StubAsyncBackend>().is_some());
     }
@@ -624,8 +635,7 @@ mod tests {
 
     #[test]
     fn async_dispatch_error_display_command_buffer_rejected() {
-        let err =
-            AsyncDispatchError::CommandBufferRejected("encoder out of memory".into());
+        let err = AsyncDispatchError::CommandBufferRejected("encoder out of memory".into());
         let s = format!("{err}");
         assert!(s.contains("command buffer rejected"));
         assert!(s.contains("encoder out of memory"));

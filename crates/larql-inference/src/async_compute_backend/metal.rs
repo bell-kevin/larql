@@ -209,10 +209,26 @@ mod tests {
         let window = 3;
 
         let h_metal = metal
-            .attention_step_windowed_async(&weights, &h_new, &mut kv_metal, 0, abs_position, window, None)
+            .attention_step_windowed_async(
+                &weights,
+                &h_new,
+                &mut kv_metal,
+                0,
+                abs_position,
+                window,
+                None,
+            )
             .read();
         let h_cpu = CPU
-            .attention_step_windowed_async(&weights, &h_new, &mut kv_cpu, 0, abs_position, window, None)
+            .attention_step_windowed_async(
+                &weights,
+                &h_new,
+                &mut kv_cpu,
+                0,
+                abs_position,
+                window,
+                None,
+            )
             .read();
 
         assert_eq!(

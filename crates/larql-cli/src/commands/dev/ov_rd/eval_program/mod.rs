@@ -254,7 +254,12 @@ pub(super) fn run_eval_program(args: EvalProgramArgs) -> Result<(), Box<dyn std:
             {
                 h
             } else {
-                larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None)
+                larql_inference::vindex::predict_kquant_hidden(
+                    &mut weights,
+                    &token_ids,
+                    &index,
+                    None,
+                )
             }
         } else {
             larql_inference::vindex::predict_kquant_hidden(&mut weights, &token_ids, &index, None)

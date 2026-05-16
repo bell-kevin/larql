@@ -403,7 +403,8 @@ impl<'a> QuantizedFfnAccess for MaskedGateIndex<'a> {
         a: f32,
         out: &mut [f32],
     ) -> bool {
-        self.inner.kquant_ffn_row_scaled_add_via_cache(l, c, f, a, out)
+        self.inner
+            .kquant_ffn_row_scaled_add_via_cache(l, c, f, a, out)
     }
     fn kquant_ffn_row_scaled_add(
         &self,

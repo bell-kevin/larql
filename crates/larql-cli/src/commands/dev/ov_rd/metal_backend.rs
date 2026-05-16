@@ -45,7 +45,12 @@ pub(super) fn try_metal_baseline(
     index: &larql_vindex::VectorIndex,
     backend: &Backend,
 ) -> Option<ndarray::Array2<f32>> {
-    larql_inference::vindex::predict_kquant_metal_hidden(weights, token_ids, index, backend.as_ref())
+    larql_inference::vindex::predict_kquant_metal_hidden(
+        weights,
+        token_ids,
+        index,
+        backend.as_ref(),
+    )
 }
 
 /// Capture the target head's pre-W_O output at `target_layer` using GPU,

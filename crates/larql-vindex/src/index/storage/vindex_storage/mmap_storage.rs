@@ -617,7 +617,9 @@ mod tests {
         );
 
         for layer in 0..3 {
-            let arr = s.interleaved_kquant_layer_data(layer).expect("layer present");
+            let arr = s
+                .interleaved_kquant_layer_data(layer)
+                .expect("layer present");
             for (c, (view, fmt)) in arr.iter().enumerate() {
                 let global = layer * FFN_COMPONENTS_PER_LAYER + c;
                 let expected: &[u8] = &payload[global * 16..(global + 1) * 16];

@@ -68,6 +68,11 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 tempfile = "3"
 # Integration test wires a real GridServiceImpl alongside the server. Dev-only.
 larql-router = { path = "../larql-router" }
+# Mirrors larql-router's GridState lock primitive (parking_lot::RwLock,
+# 2026-05-16) so integration tests can construct an
+# `Arc<parking_lot::RwLock<GridState>>` to pass into
+# `GridServiceImpl::new`.
+parking_lot = "0.12"
 # Exp 53 ShardService criterion benches.
 criterion = { version = "0.5", features = ["html_reports"] }
 

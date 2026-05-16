@@ -552,7 +552,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // first rebalancer tick fires. The rebalancer tick (if enabled)
     // keeps refreshing these every interval.
     if let Some(g) = grid_state.as_ref() {
-        metrics.refresh_gauges(&*g.read());
+        metrics.refresh_gauges(&g.read());
     }
 
     // ADR-0019 — build the H3Client when `--http3-shards` is on.

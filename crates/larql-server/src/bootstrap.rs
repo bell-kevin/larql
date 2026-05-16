@@ -690,10 +690,7 @@ pub struct Cli {
 /// The h3 listener serves the same `axum::Router` as the dense
 /// path — handlers are identical, only the transport differs.
 #[cfg(feature = "http3")]
-async fn spawn_http3_listener_if_configured(
-    cli: &Cli,
-    app: axum::Router,
-) -> Result<(), BoxError> {
+async fn spawn_http3_listener_if_configured(cli: &Cli, app: axum::Router) -> Result<(), BoxError> {
     let Some(port) = cli.http3_port else {
         return Ok(());
     };

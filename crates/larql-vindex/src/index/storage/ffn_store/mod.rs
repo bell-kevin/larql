@@ -50,8 +50,8 @@ mod down;
 mod fp4;
 mod gate_q4;
 mod interleaved;
-mod interleaved_q4;
 mod interleaved_kquant;
+mod interleaved_q4;
 mod kquant_cache;
 mod up;
 

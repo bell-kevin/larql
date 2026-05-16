@@ -129,9 +129,12 @@ cargo run -p larql-cli --release -- bench gemma3:4b --engine turbo-quant:bits=4
 cargo run -p larql-cli --release -- bench gemma3:4b --engine apollo:layer=30
 ```
 
-The `kv-cache-benchmark` crate also runs all four under `cargo bench
--p kv-cache-benchmark --bench kv_strategies` against synthetic K/V tensors
-(real-model variant gated behind the `real-model` feature).
+The in-crate criterion bench at `crates/larql-kv/benches/engine_decode.rs`
+runs the dispatch helpers under `cargo bench -p larql-kv --bench engine_decode`,
+covering `StandardEngine` vs the legacy `generate_cached_backend` parity oracle
+plus the sync/async dispatch helpers. (Until 2026-05-16 this harness lived in
+the retired `kv-cache-benchmark` crate as `kv_strategies`; the production
+comparator is now this in-crate bench plus `larql bench --engine <spec>`.)
 
 ## See also
 

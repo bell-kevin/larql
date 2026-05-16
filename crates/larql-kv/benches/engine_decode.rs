@@ -3,8 +3,10 @@
 //! Times prefill (8-token prompt) and a single decode step on the
 //! synthetic test model. The fixture is small so these benches run
 //! quickly and don't depend on a vindex on disk; for end-to-end
-//! real-model numbers see `cargo bench -p kv-cache-benchmark --bench
-//! kv_strategies`.
+//! real-model numbers run `larql bench <vindex> --engine <spec>` from
+//! the CLI. (The retired `kv-cache-benchmark::kv_strategies` synthetic
+//! comparator was deprecated in 2026-05-16 — it measured random-vector
+//! encode/decode, not real decode steady-state.)
 //!
 //! Engines covered:
 //! - `standard` (production K/V cache, unbounded)
@@ -194,9 +196,8 @@ fn bench_helpers_sync_vs_async(c: &mut Criterion) {
             kv_prefill_via_dispatch(&cpu, &weights, &ffn, &prompt, None, None).unwrap();
         let mut pos = prompt.len();
         b.iter(|| {
-            let _ = kv_decode_step_via_dispatch(
-                &cpu, &weights, &ffn, &mut handles, 1, pos, None, None,
-            );
+            let _ =
+                kv_decode_step_via_dispatch(&cpu, &weights, &ffn, &mut handles, 1, pos, None, None);
             pos += 1;
         });
     });
@@ -207,7 +208,14 @@ fn bench_helpers_sync_vs_async(c: &mut Criterion) {
         let mut pos = prompt.len();
         b.iter(|| {
             let _ = kv_decode_step_via_dispatch_async(
-                &cpu, &weights, &ffn, &mut handles, 1, pos, None, None,
+                &cpu,
+                &weights,
+                &ffn,
+                &mut handles,
+                1,
+                pos,
+                None,
+                None,
             );
             pos += 1;
         });

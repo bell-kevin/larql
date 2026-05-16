@@ -311,7 +311,8 @@ mod tests {
         let prompt = vec![0u32, 1, 2, 3, 4];
         let window = Some(2);
 
-        let (h_sync, _) = kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).unwrap();
+        let (h_sync, _) =
+            kv_prefill_via_dispatch(&backend, &weights, &ffn, &prompt, window, None).unwrap();
         let (h_async, _) =
             kv_prefill_via_dispatch_async(&backend, &weights, &ffn, &prompt, window, None).unwrap();
 

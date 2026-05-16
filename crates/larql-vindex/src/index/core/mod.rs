@@ -319,14 +319,19 @@ mod refactor_tests {
         v.gate.hnsw_enabled.store(true, Ordering::Relaxed);
         v.gate.hnsw_ef_search.store(42, Ordering::Relaxed);
         v.gate.gate_cache_max_layers.store(7, Ordering::Relaxed);
-        v.ffn.kquant_ffn_cache_max_layers.store(3, Ordering::Relaxed);
+        v.ffn
+            .kquant_ffn_cache_max_layers
+            .store(3, Ordering::Relaxed);
 
         let cloned = v.clone();
         assert!(cloned.gate.hnsw_enabled.load(Ordering::Relaxed));
         assert_eq!(cloned.gate.hnsw_ef_search.load(Ordering::Relaxed), 42);
         assert_eq!(cloned.gate.gate_cache_max_layers.load(Ordering::Relaxed), 7);
         assert_eq!(
-            cloned.ffn.kquant_ffn_cache_max_layers.load(Ordering::Relaxed),
+            cloned
+                .ffn
+                .kquant_ffn_cache_max_layers
+                .load(Ordering::Relaxed),
             3
         );
 

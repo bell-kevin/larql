@@ -330,7 +330,9 @@ mod tests {
         let index = VectorIndex::empty(1, 256);
         let x = vec![0.0_f32; 256];
         for component in [3usize, 4, 99] {
-            assert!(index.kquant_matmul_transb(0, component, &x, 1, None).is_none());
+            assert!(index
+                .kquant_matmul_transb(0, component, &x, 1, None)
+                .is_none());
         }
     }
 

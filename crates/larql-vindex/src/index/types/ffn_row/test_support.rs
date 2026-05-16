@@ -71,7 +71,14 @@ impl QuantizedFfnAccess for Stub {
     fn kquant_ffn_row_dot(&self, _: usize, _: usize, _: usize, _: &[f32]) -> Option<f32> {
         self.q4k_dot
     }
-    fn kquant_ffn_row_scaled_add(&self, _: usize, _: usize, _: usize, _: f32, _: &mut [f32]) -> bool {
+    fn kquant_ffn_row_scaled_add(
+        &self,
+        _: usize,
+        _: usize,
+        _: usize,
+        _: f32,
+        _: &mut [f32],
+    ) -> bool {
         self.q4k_scaled_add_returns
     }
     fn kquant_ffn_row_scaled_add_via_cache(

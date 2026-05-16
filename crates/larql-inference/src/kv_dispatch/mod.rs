@@ -630,7 +630,9 @@ mod tests {
         let backend = StubKvBackend;
         let weights = crate::test_utils::make_test_weights();
         let tokens = Array2::zeros((2, weights.hidden_size));
-        assert!(backend.attention_prefill(&weights, &tokens, 0, None, None).is_none());
+        assert!(backend
+            .attention_prefill(&weights, &tokens, 0, None, None)
+            .is_none());
     }
 
     #[test]

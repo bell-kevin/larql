@@ -2082,26 +2082,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kv-cache-benchmark"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "larql-compute",
- "larql-inference",
- "larql-kv",
- "larql-models",
- "larql-vindex",
- "ndarray",
- "rand 0.8.6",
- "rand_distr",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokenizers",
- "zip 2.4.2",
-]
-
-[[package]]
 name = "larql-boundary"
 version = "0.1.0"
 dependencies = [
@@ -2378,6 +2358,7 @@ dependencies = [
  "larql-vindex",
  "libc",
  "memmap2",
+ "parking_lot",
  "prost",
  "protobuf-src",
  "rayon",

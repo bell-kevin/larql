@@ -403,26 +403,25 @@ impl TurboQuantEngine {
         for layer in 0..num_layers {
             let prior_kv = self.layers[layer].decompress(&self.tq);
             // Try native-quantised attention helper; fall back to f32.
-            let (h_post_attn, updated_kv) =
-                larql_inference::vindex::attention_decode_step_native(
+            let (h_post_attn, updated_kv) = larql_inference::vindex::attention_decode_step_native(
+                weights,
+                index,
+                backend,
+                &h,
+                layer,
+                Some(&prior_kv),
+                abs_position,
+            )
+            .or_else(|| {
+                run_attention_block_decode_step_backend(
                     weights,
-                    index,
-                    backend,
                     &h,
                     layer,
                     Some(&prior_kv),
                     abs_position,
+                    Some(backend),
                 )
-                .or_else(|| {
-                    run_attention_block_decode_step_backend(
-                        weights,
-                        &h,
-                        layer,
-                        Some(&prior_kv),
-                        abs_position,
-                        Some(backend),
-                    )
-                })?;
+            })?;
             let arch = &*weights.arch;
             let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
             self.layers[layer] = CompressedLayer {

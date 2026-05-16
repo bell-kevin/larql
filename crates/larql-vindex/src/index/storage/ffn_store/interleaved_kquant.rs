@@ -206,7 +206,8 @@ impl VectorIndex {
             // manifest is loaded — that's the correct (start, end)
             // span. Without the per-layer view we fall back to the
             // legacy uniform-Q4_K stride.
-            let (start, len) = if let Some(arr) = self.storage.interleaved_kquant_layer_data(layer) {
+            let (start, len) = if let Some(arr) = self.storage.interleaved_kquant_layer_data(layer)
+            {
                 // Span = first component's start to last component's end.
                 let first_start = {
                     let (view, _) = arr[0];

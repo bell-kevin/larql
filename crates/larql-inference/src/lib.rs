@@ -160,6 +160,10 @@ pub fn activation_from_arch(
 }
 
 // Re-export essentials at crate root.
+pub use async_compute_backend::{
+    AsyncComputeBackend, AsyncDispatchError, AttentionHandle, AttentionHandleInner, ReadyAttention,
+    ReadyResidualUpload, ResidualUploadHandle, ResidualUploadHandleInner,
+};
 pub use attention::AttentionWeights;
 pub use capture::{
     CaptureCallbacks, CaptureConfig, InferenceModel, TopKEntry, VectorFileHeader, VectorRecord,
@@ -172,10 +176,6 @@ pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
     ShardConfig, SparseFfn, WeightFfn, WirePreference,
-};
-pub use async_compute_backend::{
-    AsyncComputeBackend, AsyncDispatchError, AttentionHandle, AttentionHandleInner,
-    ReadyAttention, ReadyResidualUpload, ResidualUploadHandle, ResidualUploadHandleInner,
 };
 pub use kv_dispatch::{
     CompressionCodec, EngineBackend, KvDispatch, KvHandle, KvHandleInner, ResidualHandle,

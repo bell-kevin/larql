@@ -82,7 +82,7 @@ async fn rebalancer_task(
         // rebalancer tick so /metrics responses between ticks see the
         // latest values without needing per-mutation gauge plumbing.
         if let Some(m) = metrics.as_deref() {
-            m.refresh_gauges(&*state.read());
+            m.refresh_gauges(&state.read());
         }
     }
 }

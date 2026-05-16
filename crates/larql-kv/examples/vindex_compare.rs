@@ -3,8 +3,7 @@
 //!
 //! Primary use: exp 26 Q2 (FP4 end-to-end correctness) via
 //!
-//!     cargo run --release --features real-model -p kv-cache-benchmark \
-//!         --example vindex_compare -- \
+//!     cargo run --release -p larql-kv --example vindex_compare -- \
 //!         --reference output/gemma3-4b-f16.vindex \
 //!         --candidate output/gemma3-4b-fp4.vindex \
 //!         --prompts   ~/chris-source/chris-experiments/routing/26_fp4_quantisation/prompts.txt \
@@ -13,22 +12,12 @@
 //! Any future storage-format comparison (FP6, NF4, Q4K regression
 //! tests) reuses the same binary — nothing here is FP4-specific.
 
-#[cfg(feature = "real-model")]
 use std::path::PathBuf;
 
-#[cfg(feature = "real-model")]
-use kv_cache_benchmark::vindex_compare::{
-    compare_many, forward_to_logits_traced, ComparisonConfig,
-};
-#[cfg(feature = "real-model")]
 use larql_inference::InferenceModel;
-#[cfg(feature = "real-model")]
+use larql_kv::vindex_compare::{compare_many, forward_to_logits_traced, ComparisonConfig};
 use larql_vindex::{SilentLoadCallbacks, VectorIndex};
 
-#[cfg(not(feature = "real-model"))]
-const REAL_MODEL_FEATURE_NAME: &str = "real-model";
-
-#[cfg(feature = "real-model")]
 struct Args {
     reference: PathBuf,
     candidate: PathBuf,
@@ -42,7 +31,6 @@ struct Args {
     trace: bool,
 }
 
-#[cfg(feature = "real-model")]
 fn parse_args() -> Args {
     let argv: Vec<String> = std::env::args().collect();
     let mut a = Args {
@@ -116,7 +104,6 @@ At least one of --prompts or --prompt must be provided."
     a
 }
 
-#[cfg(feature = "real-model")]
 fn load_prompts(args: &Args) -> Vec<String> {
     let mut prompts = args.inline_prompts.clone();
     if let Some(path) = &args.prompts_path {
@@ -138,7 +125,6 @@ fn load_prompts(args: &Args) -> Vec<String> {
     prompts
 }
 
-#[cfg(feature = "real-model")]
 fn default_prompt_set() -> Vec<String> {
     vec![
         "The capital of France is".into(),
@@ -152,7 +138,6 @@ fn default_prompt_set() -> Vec<String> {
     ]
 }
 
-#[cfg(feature = "real-model")]
 fn main() {
     let args = parse_args();
 
@@ -270,25 +255,13 @@ fn main() {
     }
 }
 
-#[cfg(not(feature = "real-model"))]
-fn main() {
-    eprintln!(
-        "vindex_compare requires the `{REAL_MODEL_FEATURE_NAME}` feature: \
-         cargo run --release --features {REAL_MODEL_FEATURE_NAME} \
-         -p kv-cache-benchmark --example vindex_compare -- ..."
-    );
-    std::process::exit(1);
-}
-
-#[cfg(feature = "real-model")]
-fn decode_token(tokenizer: &tokenizers::Tokenizer, id: u32) -> String {
+fn decode_token(tokenizer: &larql_inference::tokenizers::Tokenizer, id: u32) -> String {
     tokenizer
         .decode(&[id], false)
         .unwrap_or_else(|_| format!("<{id}>"))
 }
 
-#[cfg(feature = "real-model")]
-fn print_human_report(report: &kv_cache_benchmark::vindex_compare::AggregateReport) {
+fn print_human_report(report: &larql_kv::vindex_compare::AggregateReport) {
     println!("── per-prompt ──");
     for p in &report.prompts {
         let ref_t = p.ref_top_token.as_deref().unwrap_or("?");

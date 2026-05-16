@@ -58,7 +58,11 @@ pub trait QuantizedFfnAccess: Send + Sync {
     /// Dequantised Q4K/Q6K FFN matrix for `(layer, component)` where
     /// `component` is 0=gate, 1=up, 2=down. Lazily decoded and cached.
     /// Returns `None` when the vindex has no Q4K interleaved data.
-    fn kquant_ffn_layer(&self, _layer: usize, _component: usize) -> Option<std::sync::Arc<Vec<f32>>> {
+    fn kquant_ffn_layer(
+        &self,
+        _layer: usize,
+        _component: usize,
+    ) -> Option<std::sync::Arc<Vec<f32>>> {
         None
     }
 

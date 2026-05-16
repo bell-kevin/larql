@@ -139,6 +139,15 @@ larql-kv/
 ├── src/
 │   ├── lib.rs          — EngineKind dispatch + re-exports of the trait surface
 │   ├── accuracy.rs     — cosine, MSE, KL, JS, compare_hidden helpers
+│   ├── accuracy_suite/ — parametric/in-context/conflict split-axis evaluation
+│   │   ├── prompts.rs    — 101 parametric prompts (KnowledgeSource::Parametric)
+│   │   ├── needle.rs     — needle-in-haystack 512→32K (KnowledgeSource::InContext)
+│   │   ├── conflict.rs   — in-context-contradicts-parametric (KnowledgeSource::Conflict)
+│   │   ├── runner.rs     — KvEngine drivers + Shannon scorer + split table
+│   │   └── measurement.rs — KL/JS/softmax/top_k_overlap helpers
+│   ├── cache.rs        — legacy `KvCache` shape used by StandardEngine
+│   ├── generation.rs   — `generate_with_engine`, `generate_cached_*` parity oracle
+│   ├── vindex_compare.rs — A/B comparison of two vindexes on the same model
 │   ├── profiler.rs     — per-stage decode timing accumulators
 │   └── engines/
 │       ├── standard.rs           — production K/V tensor cache (default)
@@ -177,8 +186,17 @@ The `KvEngine` trait itself lives in
   `layer_graph::pipeline_layer::DEFAULT_GPU_KV_CACHE_MAX_SEQ`).
 - **`larql-compute`** — the `ComputeBackend` trait engines dispatch through.
 - **`larql-vindex`** — the `VectorIndex` engines query for Q4K weights.
-- **`kv-cache-benchmark`** — criterion-driven comparison of all engines plus
-  baselines (Standard KV, Graph Walk).
+- **`larql-cli bench`** (`larql_cli::commands::primary::bench`) — `--engine
+  <spec>` selector dispatches every engine through a uniform criterion-style
+  harness; cross-engine **throughput** comparisons live here.
+- **`larql-cli accuracy`** (`larql_cli::commands::primary::accuracy_cmd`) —
+  drives `accuracy_suite` against any model + engine list, splits results
+  by parametric / in-context / conflict, scores with top-1 + Shannon
+  bits-per-token. `larql accuracy <model> --quick --engines standard,markov-rs`
+  is the fast smoke run; full corpora are 101 + 7 + 20 prompts. JSON export
+  via `--output-file`. The historical `kv-cache-benchmark` crate that hosted
+  synthetic-strategy comparators was retired in 2026-05-16 — its surviving
+  pieces (`accuracy_suite` + `vindex_compare`) live in this crate.
 
 ## History
 

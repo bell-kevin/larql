@@ -14,9 +14,7 @@
 use larql_compute::CpuBackend;
 use larql_inference::ffn::WeightFfn;
 use larql_inference::forward::NoopHook;
-use larql_inference::kv_dispatch::helpers::{
-    kv_decode_step_via_dispatch, kv_prefill_via_dispatch,
-};
+use larql_inference::kv_dispatch::helpers::{kv_decode_step_via_dispatch, kv_prefill_via_dispatch};
 use larql_inference::test_utils::make_test_weights;
 use larql_kv::generation::{kv_decode_step_run, kv_prefill_run};
 

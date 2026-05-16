@@ -85,13 +85,42 @@ jobs:
         run: cargo check -p larql-compute --all-targets --all-features
 
       - name: Clippy default features
-        run: cargo clippy -p larql-compute --all-targets -- -D warnings
+        # `--no-deps` so warnings in sibling crates' in-flight work do
+        # not promote to errors here; matches the local `make
+        # larql-compute-lint` target.
+        run: cargo clippy -p larql-compute --all-targets --no-deps -- -D warnings
 
       - name: Clippy all features
-        run: cargo clippy -p larql-compute --all-targets --all-features -- -D warnings
+        run: cargo clippy -p larql-compute --all-targets --no-deps --all-features -- -D warnings
 
       - name: Unit tests
         run: cargo test -p larql-compute --lib
 
       - name: Backend contract tests
         run: cargo test -p larql-compute --test test_backend_matmul_quant
+
+  coverage:
+    name: coverage · ubuntu
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install OpenBLAS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev pkg-config
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Coverage policy gate
+        # `make larql-compute-coverage-summary` runs `cargo llvm-cov`
+        # with `--fail-under-lines` AND invokes
+        # `scripts/check_coverage_policy.py`, so any regression on
+        # per-file floors or the total floor fails CI here.
+        run: make larql-compute-coverage-summary

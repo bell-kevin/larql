@@ -20,8 +20,8 @@ use larql_inference::forward::{
     track_race as li_track_race, track_token as li_track_token,
     unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
 };
-use larql_kv::generation::generate_cached_hooked;
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
+use larql_kv::generation::generate_cached_hooked;
 use larql_vindex::format::filenames::{
     ATTN_WEIGHTS_BIN, DOWN_WEIGHTS_BIN, EMBEDDINGS_BIN, GATE_VECTORS_BIN, LM_HEAD_BIN,
     MODEL_WEIGHTS_BIN, NORMS_BIN, UP_WEIGHTS_BIN, WEIGHT_MANIFEST_JSON,

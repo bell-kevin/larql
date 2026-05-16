@@ -53,9 +53,9 @@ mod exact;
 mod full_mmap;
 mod helpers;
 mod interleaved;
-mod interleaved_q4;
 mod interleaved_kquant_dequant;
 mod interleaved_kquant_native;
+mod interleaved_q4;
 mod sparse;
 
 #[cfg(test)]

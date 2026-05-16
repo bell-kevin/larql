@@ -263,25 +263,27 @@ short-circuit is actually faster than the comparator path because no
 `min_by` runs. So `--saturation-ceiling N` is free to enable.
 
 **Concurrent `route()` throughput** — N parallel tokio tasks against
-a single `Arc<tokio::sync::RwLock<GridState>>` (the same shape
+a single `Arc<parking_lot::RwLock<GridState>>` (the same shape
 `AppState::resolve_all` uses); topology is 10 shards × 2 replicas,
-30 layers, 256 routes per worker:
+30 layers, 256 routes per worker. Numbers below are post-swap from
+`tokio::sync::RwLock` → `parking_lot::RwLock` (2026-05-16):
 
-| Workers | Throughput | vs 1-worker |
-|---|---|---|
-| 1 | 5.6 Melem/s | 1.0× |
-| 4 | 8.7 Melem/s | 1.56× |
-| 8 | 4.0 Melem/s | 0.71× |
-| 16 | 3.6 Melem/s | 0.64× |
+| Workers | Throughput | vs 1-worker | vs pre-swap |
+|---|---|---|---|
+| 1 | 6.4 Melem/s | 1.0× | **+14%** |
+| 4 | 11.1 Melem/s | 1.7× | **+28%** |
+| 8 | 7.2 Melem/s | 1.1× | **+80%** |
+| 16 | 6.1 Melem/s | 0.96× | **+70%** |
 
-Read scaling tops out at ~4 concurrent readers — beyond that, the
-tokio `RwLock` acquisition cost dominates the ~110 ns critical
-section. A real load hitting >4 in-flight `walk-ffn` calls on a
-single router will plateau on lock contention before plateauing on
-`route()` cost. Two follow-ups (separate tickets): swap to a
-read-mostly primitive like `arc_swap::ArcSwap<GridState>` for the
-routing snapshot, or compare against `parking_lot::RwLock` for the
-short-critical-section read path.
+Peak throughput is at 4 readers; 8 and 16 stay above the 1-worker
+baseline (the pre-swap 8-worker case had **collapsed below** 1
+worker, 4.0 Melem/s vs 5.6 Melem/s — that pathology is gone). The
+remaining sub-linear scaling past 4 readers is `parking_lot`'s
+single-atomic read counter on a 12-core M3 Max, not a lock-cost
+explosion. ArcSwap is a possible next step for grids with low write
+rates; with ~1k heartbeats/sec on a 100-server grid today, the
+copy-on-write cost outweighs the read win, so `parking_lot` is the
+current sweet spot.
 
 ```bash
 make bench-routing     # criterion sweeps; see crates/larql-router/benches/routing.rs

@@ -307,9 +307,11 @@ mod tests {
         // recompute K/V from residuals.
         let backend = backend();
         let weights = make_test_weights();
-        let residuals =
-            ndarray::Array2::from_shape_vec((1, weights.hidden_size), vec![0.0; weights.hidden_size])
-                .unwrap();
+        let residuals = ndarray::Array2::from_shape_vec(
+            (1, weights.hidden_size),
+            vec![0.0; weights.hidden_size],
+        )
+        .unwrap();
         let _ = backend.recompute_kv_from_residuals_async(&weights, &residuals, 0);
         // (recompute_kv_from_residuals_async signature unchanged at A3.)
     }

@@ -243,7 +243,9 @@ impl ModelBuilder {
             id: self.id,
             path: PathBuf::from("/nonexistent"),
             config: self.config,
-            patched: std::sync::Arc::new(tokio::sync::RwLock::new(PatchedVindex::new(test_index()))),
+            patched: std::sync::Arc::new(tokio::sync::RwLock::new(
+                PatchedVindex::new(test_index()),
+            )),
             embeddings: {
                 let mut e = Array2::<f32>::zeros((8, 4));
                 e[[0, 0]] = 1.0;

@@ -250,8 +250,9 @@ mod tests {
 
             let (h_metal, _) = kv_prefill_via_dispatch(&metal, &weights, &ffn, &prompt, None, None)
                 .expect("metal prefill");
-            let (h_cpu, _) = kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None, None)
-                .expect("cpu prefill");
+            let (h_cpu, _) =
+                kv_prefill_via_dispatch(&CpuBackend, &weights, &ffn, &prompt, None, None)
+                    .expect("cpu prefill");
 
             assert_eq!(
                 h_metal, h_cpu,
@@ -361,8 +362,12 @@ mod tests {
             let weights = make_test_weights();
             let tokens = vec![0u32, 1, 2, 3];
             let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
-            let (_, mut kv_metal) = metal.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
-            let (_, mut kv_cpu) = CPU.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
+            let (_, mut kv_metal) = metal
+                .attention_prefill(&weights, &h_in, 0, None, None)
+                .unwrap();
+            let (_, mut kv_cpu) = CPU
+                .attention_prefill(&weights, &h_in, 0, None, None)
+                .unwrap();
             let h_new = crate::forward::embed_tokens_pub(&weights, &[4u32]);
 
             let h_metal = metal

@@ -360,3 +360,165 @@ pub fn format_accuracy_summary(results: &[AccuracyResult]) -> String {
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kl_divergence_self_is_zero() {
+        let p = vec![0.5, 0.3, 0.2];
+        assert!(kl_divergence(&p, &p).abs() < 1e-12);
+    }
+
+    #[test]
+    fn kl_divergence_skips_zero_probs() {
+        // qi=0 with pi>0 would diverge; the impl gates both sides with 1e-12.
+        let p = vec![0.5, 0.5, 0.0];
+        let q = vec![0.5, 0.5, 0.0];
+        assert!(kl_divergence(&p, &q).is_finite());
+    }
+
+    #[test]
+    fn js_divergence_self_is_zero() {
+        let p = vec![0.4, 0.3, 0.3];
+        assert!(js_divergence(&p, &p).abs() < 1e-12);
+    }
+
+    #[test]
+    fn js_divergence_is_symmetric() {
+        let p = vec![0.6, 0.3, 0.1];
+        let q = vec![0.1, 0.3, 0.6];
+        let pq = js_divergence(&p, &q);
+        let qp = js_divergence(&q, &p);
+        assert!((pq - qp).abs() < 1e-12);
+        assert!(pq > 0.0);
+    }
+
+    #[test]
+    fn softmax_sums_to_one() {
+        let logits = [1.0f32, 2.0, 3.0, 4.0];
+        let p = softmax(&logits);
+        let s: f64 = p.iter().sum();
+        assert!((s - 1.0).abs() < 1e-9);
+        // Monotone in input.
+        for i in 1..p.len() {
+            assert!(p[i] >= p[i - 1]);
+        }
+    }
+
+    #[test]
+    fn top_k_overlap_identical_sequences() {
+        let a = vec![10u32, 20, 30, 40];
+        assert_eq!(top_k_overlap(&a, &a, 3), 1.0);
+    }
+
+    #[test]
+    fn top_k_overlap_disjoint_is_zero() {
+        let a = vec![1u32, 2, 3];
+        let b = vec![4u32, 5, 6];
+        assert_eq!(top_k_overlap(&a, &b, 3), 0.0);
+    }
+
+    #[test]
+    fn first_divergence_identical_returns_none() {
+        let a = vec![1u32, 2, 3];
+        assert!(first_divergence(&a, &a).is_none());
+    }
+
+    #[test]
+    fn first_divergence_finds_first_mismatch() {
+        let a = vec![1u32, 2, 3, 4];
+        let b = vec![1u32, 2, 9, 4];
+        assert_eq!(first_divergence(&a, &b), Some(2));
+    }
+
+    #[test]
+    fn token_match_rate_perfect() {
+        let a = vec![1u32, 2, 3];
+        assert_eq!(token_match_rate(&a, &a), 1.0);
+    }
+
+    #[test]
+    fn token_match_rate_partial() {
+        let a = vec![1u32, 2, 3, 4];
+        let b = vec![1u32, 2, 9, 9];
+        assert!((token_match_rate(&a, &b) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn token_match_rate_empty_input_is_zero() {
+        let a: Vec<u32> = vec![];
+        let b = vec![1u32, 2];
+        assert_eq!(token_match_rate(&a, &b), 0.0);
+    }
+
+    #[test]
+    fn reciprocal_rank_first_position() {
+        let preds = vec![5u32, 6, 7];
+        assert_eq!(reciprocal_rank(&preds, 5), 1.0);
+    }
+
+    #[test]
+    fn reciprocal_rank_missing_target_is_zero() {
+        let preds = vec![5u32, 6, 7];
+        assert_eq!(reciprocal_rank(&preds, 99), 0.0);
+    }
+
+    #[test]
+    fn reciprocal_rank_later_position() {
+        let preds = vec![5u32, 6, 7];
+        assert!((reciprocal_rank(&preds, 7) - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn accuracy_result_token_match_constructor_matched() {
+        let r = AccuracyResult::token_match("strat", "test", "prompt", true);
+        assert!(r.top1_match);
+        assert!(r.kl_divergence.is_nan());
+        assert!((r.top5_overlap - 1.0).abs() < 1e-6);
+        assert!(r.needle_found.is_none());
+    }
+
+    #[test]
+    fn accuracy_result_token_match_constructor_missed() {
+        let r = AccuracyResult::token_match("strat", "test", "prompt", false);
+        assert!(!r.top1_match);
+        assert_eq!(r.top5_overlap, 0.0);
+        assert_eq!(r.baseline_token_rank, 0);
+    }
+
+    #[test]
+    fn accuracy_result_needle_constructor() {
+        let r = AccuracyResult::needle("strat", "test", "prompt", true, true);
+        assert_eq!(r.needle_found, Some(true));
+        assert_eq!(r.needle_exact_match, Some(true));
+    }
+
+    #[test]
+    fn factual_prompts_corpus_is_non_empty() {
+        let prompts = factual_prompts();
+        assert!(!prompts.is_empty());
+        assert!(prompts.iter().any(|(_, a)| *a == "Paris"));
+    }
+
+    #[test]
+    fn diverse_prompts_corpus_is_non_empty() {
+        let prompts = diverse_prompts();
+        assert!(!prompts.is_empty());
+    }
+
+    #[test]
+    fn format_accuracy_summary_handles_empty() {
+        let s = format_accuracy_summary(&[]);
+        assert!(s.contains("Accuracy Summary"));
+    }
+
+    #[test]
+    fn format_accuracy_summary_renders_strategy() {
+        let r = AccuracyResult::token_match("Standard KV", "top1", "The capital is", true);
+        let s = format_accuracy_summary(&[r]);
+        assert!(s.contains("Standard KV"));
+        assert!(s.contains("100.0%"));
+    }
+}

@@ -458,9 +458,15 @@ fn argmax_next_token(
 fn is_stop_token_str(s: &str) -> bool {
     matches!(
         s,
-        "<eos>" | "</s>" | "<|endoftext|>" | "<|im_end|>"
-            | "<|end_of_turn|>" | "<end_of_turn>"
-            | "<|end_of_text|>" | "<|eom_id|>" | "<|eot_id|>"
+        "<eos>"
+            | "</s>"
+            | "<|endoftext|>"
+            | "<|im_end|>"
+            | "<|end_of_turn|>"
+            | "<end_of_turn>"
+            | "<|end_of_text|>"
+            | "<|eom_id|>"
+            | "<|eot_id|>"
     )
 }
 
@@ -562,7 +568,10 @@ where
     generated
 }
 
-fn masked_argmax(logits: &[f32], tokenizer: &larql_inference::tokenizers::Tokenizer) -> Option<(u32, String)> {
+fn masked_argmax(
+    logits: &[f32],
+    tokenizer: &larql_inference::tokenizers::Tokenizer,
+) -> Option<(u32, String)> {
     let (idx, _) = logits
         .iter()
         .enumerate()
@@ -601,15 +610,8 @@ mod tests {
         let weights = make_test_weights();
         let tokenizer = make_test_tokenizer(weights.vocab_size);
         let ffn = WeightFfn { weights: &weights };
-        let ids = generate_cached_with_window(
-            &weights,
-            &tokenizer,
-            &ffn,
-            &[0u32],
-            4,
-            Some(2),
-            |_, _| {},
-        );
+        let ids =
+            generate_cached_with_window(&weights, &tokenizer, &ffn, &[0u32], 4, Some(2), |_, _| {});
         assert!(ids.len() <= 4);
     }
 

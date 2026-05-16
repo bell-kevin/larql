@@ -410,8 +410,21 @@ pub async fn try_once(
                     hb_handle.abort();
                     return Err(format!("router rejected: {}", r.reason).into());
                 }
-                Some(RouterPayload::Assign(_)) => {
-                    warn!("Received AssignMsg but Mode B not implemented — ignoring");
+                Some(RouterPayload::Assign(a)) => {
+                    // Mode A — this server is already serving a layer
+                    // range. Mode B's `run_available_loop` is the path
+                    // that processes AssignMsg (see announce.rs:509);
+                    // arriving here means the router sent an
+                    // assignment to a serving stream, which is a
+                    // protocol-level error on the router side. We log
+                    // loudly and ignore — the operator should see this
+                    // in logs as a router bug, not silent misbehaviour.
+                    warn!(
+                        model_id = %a.model_id,
+                        layers = %format!("{}-{}", a.layer_start, a.layer_end),
+                        "Mode A stream received AssignMsg — ignoring (router bug? \
+                         AssignMsg should target Mode B / available pool only)"
+                    );
                 }
                 Some(RouterPayload::Unassign(u)) => {
                     info!(
@@ -452,7 +465,17 @@ pub async fn try_once(
 
 // ── Mode B connection lifecycle ────────────────────────────────────────────────
 
-async fn try_once_available(
+/// One Mode B handshake against the router named by `cfg.join_url`:
+/// opens a gRPC connection, sends `AvailableMsg`, then runs
+/// [`run_available_loop`] to handle `AssignMsg` (download shard via
+/// `shard_loader` + send `ReadyMsg`) until `AckMsg` lands or the
+/// stream closes. Returns `Ok(())` after the spare has registered as
+/// serving.
+///
+/// Public so integration tests can drive a full Mode B round-trip
+/// against an in-process router fixture without resorting to manual
+/// gRPC plumbing.
+pub async fn try_once_available(
     cfg: &AvailableConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel = connect_grid_channel(&cfg.join_url, cfg.quic_cert_fingerprint.as_deref()).await?;
@@ -532,8 +555,8 @@ async fn run_available_loop(
                                         layer_start: assign.layer_start,
                                         layer_end: assign.layer_end,
                                         listen_url: cfg.listen_url.clone(),
-            expert_start: 0,
-            expert_end: 0,
+                                        expert_start: 0,
+                                        expert_end: 0,
                                     })),
                                 })
                                 .await;

@@ -14,11 +14,13 @@ use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::RwLock;
 use tempfile::TempDir;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use larql_router::grid::{GridServiceImpl, GridState};
+use larql_router::grid::service::GridServiceImpl;
+use larql_router::grid::GridState;
 use larql_router_protocol::{
     grid_service_server::GridServiceServer, AnnounceMsg, GridServiceClient, RouterMessage,
     RouterPayload, ServerMessage, ServerPayload, UnassignMsg,
@@ -122,7 +124,7 @@ async fn drain_then_reassign_via_available_after_drain() {
     let drained_server_id = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let g = state.read().await;
+            let g = state.read();
             for (sid, entry) in g.servers() {
                 if entry.listen_url == "http://drained:8080" {
                     return sid.clone();
@@ -135,7 +137,7 @@ async fn drain_then_reassign_via_available_after_drain() {
 
     // Confirm: 2 servers serving (origin + drained), 0 in available pool.
     {
-        let g = state.read().await;
+        let g = state.read();
         assert_eq!(g.status_response().servers.len(), 2);
         assert!(!g.has_available_servers());
     }
@@ -143,23 +145,23 @@ async fn drain_then_reassign_via_available_after_drain() {
     // Trigger UnassignMsg → router sends down the drained server's
     // serving_sender channel. The production announce loop must then drain,
     // send DroppingMsg, and re-enter run_available_loop on the same stream.
-    {
-        let g = state.read().await;
-        let sender = g
-            .serving_sender(&drained_server_id)
-            .expect("router must hold the drained server's sender");
-        sender
-            .send(Ok(RouterMessage {
-                payload: Some(RouterPayload::Unassign(UnassignMsg {
-                    model_id: "test-model".into(),
-                    layer_start: 0,
-                    layer_end: 4,
-                    reason: "rebalancing".into(),
-                })),
-            }))
-            .await
-            .unwrap();
-    }
+    // Clone the sender then drop the read guard before awaiting — the
+    // parking_lot guard is !Send and can't be held across an `.await`.
+    let sender = state
+        .read()
+        .serving_sender(&drained_server_id)
+        .expect("router must hold the drained server's sender");
+    sender
+        .send(Ok(RouterMessage {
+            payload: Some(RouterPayload::Unassign(UnassignMsg {
+                model_id: "test-model".into(),
+                layer_start: 0,
+                layer_end: 4,
+                reason: "rebalancing".into(),
+            })),
+        }))
+        .await
+        .unwrap();
 
     // The drained server now: drain → DroppingMsg → re-enter Mode B.
     // After that, GridState should:
@@ -172,7 +174,7 @@ async fn drain_then_reassign_via_available_after_drain() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let g = state.read().await;
+            let g = state.read();
             if g.has_available_servers() {
                 return;
             }
@@ -182,7 +184,7 @@ async fn drain_then_reassign_via_available_after_drain() {
     .expect("drained server must appear in available pool within 3s");
 
     {
-        let g = state.read().await;
+        let g = state.read();
         // The original serving entry is gone.
         let serving_urls: Vec<String> = g
             .status_response()
@@ -200,8 +202,8 @@ async fn drain_then_reassign_via_available_after_drain() {
     // live-origin range (20-24). The router must resolve the origin from the
     // surviving donor and dispatch AssignMsg.
     {
-        let mut g = state.write().await;
-        let sent = g.try_assign_gap("test-model", 20, 24, 0);
+        let mut g = state.write();
+        let sent = g.try_assign_gap("test-model", 20, 24, 0, 0, 0);
         assert!(sent, "router must dispatch AssignMsg to the available pool");
     }
 

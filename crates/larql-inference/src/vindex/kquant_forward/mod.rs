@@ -27,17 +27,19 @@ pub use cached::{
 
 pub(crate) use generation::generate_kquant_cpu_constrained_streaming_sampled_with_eos;
 pub use generation::{
-    generate_kquant_cpu, generate_kquant_cpu_constrained, generate_kquant_cpu_constrained_streaming,
-    generate_kquant_cpu_constrained_streaming_sampled, generate_kquant_cpu_remote, is_end_of_turn,
-    predict_kquant,
+    generate_kquant_cpu, generate_kquant_cpu_constrained,
+    generate_kquant_cpu_constrained_streaming, generate_kquant_cpu_constrained_streaming_sampled,
+    generate_kquant_cpu_remote, is_end_of_turn, predict_kquant,
 };
 pub use hidden::predict_kquant_hidden;
 pub use hooks::predict_kquant_hidden_hooked;
 pub use interventions::{
-    predict_kquant_hidden_with_mapped_head_residual_delta, predict_kquant_hidden_with_mapped_pre_o_head,
+    predict_kquant_hidden_with_mapped_head_residual_delta,
+    predict_kquant_hidden_with_mapped_pre_o_head,
     predict_kquant_hidden_with_original_head_residual_delta,
     predict_kquant_hidden_with_replaced_head_residual_delta,
-    predict_kquant_hidden_with_replaced_pre_o_head, predict_kquant_hidden_with_subtracted_pre_o_heads,
+    predict_kquant_hidden_with_replaced_pre_o_head,
+    predict_kquant_hidden_with_subtracted_pre_o_heads,
     predict_kquant_hidden_with_zeroed_pre_o_heads,
 };
 pub use metal::{

@@ -166,3 +166,72 @@ pub fn format_needle_results(
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needle_tests_corpus_is_non_empty() {
+        let tests = needle_tests();
+        assert!(!tests.is_empty());
+        for t in &tests {
+            assert!(!t.needle_text.is_empty(), "needle_text missing");
+            assert!(!t.needle_answer.is_empty(), "needle_answer missing");
+            assert!(!t.query_text.is_empty(), "query_text missing");
+            assert!(t.context_tokens > 0, "context_tokens must be > 0");
+        }
+    }
+
+    #[test]
+    fn multi_needle_tests_corpus_is_non_empty() {
+        let tests = multi_needle_tests();
+        assert!(!tests.is_empty());
+    }
+
+    #[test]
+    fn build_haystack_plants_needle() {
+        let needle = "MAGIC-WORD-XYZ";
+        let hay = build_haystack(200, needle);
+        assert!(
+            hay.contains(needle),
+            "needle should be embedded in haystack"
+        );
+        // Haystack should approximately match the requested length
+        // (4 chars per token average).
+        assert!(hay.len() >= 200 * 4 / 2);
+    }
+
+    #[test]
+    fn build_haystack_zero_tokens_returns_needle_only() {
+        let needle = "X";
+        let hay = build_haystack(0, needle);
+        assert!(hay.contains(needle));
+    }
+
+    #[test]
+    fn needle_found_is_case_insensitive() {
+        assert!(needle_found("the answer is PARIS", "paris"));
+        assert!(needle_found("Paris is the capital", "PARIS"));
+        assert!(!needle_found("no match here", "berlin"));
+    }
+
+    #[test]
+    fn format_needle_results_empty_input() {
+        let s = format_needle_results(&[]);
+        assert!(s.contains("Needle-in-a-Haystack"));
+    }
+
+    #[test]
+    fn format_needle_results_renders_rows() {
+        let rows = vec![
+            (1024usize, vec![("Standard".to_string(), true)]),
+            (4096usize, vec![("Standard".to_string(), false)]),
+        ];
+        let s = format_needle_results(&rows);
+        assert!(s.contains("1024 tokens"));
+        assert!(s.contains("4096 tokens"));
+        assert!(s.contains("PASS"));
+        assert!(s.contains("FAIL"));
+    }
+}

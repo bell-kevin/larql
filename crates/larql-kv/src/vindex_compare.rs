@@ -12,8 +12,10 @@
 //! Primary consumer: exp 26 Q2 (FP4 end-to-end correctness) via the
 //! `vindex_compare` example. But the library has no FP4-specific
 //! behaviour and is ready for any future storage-format A/B.
-
-#![cfg(feature = "real-model")]
+//!
+//! Lifted from the retired `kv-cache-benchmark` crate (2026-05-16); the
+//! `real-model` feature gate is gone because all deps (`larql-inference`,
+//! `larql-vindex`) are already unconditional in `larql-kv`.
 
 use std::collections::HashMap;
 

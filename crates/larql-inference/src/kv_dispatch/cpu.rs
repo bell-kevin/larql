@@ -521,7 +521,9 @@ mod tests {
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
         // Populate handle via prefill.
-        let (_, mut handle) = backend.attention_prefill(&weights, &h_in, 0, None, None).unwrap();
+        let (_, mut handle) = backend
+            .attention_prefill(&weights, &h_in, 0, None, None)
+            .unwrap();
         let prior_len = handle.cached_len();
 
         // Snapshot prior K/V before the trait call mutates the handle.
