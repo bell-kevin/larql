@@ -107,6 +107,11 @@ Runs every `--rebalance-interval` seconds (default 30). Each tick:
 Set `--rebalance-interval 0` to disable the background tick (you can
 still drive moves manually via the admin RPCs).
 
+End-to-end walkthrough: [`docs/hot-shard-demo.md`](./docs/hot-shard-demo.md)
+(spins up a 2-serving-shard + 1-spare topology, drives load, and
+prints the rebalancer's elevation/cool-down log lines). The
+companion script is `scripts/demo-hot-shard.sh`.
+
 ### Admin CLI
 
 The same binary doubles as an admin client:

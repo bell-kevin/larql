@@ -16,9 +16,17 @@
 //! `predict_q4k_hidden` path — the caller decides via
 //! [`supports_cached_decode`].
 
+// `cache[layer]` indexing reads more naturally than the iterator
+// equivalent and pairs cleanly with the explicit `layer` ID that's
+// passed into `insert_q4k_layer_tensors` / `run_attention_block_*`.
+// The `(Array2, (Array2, Array2))` return is the documented
+// `(h_post_attn, (k_cache, v_cache))` shape used across the decode
+// helpers; introducing a type alias would just spread the shape
+// across two files.
+#![allow(clippy::needless_range_loop, clippy::type_complexity)]
+
 use larql_compute::cpu::ops::q4k_q8k_dot::{
-    q4k_q8k_gate_up_into, q4k_q8k_matvec_into, q6k_q8k_matvec_into, quantize_x_to_q8k_into,
-    Q8KActivation,
+    q4k_q8k_matvec_into, q6k_q8k_matvec_into, quantize_x_to_q8k_into, Q8KActivation,
 };
 use larql_compute::ComputeBackend;
 use larql_models::ModelWeights;
@@ -204,25 +212,10 @@ impl CachedTimings {
 // (CPU `q4k_matvec_into` / `q6k_matvec_into`), skipping the dequant
 // staging entirely.
 
-fn matvec_quant(
-    backend: &dyn ComputeBackend,
-    bytes: &[u8],
-    format: &str,
-    x: &[f32],
-    rows: usize,
-    cols: usize,
-) -> Option<Vec<f32>> {
-    match format {
-        "Q4_K" => backend.q4k_matvec(bytes, x, rows, cols),
-        "Q6_K" => backend.q6k_matvec(bytes, x, rows, cols),
-        _ => None,
-    }
-}
-
 /// Format-aware Q*K × Q8_K matvec used by the production decode path.
 /// Uses NEON `sdot` (Q4_K) or `vmlal_s8` (Q6_K) under the hood — ~2-3×
-/// the f32-FMA throughput of `matvec_quant`. Returns `None` for any
-/// unsupported format (caller falls through to dequant).
+/// the f32-FMA throughput of `backend.quant_matvec`. Returns `None`
+/// for any unsupported format (caller falls through to dequant).
 fn matvec_q4k_or_q6k_q8k(
     bytes: &[u8],
     format: &str,
@@ -341,7 +334,10 @@ fn vec_to_2d_row(v: Vec<f32>) -> Array2<f32> {
 fn run_attn_decode_step_q4k_direct(
     weights: &ModelWeights,
     index: &VectorIndex,
-    backend: &dyn ComputeBackend,
+    // Kept on the helper signature for parity with the outer
+    // `predict_q4k_decode_step_direct` API and any future asm dispatch
+    // that wants runtime feature detection.
+    _backend: &dyn ComputeBackend,
     h_new: &Array2<f32>,
     layer: usize,
     kv_entry: Option<&(Array2<f32>, Array2<f32>)>,
@@ -520,7 +516,7 @@ fn run_attn_decode_step_q4k_direct(
 fn run_ffn_decode_step_q4k_direct(
     weights: &ModelWeights,
     index: &VectorIndex,
-    backend: &dyn ComputeBackend,
+    _backend: &dyn ComputeBackend,
     h_post_attn: &Array2<f32>,
     layer: usize,
 ) -> Option<Array2<f32>> {
@@ -676,4 +672,469 @@ pub fn predict_q4k_decode_step_direct(
     }
 
     Some(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights, Q4KTestFixtures};
+    use larql_compute::CpuBackend;
+
+    // ── supports_cached_decode / supports_direct_matvec_decode ──────────
+
+    #[test]
+    fn supports_cached_decode_is_true_for_dense_arch() {
+        let weights = make_test_q4k_weights();
+        assert!(
+            supports_cached_decode(&weights),
+            "synthetic Gemma 3-style weights are dense, no KV sharing, no hybrid MoE"
+        );
+    }
+
+    #[test]
+    fn supports_direct_matvec_decode_is_true_for_q4k_synthetic_vindex() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        assert!(
+            supports_direct_matvec_decode(&weights, &index),
+            "synth Q4_K vindex has Q4_K attn + interleaved data, intermediate divisible by 256"
+        );
+    }
+
+    #[test]
+    fn layer_supports_direct_matvec_is_true_for_q4k_synthetic() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        for l in 0..weights.num_layers {
+            assert!(
+                layer_supports_direct_matvec(&index, l),
+                "layer {l} should support direct matvec"
+            );
+        }
+    }
+
+    // ── matvec_q4k_or_q6k_q8k dispatcher ────────────────────────────────
+
+    #[test]
+    fn matvec_q4k_or_q6k_q8k_q4k_format_produces_finite_output() {
+        use larql_compute::cpu::ops::q4_common::quantize_q4_k;
+        use larql_compute::cpu::ops::q4k_q8k_dot::quantize_x_to_q8k_into;
+
+        let rows = 16usize;
+        let cols = 256usize; // one super-block
+        let weights: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.001).sin() * 0.1)
+            .collect();
+        let q4k_bytes = quantize_q4_k(&weights);
+
+        let x: Vec<f32> = (0..cols)
+            .map(|j| ((j as f32) * 0.007).cos() * 0.5)
+            .collect();
+        let mut x_q8k = Q8KActivation::with_capacity(cols);
+        quantize_x_to_q8k_into(&mut x_q8k, &x);
+
+        let out = matvec_q4k_or_q6k_q8k(&q4k_bytes, "Q4_K", &x_q8k, rows, cols)
+            .expect("Q4_K dispatch must succeed");
+        assert_eq!(out.len(), rows);
+        assert!(out.iter().all(|v| v.is_finite()));
+        assert!(
+            out.iter().any(|&v| v.abs() > 1e-6),
+            "matvec should produce non-zero output for non-degenerate input"
+        );
+    }
+
+    #[test]
+    fn matvec_q4k_or_q6k_q8k_unknown_format_returns_none() {
+        let x_q8k = Q8KActivation::with_capacity(256);
+        // Empty bytes + unknown format should drop through to None.
+        let out = matvec_q4k_or_q6k_q8k(&[], "F32", &x_q8k, 4, 256);
+        assert!(out.is_none(), "unsupported format must return None");
+    }
+
+    #[test]
+    fn matvec_q4k_or_q6k_q8k_zero_dims_returns_zeroed_vec() {
+        let x_q8k = Q8KActivation::with_capacity(0);
+        let out = matvec_q4k_or_q6k_q8k(&[], "Q4_K", &x_q8k, 0, 0);
+        assert_eq!(out.as_deref(), Some(&[][..]));
+    }
+
+    #[test]
+    fn matvec_q4k_or_q6k_q8k_non_multiple_cols_returns_none() {
+        let x_q8k = Q8KActivation::with_capacity(255);
+        // 255 is not a multiple of 256 → reject (caller falls back to dequant path).
+        let out = matvec_q4k_or_q6k_q8k(&[], "Q4_K", &x_q8k, 4, 255);
+        assert!(out.is_none(), "non-256-multiple cols must be rejected");
+    }
+
+    // ── predict_q4k_prefill / predict_q4k_decode_step ────────────────────
+
+    #[test]
+    fn predict_q4k_prefill_returns_hidden_with_expected_shape() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2, 3];
+        let (h, cache, _timings) = predict_q4k_prefill(&mut fx.weights, &token_ids, &fx.index);
+        assert_eq!(
+            h.shape()[0],
+            token_ids.len(),
+            "prefill returns seq_len rows"
+        );
+        assert_eq!(h.shape()[1], fx.weights.hidden_size);
+        assert!(
+            h.iter().all(|v| v.is_finite()),
+            "hidden state must be finite"
+        );
+        assert_eq!(cache.len(), fx.weights.num_layers);
+        for layer in 0..fx.weights.num_layers {
+            assert!(
+                cache[layer].is_some(),
+                "every layer should have K/V populated after prefill"
+            );
+        }
+    }
+
+    #[test]
+    fn predict_q4k_decode_step_appends_kv_and_returns_one_row() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2, 3];
+        let (_, mut cache, _) = predict_q4k_prefill(&mut fx.weights, &token_ids, &fx.index);
+
+        let pre_lens: Vec<usize> = cache
+            .iter()
+            .map(|c| c.as_ref().map(|(k, _)| k.shape()[0]).unwrap_or(0))
+            .collect();
+
+        let (h_new, _step_timings) =
+            predict_q4k_decode_step(&mut fx.weights, 4, &fx.index, &mut cache, token_ids.len())
+                .expect("decode step must succeed on a populated cache");
+
+        assert_eq!(h_new.shape(), &[1, fx.weights.hidden_size]);
+        assert!(h_new.iter().all(|v| v.is_finite()));
+
+        for (layer, pre) in pre_lens.iter().enumerate() {
+            let post = cache[layer]
+                .as_ref()
+                .map(|(k, _)| k.shape()[0])
+                .unwrap_or(0);
+            assert_eq!(post, pre + 1, "layer {layer} K/V should have grown by 1");
+        }
+    }
+
+    #[test]
+    fn predict_q4k_decode_step_rejects_mismatched_cache_length() {
+        let mut fx = Q4KTestFixtures::build();
+        // Cache length doesn't match num_layers — function must return None.
+        let mut bad_cache: CpuKvCache = vec![None; fx.weights.num_layers + 1];
+        let result = predict_q4k_decode_step(&mut fx.weights, 1, &fx.index, &mut bad_cache, 0);
+        assert!(result.is_none());
+    }
+
+    // ── predict_q4k_decode_step_direct (Q4K × Q8K sdot path) ────────────
+
+    #[test]
+    fn predict_q4k_decode_step_direct_returns_finite_hidden() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2, 3];
+        let (_, mut cache, _) = predict_q4k_prefill(&mut fx.weights, &token_ids, &fx.index);
+
+        let backend = CpuBackend;
+        let h_new = predict_q4k_decode_step_direct(
+            &mut fx.weights,
+            4,
+            &fx.index,
+            &backend,
+            &mut cache,
+            token_ids.len(),
+        )
+        .expect("direct decode step must succeed");
+
+        assert_eq!(h_new.shape(), &[1, fx.weights.hidden_size]);
+        assert!(h_new.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn predict_q4k_decode_step_direct_rejects_mismatched_cache_length() {
+        let mut fx = Q4KTestFixtures::build();
+        let mut bad_cache: CpuKvCache = vec![None; fx.weights.num_layers - 1];
+        let backend = CpuBackend;
+        let result = predict_q4k_decode_step_direct(
+            &mut fx.weights,
+            1,
+            &fx.index,
+            &backend,
+            &mut bad_cache,
+            0,
+        );
+        assert!(result.is_none());
+    }
+
+    // ── CachedTimings merge ──────────────────────────────────────────────
+
+    #[test]
+    fn cached_timings_add_accumulates_dequant_ms() {
+        let mut t = CachedTimings::default();
+        assert_eq!(t.dequant_ms, 0.0);
+        t.add(CachedTimings { dequant_ms: 1.5 });
+        t.add(CachedTimings { dequant_ms: 2.25 });
+        assert_eq!(t.dequant_ms, 3.75);
+    }
+}
+
+#[cfg(test)]
+mod branch_tests {
+    use super::*;
+    use crate::test_utils::{
+        make_test_q4k_vindex, make_test_q4k_weights, make_test_tokenizer, Q4K_TEST_HIDDEN,
+        Q4K_TEST_INTER, Q4K_TEST_NUM_LAYERS, Q4K_TEST_VOCAB,
+    };
+    use larql_compute::cpu::ops::q4_common::quantize_q4_k;
+    use larql_compute::CpuBackend;
+    use larql_models::{detect_from_json, ModelWeights, WeightArray};
+    use ndarray::Array2;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn rand_mat(rows: usize, cols: usize, seed: u64) -> WeightArray {
+        let mut state = seed;
+        let data: Vec<f32> = (0..rows * cols)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state as u32) as f32 / u32::MAX as f32 * 0.1 - 0.05
+            })
+            .collect();
+        Array2::from_shape_vec((rows, cols), data)
+            .unwrap()
+            .into_shared()
+    }
+
+    /// Llama-style fixture: same dimensions as the Gemma 3 fixture but
+    /// `model_type=llama` so `arch.activation()` returns SiLU instead
+    /// of GeluTanh. Exercises the SiLU branch in
+    /// `run_ffn_decode_step_q4k_direct`.
+    fn make_llama_q4k_weights() -> ModelWeights {
+        let num_q = 4usize;
+        let num_kv = 2usize;
+        let head_dim = Q4K_TEST_HIDDEN / num_q;
+        let arch_json = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": Q4K_TEST_HIDDEN,
+            "num_hidden_layers": Q4K_TEST_NUM_LAYERS,
+            "intermediate_size": Q4K_TEST_INTER,
+            "head_dim": head_dim,
+            "num_attention_heads": num_q,
+            "num_key_value_heads": num_kv,
+            "vocab_size": Q4K_TEST_VOCAB,
+            "hidden_activation": "silu",
+            "rope_theta": 10000.0,
+        });
+        let arch = detect_from_json(&arch_json);
+        let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+        let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut seed = 0xc0ffee_u64.wrapping_mul(31);
+        let mut next_seed = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        let embed = rand_mat(Q4K_TEST_VOCAB, Q4K_TEST_HIDDEN, next_seed());
+        let lm_head = embed.clone();
+        tensors.insert(arch.embed_key().to_string(), embed.clone());
+        vectors.insert(
+            arch.final_norm_key().to_string(),
+            vec![1.0; Q4K_TEST_HIDDEN],
+        );
+        let q_dim = num_q * head_dim;
+        let kv_dim = num_kv * head_dim;
+        for layer in 0..Q4K_TEST_NUM_LAYERS {
+            tensors.insert(
+                arch.attn_q_key(layer),
+                rand_mat(q_dim, Q4K_TEST_HIDDEN, next_seed()),
+            );
+            tensors.insert(
+                arch.attn_k_key(layer),
+                rand_mat(kv_dim, Q4K_TEST_HIDDEN, next_seed()),
+            );
+            tensors.insert(
+                arch.attn_v_key(layer),
+                rand_mat(kv_dim, Q4K_TEST_HIDDEN, next_seed()),
+            );
+            tensors.insert(
+                arch.attn_o_key(layer),
+                rand_mat(Q4K_TEST_HIDDEN, q_dim, next_seed()),
+            );
+            tensors.insert(
+                arch.ffn_gate_key(layer),
+                rand_mat(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, next_seed()),
+            );
+            tensors.insert(
+                arch.ffn_up_key(layer),
+                rand_mat(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, next_seed()),
+            );
+            tensors.insert(
+                arch.ffn_down_key(layer),
+                rand_mat(Q4K_TEST_HIDDEN, Q4K_TEST_INTER, next_seed()),
+            );
+            vectors.insert(arch.input_layernorm_key(layer), vec![1.0; Q4K_TEST_HIDDEN]);
+            vectors.insert(
+                arch.post_attention_layernorm_key(layer),
+                vec![1.0; Q4K_TEST_HIDDEN],
+            );
+        }
+        ModelWeights {
+            tensors,
+            vectors,
+            raw_bytes: HashMap::new(),
+            packed_mmaps: HashMap::new(),
+            skipped_tensors: Vec::new(),
+            packed_byte_ranges: HashMap::new(),
+            embed,
+            lm_head,
+            position_embed: None,
+            arch,
+            num_layers: Q4K_TEST_NUM_LAYERS,
+            hidden_size: Q4K_TEST_HIDDEN,
+            intermediate_size: Q4K_TEST_INTER,
+            vocab_size: Q4K_TEST_VOCAB,
+            head_dim,
+            num_q_heads: num_q,
+            num_kv_heads: num_kv,
+            rope_base: 10_000.0,
+        }
+    }
+
+    /// Direct decode step on a SiLU-activation arch — exercises the
+    /// non-GeluTanh branch in `run_ffn_decode_step_q4k_direct`.
+    #[test]
+    fn predict_q4k_decode_step_direct_silu_activation_path() {
+        let mut weights = make_llama_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let _tok = make_test_tokenizer(weights.vocab_size);
+        let token_ids = vec![1u32, 2];
+        let (_, mut cache, _) = predict_q4k_prefill(&mut weights, &token_ids, &index);
+        let backend = CpuBackend;
+        let h_new = predict_q4k_decode_step_direct(
+            &mut weights,
+            3,
+            &index,
+            &backend,
+            &mut cache,
+            token_ids.len(),
+        )
+        .expect("SiLU direct decode step must succeed");
+        assert!(h_new.iter().all(|v| v.is_finite()));
+    }
+
+    /// `predict_q4k_decode_step` (dequant path) on the same SiLU
+    /// fixture — exercises `run_ffn`'s SiLU branch.
+    #[test]
+    fn predict_q4k_decode_step_silu_activation_path() {
+        let mut weights = make_llama_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let token_ids = vec![1u32, 2];
+        let (_, mut cache, _) = predict_q4k_prefill(&mut weights, &token_ids, &index);
+        let (h_new, _) =
+            predict_q4k_decode_step(&mut weights, 3, &index, &mut cache, token_ids.len())
+                .expect("SiLU dequant decode step must succeed");
+        assert!(h_new.iter().all(|v| v.is_finite()));
+    }
+
+    /// Q4K format check — when a matrix's bytes are too short for the
+    /// claimed (rows, cols), the dispatcher should return None instead
+    /// of panicking on the out-of-range slice.
+    #[test]
+    fn matvec_q4k_or_q6k_q8k_short_bytes_returns_none() {
+        let x_q8k = Q8KActivation::with_capacity(256);
+        // Need at least 4 * (256/256) * 144 = 576 bytes for 4×256 Q4_K.
+        let too_short = vec![0u8; 144]; // only 1 row's worth
+        let out = matvec_q4k_or_q6k_q8k(&too_short, "Q4_K", &x_q8k, 4, 256);
+        assert!(out.is_none(), "short byte buffer must be rejected");
+    }
+
+    /// Cover the no-attention-data branch of
+    /// `layer_supports_direct_matvec`: a vindex with no attn_q4k_layer_data.
+    #[test]
+    fn layer_supports_direct_matvec_false_without_attn_data() {
+        let weights = make_test_q4k_weights();
+        // Build an index with no Q4_K storage at all.
+        let bare = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        assert!(
+            !supports_direct_matvec_decode(&weights, &bare),
+            "vindex with no Q4_K data can't support direct matvec"
+        );
+        for l in 0..weights.num_layers {
+            assert!(!layer_supports_direct_matvec(&bare, l));
+        }
+    }
+
+    /// Cover the unsupported-format branch of
+    /// `layer_supports_direct_matvec`: vindex carries Q4_K storage but
+    /// one entry is tagged with a format the direct path doesn't
+    /// recognise (e.g., `Q4_KF`).
+    #[test]
+    fn layer_supports_direct_matvec_false_with_unsupported_format() {
+        let weights = make_test_q4k_weights();
+        let arch = &*weights.arch;
+        let mut attn_payload = Vec::new();
+        let mut attn_manifest: Vec<(usize, usize, String)> = Vec::new();
+        let q_dim = weights.num_q_heads * weights.head_dim;
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        for layer in 0..weights.num_layers {
+            for (idx, key) in [
+                arch.attn_q_key(layer),
+                arch.attn_k_key(layer),
+                arch.attn_v_key(layer),
+                arch.attn_o_key(layer),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let rows = if idx == 0 || idx == 3 { q_dim } else { kv_dim };
+                let _ = rows;
+                let tensor = weights.tensors.get(key).unwrap();
+                let bytes = quantize_q4_k(tensor.as_slice().unwrap());
+                let off = attn_payload.len();
+                let len = bytes.len();
+                attn_payload.extend_from_slice(&bytes);
+                // Tag the first Q with an unsupported format.
+                let fmt = if layer == 0 && idx == 0 {
+                    "Q4_KF".to_string()
+                } else {
+                    "Q4_K".to_string()
+                };
+                attn_manifest.push((off, len, fmt));
+            }
+        }
+        // Also need interleaved Q4_K so the FFN branch passes through
+        // before we hit the attn check. Use the synth helper for that.
+        let mut index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        index.vocab_size = weights.vocab_size;
+        let mut anon = memmap2::MmapMut::map_anon(attn_payload.len()).expect("anon");
+        anon.copy_from_slice(&attn_payload);
+        let mmap = Arc::new(anon.make_read_only().unwrap());
+        Arc::make_mut(&mut index.storage).set_attn_q4k(mmap, Some(attn_manifest));
+        assert!(
+            !layer_supports_direct_matvec(&index, 0),
+            "layer with Q4_KF format must not support the direct matvec path"
+        );
+    }
+
+    /// `CachedTimings::merge` is private; verify the public `add`
+    /// wrapper covers it (both should sum into `dequant_ms`).
+    #[test]
+    fn cached_timings_default_starts_at_zero() {
+        let t = CachedTimings::default();
+        assert_eq!(t.dequant_ms, 0.0);
+    }
 }

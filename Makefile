@@ -703,6 +703,10 @@ bench-wire:
 bench-routing:
 	cargo bench -p larql-router --bench routing
 
+# Exp 53 ShardService KNN hot-path criterion bench (cache + vindex variants).
+bench-shard-query:
+	cargo bench -p larql-server --bench shard_query
+
 # Grid end-to-end regression gate (requires LARQL_BENCH_FFN_URL env var).
 bench-grid:
 	./scripts/bench-grid-regress.sh $(MODEL)

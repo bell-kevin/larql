@@ -50,6 +50,8 @@ pub mod experts;
 pub mod ffn;
 pub mod forward;
 pub mod forward_overrides;
+pub mod kv_dispatch;
+pub mod kv_dispatch_cpu;
 pub mod kv_engine;
 pub mod layer_graph;
 pub mod model;
@@ -98,6 +100,9 @@ pub use ffn::{
     BackendFfn, FfnBackend, LayerFfnRouter, LayerShardedBackend, MoeRouterWeights, RemoteFfnConfig,
     RemoteFfnError, RemoteLatencyStats, RemoteMoeBackend, RemoteMoeError, RemoteWalkBackend,
     ShardConfig, SparseFfn, WeightFfn, WirePreference,
+};
+pub use kv_dispatch::{
+    CompressionCodec, KvDispatch, KvHandle, KvHandleInner, ResidualHandle, ResidualHandleInner,
 };
 pub use kv_engine::{DecodeStageSummary, EngineInfo, KvEngine};
 // Crate-root forward re-exports — kept for any name with external use OR
@@ -204,10 +209,14 @@ pub mod prelude {
 /// them here makes that boundary visible without breaking existing crate-root
 /// users in one large move.
 ///
-/// KV-cache engines (`MarkovResidualEngine`, `UnlimitedContextEngine`,
-/// `EngineKind`, `KvEngine`) and accuracy helpers (`compare_hidden`,
-/// `cosine_similarity`, `kl_divergence`, …) now live in the `larql-kv`
-/// crate — depend on it directly.
+/// `KvEngine`, `EngineInfo`, and `DecodeStageSummary` are defined in
+/// this crate's [`kv_engine`](crate::kv_engine) module and re-exported
+/// at the crate root. Concrete engine implementations
+/// (`MarkovResidualEngine`, `UnlimitedContextEngine`, `StandardEngine`,
+/// `NoCacheEngine`, `TurboQuantEngine`, `ApolloEngine`) plus
+/// `EngineKind` and accuracy helpers (`compare_hidden`,
+/// `cosine_similarity`, `kl_divergence`, …) live in the `larql-kv`
+/// crate — depend on it directly when you need concrete engines.
 pub mod research {
     // Source directly from subpaths so this curated surface keeps working
     // even when individual root re-exports are dropped. Kept as a single

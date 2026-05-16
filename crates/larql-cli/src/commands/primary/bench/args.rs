@@ -36,8 +36,17 @@ pub struct BenchArgs {
     pub ollama: Option<String>,
 
     /// Comma-separated KV engines to bench alongside the GPU path.
-    /// Supported: `markov-rs`, `unlimited-context`.
-    /// Example: `--engine markov-rs,unlimited-context`.
+    ///
+    /// Supported engine specs (same syntax as `EngineKind::from_name`):
+    ///   standard                       — production K/V cache (default)
+    ///   standard:window=N              — sliding-window K/V
+    ///   no-cache                       — full re-forward per step (O(N²)); debug
+    ///   markov-rs[:window=N]           — residual-stream replacement
+    ///   unlimited-context:window=N     — per-window K/V checkpoints
+    ///   turbo-quant[:bits=3|4]         — WHT + Lloyd-Max codec; experimental
+    ///   apollo:layer=N,coef=F,top_k=K  — boundary-residual injection; experimental
+    ///
+    /// Example: `--engine standard,markov-rs:window=512,unlimited-context:window=256`.
     #[arg(long, value_name = "ENGINE,...")]
     pub engine: Option<String>,
 

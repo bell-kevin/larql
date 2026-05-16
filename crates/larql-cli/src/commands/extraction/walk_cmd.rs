@@ -87,6 +87,12 @@ pub struct WalkArgs {
     #[arg(long, default_value = "0")]
     pub context_window: usize,
 
+    /// KV engine spec — overrides `--kv-cache` when set. See `larql run
+    /// --help` for the full syntax. Falls back to the `LARQL_KV_ENGINE`
+    /// env var when unset.
+    #[arg(long, value_name = "SPEC")]
+    pub engine: Option<String>,
+
     /// Run full forward pass with walk FFN and show predictions (requires --model).
     #[arg(long)]
     pub predict: bool,
@@ -1048,28 +1054,55 @@ fn generate_stream(
     // engine builder.
     let backend_name = backend.name().to_string();
 
-    // Unified `KvEngine` dispatch. Resolves the legacy `--kv-cache`
-    // flag to an `EngineKind` and drives generation through
-    // `generate_with_engine`. Bit-parity with the previous
-    // `generate_cached_backend` / `predict_with_ffn` paths is enforced
-    // by `larql-kv`'s parity test suite (spec §8.4).
+    // Unified `KvEngine` dispatch. Resolution precedence:
+    //   1. `--engine SPEC` flag (parsed by `EngineKind::from_name`)
+    //   2. `LARQL_KV_ENGINE` env var (same parser)
+    //   3. `--kv-cache standard|markov-bounded|none` legacy mapping
+    // CLI flag wins over env var; env var wins over `--kv-cache`. See
+    // `crates/larql-inference/docs/specs/kv-engine-unification.md` §6.
     use larql_kv::EngineKind;
-    let (kind, label) = match args.kv_cache {
-        KvCacheKind::Standard => (
-            EngineKind::Standard { window_size: None },
-            "standard KV cache",
-        ),
-        KvCacheKind::MarkovBounded => (
-            EngineKind::Standard {
-                window_size: if args.context_window > 0 {
-                    Some(args.context_window)
-                } else {
-                    None
+    let engine_spec = args
+        .engine
+        .clone()
+        .or_else(|| std::env::var("LARQL_KV_ENGINE").ok());
+    let (kind, label) = match engine_spec {
+        Some(spec) => {
+            let kind = EngineKind::from_name(&spec).unwrap_or_else(|| {
+                eprintln!(
+                    "warning: unknown --engine spec {spec:?}, falling back to standard (unbounded)"
+                );
+                EngineKind::Standard { window_size: None }
+            });
+            let label = match &kind {
+                EngineKind::Standard { window_size: None } => "engine=standard",
+                EngineKind::Standard {
+                    window_size: Some(_),
+                } => "engine=standard (windowed)",
+                EngineKind::NoCache => "engine=no-cache",
+                EngineKind::MarkovResidual { .. } => "engine=markov-rs",
+                EngineKind::UnlimitedContext { .. } => "engine=unlimited-context",
+                EngineKind::TurboQuant { .. } => "engine=turbo-quant",
+                EngineKind::Apollo { .. } => "engine=apollo",
+            };
+            (kind, label)
+        }
+        None => match args.kv_cache {
+            KvCacheKind::Standard => (
+                EngineKind::Standard { window_size: None },
+                "standard KV cache",
+            ),
+            KvCacheKind::MarkovBounded => (
+                EngineKind::Standard {
+                    window_size: if args.context_window > 0 {
+                        Some(args.context_window)
+                    } else {
+                        None
+                    },
                 },
-            },
-            "Markov-bounded KV cache",
-        ),
-        KvCacheKind::None => (EngineKind::NoCache, "no cache (O(N²))"),
+                "Markov-bounded KV cache",
+            ),
+            KvCacheKind::None => (EngineKind::NoCache, "no cache (O(N²))"),
+        },
     };
     let mut engine = kind.build(backend);
     let generated = larql_inference::forward::generate_with_engine(

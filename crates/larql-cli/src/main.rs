@@ -298,6 +298,7 @@ impl From<ChatArgs> for run_cmd::RunArgs {
             top: 1,
             kv_cache: run_cmd::KvCacheKind::Standard,
             context_window: 0,
+            engine: None,
             ffn: c.ffn,
             ffn_timeout_secs: c.ffn_timeout_secs,
             metal: false,

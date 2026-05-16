@@ -120,7 +120,7 @@ pub fn model_functional(id: &str) -> Arc<LoadedModel> {
         id: id.to_string(),
         path: std::path::PathBuf::from("/nonexistent"),
         config: test_config(),
-        patched: tokio::sync::RwLock::new(PatchedVindex::new(test_index())),
+        patched: std::sync::Arc::new(tokio::sync::RwLock::new(PatchedVindex::new(test_index()))),
         embeddings: {
             let mut e = Array2::<f32>::zeros((8, 4));
             e[[0, 0]] = 1.0;
@@ -162,7 +162,7 @@ pub fn model_infer_enabled(id: &str) -> Arc<LoadedModel> {
         id: id.to_string(),
         path: PathBuf::from("/nonexistent"),
         config: test_config(),
-        patched: tokio::sync::RwLock::new(PatchedVindex::new(test_index())),
+        patched: std::sync::Arc::new(tokio::sync::RwLock::new(PatchedVindex::new(test_index()))),
         embeddings: {
             let mut e = Array2::<f32>::zeros((8, 4));
             e[[0, 0]] = 1.0;
@@ -243,7 +243,7 @@ impl ModelBuilder {
             id: self.id,
             path: PathBuf::from("/nonexistent"),
             config: self.config,
-            patched: tokio::sync::RwLock::new(PatchedVindex::new(test_index())),
+            patched: std::sync::Arc::new(tokio::sync::RwLock::new(PatchedVindex::new(test_index()))),
             embeddings: {
                 let mut e = Array2::<f32>::zeros((8, 4));
                 e[[0, 0]] = 1.0;

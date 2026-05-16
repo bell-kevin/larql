@@ -312,24 +312,41 @@ is enabled.
   so hidden-sized arrays don't pay proto varint overhead.
 - `larql-server/src/shard_query.rs` — pure helpers (`l2_normalize`,
   `cosine_similarities`, `weighted_topk_average`, `decode_f32_le`,
-  `encode_f32_le`), `ShardCache` (in-memory `HashMap<u32, LayerEntry>`
-  with `insert_layer` + test-only `seed_from_normed`), and the
-  `ShardGrpcService` tonic impl. All branches unit-tested.
+  `encode_f32_le`) + a `ShardSource` enum with two backends:
+    - `ShardSource::Vindex` — production. Queries the server's
+      loaded `PatchedVindex` via `gate_knn` + `ffn_row_into`
+      (component = down). "Compiled facts" live as vindex patches
+      (`insert_feature` + `set_down_vector`); no separate on-disk
+      cache format is needed.
+    - `ShardSource::Cache` — test fixture. Tiny in-memory
+      `HashMap<u32, LayerEntry>` with `insert_layer` +
+      `seed_from_normed`; lets unit + integration tests cover the
+      wire path without a full vindex.
+  Enum dispatch (no `async-trait`).
 - `larql-server/src/bootstrap.rs` — opt-in registration: when
   `--shard-query-tau <TAU>` is passed alongside `--grpc-port`, the
   server adds `ShardServiceServer` to the existing tonic builder
-  chain (next to `VindexServiceServer` + `ExpertServiceServer`).
-  The cache starts empty; on-disk loaders are explicitly out of
-  scope for this transport-layer port and tracked separately.
-- `larql-server/tests/test_shard_query.rs` — 3 round-trip
-  integration tests over a real TCP socket (hit / miss-below-tau /
-  unknown-layer).
+  chain (next to `VindexServiceServer` + `ExpertServiceServer`),
+  wired over a *shared* `Arc<RwLock<PatchedVindex>>` cloned from
+  `LoadedModel.patched`.
+- `larql-server/src/state.rs`: `LoadedModel.patched` is now
+  `Arc<RwLock<PatchedVindex>>` (was `RwLock<PatchedVindex>`).
+  Deref-coercion preserves every existing `.read().await` /
+  `.write().await` call site unchanged; only the 12 construction
+  sites needed `Arc::new` wrapping. Patches added at runtime are
+  immediately visible to both the inference path and the shard
+  service — no snapshot, no copy.
+- `larql-server/tests/test_shard_query.rs` — 4 round-trip
+  integration tests over a real TCP socket: hit / miss-below-tau /
+  unknown-layer / **live patch propagation** (proves the shared-Arc
+  refactor — a patch added through one Arc handle surfaces on the
+  next `Query` through another handle).
 
 **Caveat:** lifting this effectively promotes "Multi-machine MoE" from
-P2 → P1 per `ROADMAP_STATUS`. The follow-up work is a portable on-disk
-cache format (the Python prototype uses `.pkl`, which is non-portable).
+P2 → P1 per `ROADMAP_STATUS`.
 
-Test counts: **26 shard_query tests** (23 unit + 3 integration).
+Test counts: **34 shard_query tests** (30 unit + 4 integration);
+shard_query.rs coverage 96.78%.
 
 ---
 

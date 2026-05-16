@@ -415,3 +415,294 @@ where
         error: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::Q4KTestFixtures;
+
+    /// `generate_via_cpu_q4k` routes through `_cached` when
+    /// `supports_cached_decode` holds. On the Q4_K synthetic fixture,
+    /// the Gemma 3-style arch satisfies the cached-decode contract, so
+    /// the cached path should run and produce a valid result.
+    #[test]
+    fn generate_via_cpu_q4k_cached_path_produces_tokens() {
+        let mut fx = Q4KTestFixtures::build();
+        // Build a small prompt directly — `make_test_tokenizer` decodes
+        // token N to `[N]` so any vocab IDs work.
+        let token_ids = vec![1u32, 2, 3];
+        let eos = EosConfig::builtin();
+
+        let result = generate_via_cpu_q4k(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            4,
+            &fx.index,
+            &eos,
+        );
+        assert!(
+            result.error.is_none(),
+            "cached path must succeed; got error: {:?}",
+            result.error
+        );
+        assert!(
+            !result.tokens.is_empty(),
+            "expect at least the seed token from the prefill argmax"
+        );
+        assert!(
+            result.prefill_ms > 0.0,
+            "prefill should be timed (synthetic, but nonzero)"
+        );
+    }
+
+    /// max_tokens=0 short-circuits with an empty-success result.
+    #[test]
+    fn generate_via_cpu_q4k_zero_tokens_returns_empty_success() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2];
+        let eos = EosConfig::builtin();
+
+        let result = generate_via_cpu_q4k(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            0,
+            &fx.index,
+            &eos,
+        );
+        assert!(result.tokens.is_empty());
+        assert!(result.error.is_none());
+        assert!(result.decode_ms.is_empty());
+    }
+
+    /// `lm_head_predict` dispatches to the Q4_K matvec path when the
+    /// vindex carries a Q4_K view of the LM head — the synthetic
+    /// fixture installs one via `set_lm_head_q4_mmap`.
+    #[test]
+    fn lm_head_predict_uses_q4_lm_head_when_available() {
+        let mut fx = Q4KTestFixtures::build();
+        // Build a synthetic hidden vector roughly the right scale
+        // (post-RMS-norm + final-norm magnitudes ≈ 1).
+        let h = ndarray::Array2::from_shape_fn((1, fx.weights.hidden_size), |(_, j)| {
+            ((j as f32) * 0.013).sin() * 0.5
+        });
+        let backend = larql_compute::CpuBackend;
+        let q4_lm_head: Option<&[u8]> = fx.index.storage.lm_head_q4_view().map(|b| b.as_ref());
+        assert!(
+            q4_lm_head.is_some(),
+            "synthetic vindex must carry a Q4_K lm_head view"
+        );
+        let vocab = fx.weights.vocab_size;
+        let result = lm_head_predict(
+            &mut fx.weights,
+            &h,
+            &fx.tokenizer,
+            &backend,
+            q4_lm_head,
+            vocab,
+        );
+        assert!(
+            !result.token_ids.is_empty(),
+            "must return at least one token id"
+        );
+        for &id in &result.token_ids {
+            assert!((id as usize) < vocab);
+        }
+    }
+
+    /// When the vindex doesn't carry a Q4_K lm_head, `lm_head_predict`
+    /// falls back to the f32 sgemv path via
+    /// `logits_to_predictions_pub`.
+    #[test]
+    fn lm_head_predict_falls_back_to_f32_when_q4_unavailable() {
+        let mut fx = Q4KTestFixtures::build();
+        let h = ndarray::Array2::from_shape_fn((1, fx.weights.hidden_size), |(_, j)| {
+            ((j as f32) * 0.013).sin() * 0.5
+        });
+        let backend = larql_compute::CpuBackend;
+        let vocab = fx.weights.vocab_size;
+        // Pass None to force the f32 fallback path.
+        let result = lm_head_predict(&mut fx.weights, &h, &fx.tokenizer, &backend, None, vocab);
+        assert!(!result.token_ids.is_empty());
+    }
+
+    /// `last_row_as_2d` extracts the final position's hidden vector
+    /// as a `[1, hidden]` array.
+    #[test]
+    fn last_row_as_2d_extracts_final_position() {
+        let h = ndarray::Array2::from_shape_fn((3, 4), |(r, c)| (r * 10 + c) as f32);
+        let last = last_row_as_2d(&h);
+        assert_eq!(last.shape(), &[1, 4]);
+        assert_eq!(last[[0, 0]], 20.0); // row 2, col 0 = 2*10 + 0
+        assert_eq!(last[[0, 3]], 23.0); // row 2, col 3 = 2*10 + 3
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    use crate::test_utils::Q4KTestFixtures;
+    use ndarray::Array2;
+
+    /// `predict_q4k_timed` returns the prediction + decomposed timing.
+    /// Sanity-check shapes and that both timings come back finite + ≥ 0.
+    #[test]
+    fn predict_q4k_timed_returns_finite_timings() {
+        let mut fx = Q4KTestFixtures::build();
+        let (result, hidden_ms, lm_head_ms) =
+            predict_q4k_timed(&mut fx.weights, &fx.tokenizer, &[1u32, 2], 3, &fx.index);
+        assert!(!result.token_ids.is_empty());
+        assert!(hidden_ms.is_finite() && hidden_ms >= 0.0);
+        assert!(lm_head_ms.is_finite() && lm_head_ms >= 0.0);
+    }
+
+    /// `generate_constrained_via_cpu_q4k_streaming_sampled` short-circuits
+    /// when `max_tokens == 0`.
+    #[test]
+    fn generate_constrained_zero_tokens_returns_empty_success() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32];
+        let eos = EosConfig::builtin();
+        let mask = |_ids: &[u32], _logits: &mut Vec<f32>| {};
+        let on_tok = |_id: u32, _s: &str, _p: f64| {};
+        let sampling = super::super::sampling::SamplingConfig::greedy();
+        let result = generate_constrained_via_cpu_q4k_streaming_sampled(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            0,
+            &fx.index,
+            mask,
+            on_tok,
+            sampling,
+            &eos,
+        );
+        assert!(result.tokens.is_empty());
+        assert!(result.error.is_none());
+    }
+
+    /// `last_row_as_2d` on a single-row hidden returns the same row.
+    #[test]
+    fn last_row_as_2d_single_row_is_identity_shaped() {
+        let h = Array2::from_shape_vec((1, 3), vec![1.0f32, 2.0, 3.0]).unwrap();
+        let last = last_row_as_2d(&h);
+        assert_eq!(last.shape(), &[1, 3]);
+        assert_eq!(last[[0, 0]], 1.0);
+        assert_eq!(last[[0, 1]], 2.0);
+        assert_eq!(last[[0, 2]], 3.0);
+    }
+
+    /// `lm_head_predict` with vocab=0 falls back to the f32 path
+    /// (the Q4 branch requires vocab > 0).
+    #[test]
+    fn lm_head_predict_zero_vocab_falls_back() {
+        let mut fx = Q4KTestFixtures::build();
+        let h = Array2::from_shape_fn((1, fx.weights.hidden_size), |(_, j)| {
+            ((j as f32) * 0.013).sin() * 0.5
+        });
+        let backend = larql_compute::CpuBackend;
+        let q4_lm_head: Option<&[u8]> = fx.index.storage.lm_head_q4_view().map(|b| b.as_ref());
+        // vocab=0 — Q4 path is gated by `vocab > 0`; falls back to f32.
+        let _result = lm_head_predict(&mut fx.weights, &h, &fx.tokenizer, &backend, q4_lm_head, 0);
+        // The f32 fallback may produce predictions or empty depending on
+        // tokenizer — what we're verifying is that it doesn't panic.
+    }
+}
+
+#[cfg(test)]
+mod uncached_path_tests {
+    use super::*;
+    use crate::test_utils::Q4KTestFixtures;
+
+    /// Direct call to the legacy O(N²) `generate_via_cpu_q4k_uncached`.
+    /// In production this path only fires for hybrid-MoE or KV-shared
+    /// architectures (where the cached path can't run); for testing,
+    /// call it directly on the dense synthetic fixture to exercise
+    /// the loop without needing a hybrid-MoE arch fixture.
+    #[test]
+    fn generate_via_cpu_q4k_uncached_produces_tokens() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2];
+        let eos = EosConfig::builtin();
+        let result = generate_via_cpu_q4k_uncached(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            3,
+            &fx.index,
+            &eos,
+        );
+        // Either succeeds and produces tokens, or returns a typed
+        // error — both are valid (no panic, no NaN propagation).
+        if let Some(err) = &result.error {
+            panic!("uncached path errored unexpectedly: {err:?}");
+        }
+        assert!(
+            result.prefill_ms > 0.0,
+            "prefill should be measured even on the legacy path"
+        );
+    }
+
+    /// `generate_via_cpu_q4k_uncached` with `max_tokens=1` exercises
+    /// the prefill-only-then-return branch (loop body never runs).
+    #[test]
+    fn generate_via_cpu_q4k_uncached_max_tokens_one_returns_seed_only() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2];
+        let eos = EosConfig::builtin();
+        let result = generate_via_cpu_q4k_uncached(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            1,
+            &fx.index,
+            &eos,
+        );
+        assert!(result.error.is_none(), "expected success");
+        // With max_tokens=1, we emit the seed and skip the decode loop.
+        assert!(result.decode_ms.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod constrained_streaming_tests {
+    use super::*;
+    use crate::test_utils::Q4KTestFixtures;
+
+    /// Cover the body of `generate_constrained_via_cpu_q4k_streaming_sampled`
+    /// (only the `max_tokens=0` short-circuit was previously hit).
+    /// The constrained loop calls into `vindex::generate_q4k_cpu_constrained_streaming_sampled_with_eos`
+    /// which produces token strings — we exercise the wrapper's
+    /// prefill/decode-ms accounting and the empty-output handling.
+    #[test]
+    fn generate_constrained_via_cpu_q4k_streaming_sampled_nonzero_runs() {
+        let mut fx = Q4KTestFixtures::build();
+        let token_ids = vec![1u32, 2];
+        let eos = EosConfig::builtin();
+        // Identity mask — pass logits through unchanged.
+        let mask = |_ids: &[u32], _logits: &mut Vec<f32>| {};
+        let mut emitted: Vec<u32> = Vec::new();
+        let on_tok = |id: u32, _s: &str, _p: f64| emitted.push(id);
+        let sampling = super::super::sampling::SamplingConfig::greedy();
+        let result = generate_constrained_via_cpu_q4k_streaming_sampled(
+            &mut fx.weights,
+            &fx.tokenizer,
+            &token_ids,
+            2,
+            &fx.index,
+            mask,
+            on_tok,
+            sampling,
+            &eos,
+        );
+        // Constrained streaming returns no typed error and either
+        // emits tokens or stops early; we just confirm no panic and
+        // sane timing fields. The Q4K constrained decoder may produce
+        // zero tokens against the synthetic vindex if the masked
+        // logits don't admit any candidate, which is fine — the
+        // wrapper still computes prefill_ms.
+        assert!(result.error.is_none());
+        assert!(result.prefill_ms >= 0.0);
+    }
+}

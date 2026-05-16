@@ -374,7 +374,7 @@ a follow-up cleanup commit.
 **Parity:** Existing snapshot tests on `larql run` must still pass
 byte-for-byte.
 
-### 8.6 Step 6 — surface
+### 8.6 Step 6 — surface ✅ landed (run/walk only; server deferred to ComputeBackend redesign per §10.6)
 
 - Add `--engine` flag to `run_cmd` and `walk_cmd` (parsed by
   `EngineKind::from_name`).
@@ -516,16 +516,27 @@ No change to user-visible default.
 
 ### 10.6 Server / router
 
-**Resolved:** `larql-server` is in scope. The server reads
-`LARQL_KV_ENGINE` and accepts an equivalent flag (TBD: per-request
-header or process-wide env, decided at implementation time). Default
-is `Standard { window_size: None }`. Apollo is **not** wired into the
-server in this unification — the server documents it as bench-only.
+**Revised (2026-05-16):** server wiring is **deferred** until the
+ComputeBackend redesign lands. The original plan to wire
+`LARQL_KV_ENGINE` into the server assumed the server's decode path
+shared a code surface with `larql run`/`larql walk`. It doesn't —
+`larql-server`'s `handle_stream_generate` dispatches through
+`larql_inference::layer_graph::generate_streaming` (the Metal
+layer-graph fast path), not `generate_with_engine` (the CPU KV-cache
+path). Routing the server through `generate_with_engine` would
+silently downgrade GPU decode to CPU, which is a real tok/s
+regression — not acceptable as a default behaviour.
 
-The "first-token factual, not bit-exact" property of Apollo
+The correct fix is to give `KvEngine` a GPU side via a redesigned
+`ComputeBackend` trait, then plumb server decode through the unified
+surface. That work is its own spec
+(`compute-backend-redesign.md`, planned), and step 6's server
+wiring lands as part of it. Until then `larql-server` continues
+using `generate_streaming` directly and ignores `LARQL_KV_ENGINE`.
+
+The Apollo carve-out for the server still applies when wiring
+eventually lands: the "first-token factual, not bit-exact" property
 (`markov-residual-engine.md:393`) is unlikely to meet server SLAs.
-Promotion of Apollo to server happens, if ever, in the follow-up
-spec referenced in §10.3.
 
 ---
 

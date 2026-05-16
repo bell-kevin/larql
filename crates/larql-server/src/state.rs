@@ -26,7 +26,7 @@ pub struct LoadedModel {
     /// Vindex config (index.json).
     pub config: VindexConfig,
     /// Base index with patch overlay (starts with no patches).
-    pub patched: RwLock<PatchedVindex>,
+    pub patched: Arc<RwLock<PatchedVindex>>,
     /// Embeddings matrix + scale factor, loaded once.
     pub embeddings: Array2<f32>,
     pub embed_scale: f32,
@@ -380,7 +380,7 @@ mod loaded_model_tests {
             id: "test".into(),
             path: PathBuf::from("/nonexistent"),
             config: tiny_config(quant),
-            patched: tokio::sync::RwLock::new(patched),
+            patched: std::sync::Arc::new(tokio::sync::RwLock::new(patched)),
             embeddings: Array2::<f32>::zeros((4, hidden)),
             embed_scale: 1.0,
             tokenizer,

@@ -67,6 +67,12 @@ utoipa-swagger-ui = { version = "9", features = ["axum"] }
 tempfile = "3"
 # Integration test wires a real GridServiceImpl alongside the server. Dev-only.
 larql-router = { path = "../larql-router" }
+# Exp 53 ShardService criterion benches.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "shard_query"
+harness = false
 
 [features]
 default = []

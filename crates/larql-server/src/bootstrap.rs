@@ -343,7 +343,7 @@ pub fn load_single_vindex(
         id,
         path,
         config,
-        patched: RwLock::new(patched),
+        patched: Arc::new(RwLock::new(patched)),
         embeddings,
         embed_scale,
         tokenizer,
@@ -973,19 +973,13 @@ pub async fn serve(cli: Cli) -> Result<(), BoxError> {
                 "ShardService: enabled on model {} with tau={tau} (vindex-backed)",
                 model.id
             );
-            // `PatchedVindex` itself isn't `Clone`, but its underlying
-            // `VectorIndex` is (refcount bump on the Arc'd substores).
-            // Build a fresh `PatchedVindex` wrapping a clone of the
-            // model's base — patches added to `model.patched` later
-            // don't propagate to the shard view in v1. The follow-up
-            // is to put `model.patched` behind an `Arc<RwLock<…>>` so
-            // the shard service and the inference path share the same
-            // patch lineage. Matches the "transport-layer port"
-            // framing: prove the wire works, plumb sharing later.
-            let base_clone = model.patched.blocking_read().base.clone();
-            let shard_patched = larql_vindex::PatchedVindex::new(base_clone);
+            // Share the model's live `Arc<RwLock<PatchedVindex>>` —
+            // patches added at runtime via `model.patched.write().await`
+            // are immediately visible to the shard service, and the
+            // shard service sees the same patch lineage the inference
+            // path walks. No snapshot, no clone of the base.
             Some(crate::shard_query::ShardSource::vindex(
-                std::sync::Arc::new(tokio::sync::RwLock::new(shard_patched)),
+                std::sync::Arc::clone(&model.patched),
                 tau,
             ))
         });

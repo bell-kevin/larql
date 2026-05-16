@@ -122,11 +122,36 @@ the call. `best_sim` is reported on hit *and* miss for telemetry /
 threshold tuning.
 
 The server side lives in `crates/larql-server/src/shard_query.rs`
-(handler + `ShardCache`) and is registered when
-`larql-server --grpc-port <P> --shard-query-tau <TAU>` are both set.
-Cache loading from disk is intentionally out of scope here —
-operators seed via in-process helpers until a portable on-disk
-format is specified in a follow-up ADR.
+and is registered when `larql-server --grpc-port <P>
+--shard-query-tau <TAU>` are both set. Two backends share a
+`ShardSource` enum:
+
+- `ShardSource::Vindex` — production. Queries the server's loaded
+  `PatchedVindex` via `gate_knn` + `ffn_row_into`. "Compiled facts"
+  live as vindex patches (`insert_feature` / `set_down_vector`),
+  so the cache piggy-backs on the existing vindex format and
+  there's no separate on-disk artefact to maintain.
+- `ShardSource::Cache` — in-memory fixture used by tests, lets
+  callers exercise the wire path without standing up a full vindex.
+
+End-to-end demo + microbench:
+
+```bash
+# Wire walkthrough — empty / patched / orthogonal / cache paths
+cargo run --release -p larql-server --example shard_query_demo
+
+# In-process ShardSource::lookup hot-path bench
+make bench-shard-query
+```
+
+Latest in-process bench numbers on M3 Max (criterion median):
+`cache_lookup` 2.1 µs at n=16/d=256, 43 µs at n=64/d=1024, 173 µs at
+n=256/d=1024; `vindex_lookup` 3.3 µs / 48 µs / 189 µs at the same
+shapes after the 2026-05-16 `PatchedVindex::gate_knn` optimization
+(O(overrides²) → O(overrides) merge, fast-path skip when no patches
+at the layer). The full gRPC wire path adds ~5–10 ms of tonic
+round-trip on loopback (see the demo output) — dominant cost is the
+transport, not the KNN itself.
 
 ## QUIC transport (opt-in)
 

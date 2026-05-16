@@ -152,7 +152,7 @@ fn make_minimal_model(layer_bands: Option<LayerBands>) -> Arc<LoadedModel> {
             fp4: None,
             ffn_layout: None,
         },
-        patched: tokio::sync::RwLock::new(patched),
+        patched: std::sync::Arc::new(tokio::sync::RwLock::new(patched)),
         embeddings: Array2::<f32>::zeros((4, hidden)),
         embed_scale: 1.0,
         tokenizer,

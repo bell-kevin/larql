@@ -27,19 +27,32 @@ use clap::Args;
 use crate::commands::extraction::walk_cmd;
 use crate::commands::primary::cache;
 
-/// KV cache strategy selector. Picks how the autoregressive decode
-/// stores past-token state.
+/// Legacy `--kv-cache` flag enum. Retained for backward compatibility;
+/// each variant resolves to an `EngineKind` in
+/// `walk_cmd::generate_stream`:
+///
+/// | `--kv-cache` value | `EngineKind` |
+/// |---|---|
+/// | `standard` (default) | `Standard { window_size: None }` |
+/// | `markov-bounded` | `Standard { window_size: Some(--context-window) }` |
+/// | `none` | `NoCache` |
+///
+/// New callers should prefer `--engine SPEC` / `LARQL_KV_ENGINE` instead
+/// — they accept the full engine catalog (MarkovResidual, UnlimitedContext,
+/// TurboQuant, Apollo) not just the three legacy cache strategies.
+/// See `crates/larql-inference/docs/specs/kv-engine-unification.md` §6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvCacheKind {
-    /// Full FP32 K/V per layer, unbounded growth. Correct over any
-    /// context length.
+    /// → `EngineKind::Standard { window_size: None }`. Full FP32 K/V per
+    /// layer, unbounded growth. Correct over any context length.
     Standard,
+    /// → `EngineKind::Standard { window_size: Some(--context-window) }`.
     /// Sliding window — keep only the last `context_window` positions.
-    /// Memory stays O(window). Older tokens drop off the back of
-    /// the cache (StreamingLLM-style).
+    /// Memory stays O(window). Older tokens drop off the back of the
+    /// cache (StreamingLLM-style).
     MarkovBounded,
-    /// No cache — re-run full forward over the growing sequence every
-    /// step. O(N²) wall time. Correctness fallback.
+    /// → `EngineKind::NoCache`. Re-runs full forward over the growing
+    /// sequence every step. O(N²) wall time. Correctness fallback.
     None,
 }
 
@@ -74,7 +87,7 @@ pub struct RunArgs {
     #[arg(short = 'n', long = "max-tokens", default_value = "64")]
     pub max_tokens: usize,
 
-    /// KV cache strategy for autoregressive decode.
+    /// KV cache strategy for autoregressive decode (legacy flag).
     ///
     ///   standard         — Full FP32 K/V, unbounded. Correct over any
     ///                      context length. Memory grows O(context).
@@ -85,9 +98,9 @@ pub struct RunArgs {
     ///                      step (O(N²) total). Useful for correctness
     ///                      checks; unusable for long outputs.
     ///
-    /// See `crates/kv-cache-benchmark/` for the strategy taxonomy and
-    /// roadmap items (turboquant, markov-full) not yet wired to the
-    /// live decode path.
+    /// Each value maps to an `EngineKind` internally (see `KvCacheKind`
+    /// docs). For the full engine catalog (MarkovResidual,
+    /// UnlimitedContext, TurboQuant, Apollo), use `--engine` instead.
     #[arg(long, default_value = "standard", value_parser = parse_kv_cache)]
     pub kv_cache: KvCacheKind,
 
@@ -95,6 +108,24 @@ pub struct RunArgs {
     /// otherwise. `0` = unbounded (same as `standard`).
     #[arg(long, default_value = "0")]
     pub context_window: usize,
+
+    /// KV engine spec, overrides `--kv-cache` when set. Accepts the same
+    /// syntax `larql bench --engine` parses:
+    ///
+    ///   standard                    — production K/V cache (default)
+    ///   standard:window=1024        — sliding-window K/V
+    ///   no-cache                    — full re-forward per step (O(N²))
+    ///   markov-rs[:window=N]        — residual-stream replacement
+    ///   unlimited-context:window=N  — per-window K/V checkpoints
+    ///   turbo-quant[:bits=3|4]      — WHT + Lloyd-Max codec
+    ///   apollo:layer=N,coef=F,top_k=K — boundary-residual injection (bench-only)
+    ///
+    /// Falls back to the `LARQL_KV_ENGINE` env var when unset, and to
+    /// the `--kv-cache` mapping when both are absent. CLI flag wins over
+    /// env var; env var wins over `--kv-cache`. See
+    /// `crates/larql-inference/docs/specs/kv-engine-unification.md`.
+    #[arg(long, value_name = "SPEC")]
+    pub engine: Option<String>,
 
     /// Show the top-K prediction table for each step instead of just
     /// the argmax. Implied by `--verbose`.
@@ -351,6 +382,7 @@ fn build_walk_args(
         max_tokens: args.max_tokens,
         kv_cache: args.kv_cache,
         context_window: args.context_window,
+        engine: args.engine.clone(),
         layers: None,
         predict_top_k: args.top,
         predict: true,

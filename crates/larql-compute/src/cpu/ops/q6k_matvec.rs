@@ -107,6 +107,7 @@ fn q6_subblock_dot_16(ql_sub: &[u8], qh_sub: &[u8], x_sub: &[f32]) -> f32 {
     #[cfg(not(target_arch = "aarch64"))]
     {
         let mut acc = 0.0f32;
+        #[allow(clippy::needless_range_loop)]
         for i in 0..8usize {
             let qi = i * 2;
             let lo_byte = ql_sub[i];
@@ -207,6 +208,11 @@ unsafe fn q6_subblock_dot_16_neon(ql_sub: &[u8], qh_sub: &[u8], x_sub: &[f32]) -
 mod neon_tests {
     use super::*;
 
+    // Reference scalar oracle for the NEON sub-block dot. Indexed
+    // access mirrors the Q6_K layout walk used by the production
+    // kernel; switching to enumerate()/iter() obscures the
+    // sub-block-offset arithmetic that's the point of the test.
+    #[allow(clippy::needless_range_loop)]
     fn scalar_subblock_dot_16(ql_sub: &[u8], qh_sub: &[u8], x_sub: &[f32]) -> f32 {
         let mut acc = 0.0f32;
         for i in 0..8usize {

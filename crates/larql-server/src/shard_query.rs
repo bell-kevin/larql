@@ -889,6 +889,119 @@ mod tests {
         assert!((source.default_tau().await - 0.42).abs() < 1e-6);
     }
 
+    /// Vindex source with a patched gate vector but no down weights
+    /// wired: `gate_knn` returns a high-cosine hit, but
+    /// `ffn_row_into` falls through and returns false because the
+    /// empty base has no down storage to read from. Exercises the
+    /// "matched gate but missing down row → clean miss with best_sim
+    /// preserved for telemetry" branch — the same path a production
+    /// shard would take if an operator inserts gate-only patches.
+    #[tokio::test]
+    async fn vindex_source_reports_miss_when_down_row_unavailable() {
+        use larql_models::TopKEntry;
+        use larql_vindex::{FeatureMeta, PatchedVindex, VectorIndex};
+
+        let base = VectorIndex::new(vec![None], vec![None], 1, 4);
+        let mut patched = PatchedVindex::new(base);
+        let meta = FeatureMeta {
+            top_token: "test".into(),
+            top_token_id: 0,
+            c_score: 1.0,
+            top_k: vec![TopKEntry {
+                token: "test".into(),
+                token_id: 0,
+                logit: 1.0,
+            }],
+        };
+        patched.insert_feature(0, 0, vec![1.0, 0.0, 0.0, 0.0], meta);
+
+        let source = ShardSource::vindex(Arc::new(RwLock::new(patched)), 0.5);
+        let lookup = source.lookup(0, &[1.0, 0.0, 0.0, 0.0], 1, 0.5).await;
+        assert!(lookup.mlp_out.is_none(), "no down storage → miss");
+        // The match still surfaced before the down lookup failed —
+        // best_sim reflects the gate cosine, useful for diagnosing
+        // mis-wired caches.
+        assert!(lookup.best_sim >= 0.99, "got best_sim={}", lookup.best_sim);
+    }
+
+    #[tokio::test]
+    async fn vindex_source_misses_when_below_tau() {
+        use larql_models::TopKEntry;
+        use larql_vindex::{FeatureMeta, PatchedVindex, VectorIndex};
+
+        let base = VectorIndex::new(vec![None], vec![None], 1, 4);
+        let mut patched = PatchedVindex::new(base);
+        let meta = FeatureMeta {
+            top_token: "x".into(),
+            top_token_id: 0,
+            c_score: 1.0,
+            top_k: vec![TopKEntry {
+                token: "x".into(),
+                token_id: 0,
+                logit: 1.0,
+            }],
+        };
+        patched.insert_feature(0, 0, vec![1.0, 0.0, 0.0, 0.0], meta);
+
+        let source = ShardSource::vindex(Arc::new(RwLock::new(patched)), 0.99);
+        // Query orthogonal to the patched gate → best_sim ≈ 0 < tau.
+        let lookup = source.lookup(0, &[0.0, 1.0, 0.0, 0.0], 1, 0.99).await;
+        assert!(lookup.mlp_out.is_none());
+        assert!(lookup.best_sim < 0.99);
+    }
+
+    #[tokio::test]
+    async fn vindex_source_k_gt_one_exercises_weighted_average_path() {
+        use larql_models::TopKEntry;
+        use larql_vindex::{FeatureMeta, PatchedVindex, VectorIndex};
+
+        let base = VectorIndex::new(vec![None], vec![None], 1, 4);
+        let mut patched = PatchedVindex::new(base);
+        let meta = |i: u32| FeatureMeta {
+            top_token: format!("f{i}"),
+            top_token_id: i,
+            c_score: 1.0,
+            top_k: vec![TopKEntry {
+                token: format!("f{i}"),
+                token_id: i,
+                logit: 1.0,
+            }],
+        };
+        patched.insert_feature(0, 0, vec![1.0, 0.0, 0.0, 0.0], meta(0));
+        patched.insert_feature(0, 1, vec![0.0, 1.0, 0.0, 0.0], meta(1));
+
+        let source = ShardSource::vindex(Arc::new(RwLock::new(patched)), 0.3);
+        // Query at 45° hits both features at cos ≈ 0.7071. ffn_row_into
+        // falls through on both (no down storage) → miss. This still
+        // exercises the k > 1 weighted-average branch ahead of the
+        // failing row lookup.
+        let q = [1.0 / 2f32.sqrt(), 1.0 / 2f32.sqrt(), 0.0, 0.0];
+        let lookup = source.lookup(0, &q, 2, 0.3).await;
+        assert!(lookup.mlp_out.is_none());
+        assert!(lookup.best_sim > 0.3);
+    }
+
+    // ── ShardCache::seed_from_normed validation branches ─────────────────────
+
+    #[test]
+    fn seed_from_normed_validates_shape() {
+        let mut cache = ShardCache::new(0.5);
+        let err = cache
+            .seed_from_normed(0, vec![1.0, 0.0], vec![1.0, 0.0, 0.0], 1, 2)
+            .unwrap_err();
+        assert!(matches!(err, CacheError::OutputShape { .. }));
+
+        let err = cache
+            .seed_from_normed(0, vec![1.0, 0.0, 0.0], vec![1.0, 0.0], 1, 2)
+            .unwrap_err();
+        assert!(matches!(err, CacheError::InputShape { .. }));
+
+        let err = cache
+            .seed_from_normed(0, vec![], vec![], 0, 0)
+            .unwrap_err();
+        assert!(matches!(err, CacheError::ZeroDim));
+    }
+
     #[test]
     fn shard_source_constructors_are_callable() {
         let cache = Arc::new(RwLock::new(ShardCache::new(0.5)));

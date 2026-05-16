@@ -480,3 +480,249 @@ pub fn make_starcoder2_test_weights() -> ModelWeights {
         rope_base: 10_000.0,
     }
 }
+
+// ── Q4_K-aware synthetic fixture ─────────────────────────────────────────
+//
+// `make_test_weights` uses hidden=16, below Q4_K's 256-element
+// super-block minimum. The cached / direct-matvec decode paths in
+// `vindex/q4k_forward/cached.rs` require a vindex with real
+// `attn_q4k_layer_data` + `interleaved_q4k_layer_data` manifests,
+// so unit tests for those paths can't fit the tiny fixture. The
+// helpers below build a hidden=256, intermediate=256 Gemma 3-style
+// fixture with synthetic Q4_K bytes that round-trip through
+// `larql_compute::cpu::ops::q4_common::quantize_q4_k`.
+
+/// Hidden dimension for the Q4_K test fixture — minimum Q4_K-safe
+/// multiple of 256.
+pub const Q4K_TEST_HIDDEN: usize = 256;
+/// Intermediate dimension for the Q4_K test fixture.
+pub const Q4K_TEST_INTER: usize = 256;
+/// Vocabulary size for the Q4_K test fixture.
+pub const Q4K_TEST_VOCAB: usize = 256;
+/// Layer count for the Q4_K test fixture.
+pub const Q4K_TEST_NUM_LAYERS: usize = 2;
+
+/// Build a synthetic `ModelWeights` sized to satisfy Q4_K's 256-element
+/// super-block constraint. Uses Gemma 3 architecture so the
+/// `has_post_norms` + `GeluTanh` branches in the cached decode path
+/// are exercised.
+pub fn make_test_q4k_weights() -> ModelWeights {
+    let num_q = 4usize;
+    let num_kv = 2usize;
+    let head_dim = Q4K_TEST_HIDDEN / num_q;
+
+    let arch_json = serde_json::json!({
+        "model_type": "gemma3_text",
+        "hidden_size": Q4K_TEST_HIDDEN,
+        "num_hidden_layers": Q4K_TEST_NUM_LAYERS,
+        "intermediate_size": Q4K_TEST_INTER,
+        "head_dim": head_dim,
+        "num_attention_heads": num_q,
+        "num_key_value_heads": num_kv,
+        "vocab_size": Q4K_TEST_VOCAB,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "rope_theta": 10000.0,
+    });
+    let arch = detect_from_json(&arch_json);
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+    let mut seed = 0xc0ffee_u64;
+    let mut next_seed = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+
+    let embed = rand_mat_seeded(Q4K_TEST_VOCAB, Q4K_TEST_HIDDEN, 0.05, next_seed());
+    let lm_head = embed.clone();
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+
+    vectors.insert(
+        arch.final_norm_key().to_string(),
+        vec![1.0; Q4K_TEST_HIDDEN],
+    );
+
+    let q_dim = num_q * head_dim;
+    let kv_dim = num_kv * head_dim;
+
+    for layer in 0..Q4K_TEST_NUM_LAYERS {
+        tensors.insert(
+            arch.attn_q_key(layer),
+            rand_mat_seeded(q_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_k_key(layer),
+            rand_mat_seeded(kv_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_v_key(layer),
+            rand_mat_seeded(kv_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_o_key(layer),
+            rand_mat_seeded(Q4K_TEST_HIDDEN, q_dim, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_gate_key(layer),
+            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_up_key(layer),
+            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_down_key(layer),
+            rand_mat_seeded(Q4K_TEST_HIDDEN, Q4K_TEST_INTER, 0.05, next_seed()),
+        );
+
+        vectors.insert(arch.input_layernorm_key(layer), vec![0.5; Q4K_TEST_HIDDEN]);
+        vectors.insert(
+            arch.post_attention_layernorm_key(layer),
+            vec![0.5; Q4K_TEST_HIDDEN],
+        );
+        if let Some(k) = arch.pre_feedforward_layernorm_key(layer) {
+            vectors.insert(k, vec![0.5; Q4K_TEST_HIDDEN]);
+        }
+        if let Some(k) = arch.post_feedforward_layernorm_key(layer) {
+            vectors.insert(k, vec![0.5; Q4K_TEST_HIDDEN]);
+        }
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: Q4K_TEST_NUM_LAYERS,
+        hidden_size: Q4K_TEST_HIDDEN,
+        intermediate_size: Q4K_TEST_INTER,
+        vocab_size: Q4K_TEST_VOCAB,
+        head_dim,
+        num_q_heads: num_q,
+        num_kv_heads: num_kv,
+        rope_base: 10_000.0,
+    }
+}
+
+/// Wrap a byte payload in an anonymous read-only mmap. Used to build
+/// in-memory test vindexes without touching the filesystem.
+fn arc_mmap_from_bytes(payload: &[u8]) -> std::sync::Arc<memmap2::Mmap> {
+    let mut anon = memmap2::MmapMut::map_anon(payload.len().max(1)).expect("anon mmap");
+    if !payload.is_empty() {
+        anon.copy_from_slice(payload);
+    }
+    let mmap = anon.make_read_only().expect("freeze");
+    std::sync::Arc::new(mmap)
+}
+
+/// Build a fully-populated synthetic `VectorIndex` that satisfies the
+/// cached + direct-matvec decode contract on the Q4_K weights from
+/// [`make_test_q4k_weights`]. Quantises Q/K/V/O and gate/up/down to
+/// Q4_K bytes via `quantize_q4_k`, installs them as the attn +
+/// interleaved Q4_K storage, and synthesises a Q4_K lm_head view from
+/// the (tied) embeddings.
+pub fn make_test_q4k_vindex(weights: &ModelWeights) -> larql_vindex::VectorIndex {
+    use larql_compute::cpu::ops::q4_common::quantize_q4_k;
+
+    let num_layers = weights.num_layers;
+    let arch = &*weights.arch;
+    let hidden = weights.hidden_size;
+
+    let q4k_for = |key: &str| -> Vec<u8> {
+        let tensor = weights
+            .tensors
+            .get(key)
+            .unwrap_or_else(|| panic!("missing tensor {key} in test weights"));
+        let slice = tensor.as_slice().expect("contiguous row-major");
+        quantize_q4_k(slice)
+    };
+
+    let mut attn_payload: Vec<u8> = Vec::new();
+    let mut attn_manifest: Vec<(usize, usize, String)> = Vec::new();
+    for layer in 0..num_layers {
+        for key in [
+            arch.attn_q_key(layer),
+            arch.attn_k_key(layer),
+            arch.attn_v_key(layer),
+            arch.attn_o_key(layer),
+        ] {
+            let bytes = q4k_for(&key);
+            let offset = attn_payload.len();
+            let length = bytes.len();
+            attn_payload.extend_from_slice(&bytes);
+            attn_manifest.push((offset, length, "Q4_K".to_string()));
+        }
+    }
+
+    let mut ffn_payload: Vec<u8> = Vec::new();
+    let mut ffn_manifest: Vec<(usize, usize, String)> = Vec::new();
+    for layer in 0..num_layers {
+        for key in [
+            arch.ffn_gate_key(layer),
+            arch.ffn_up_key(layer),
+            arch.ffn_down_key(layer),
+        ] {
+            let bytes = q4k_for(&key);
+            let offset = ffn_payload.len();
+            let length = bytes.len();
+            ffn_payload.extend_from_slice(&bytes);
+            ffn_manifest.push((offset, length, "Q4_K".to_string()));
+        }
+    }
+
+    let gate_vectors = vec![None; num_layers];
+    let down_meta = vec![None; num_layers];
+    let mut index = larql_vindex::VectorIndex::new(gate_vectors, down_meta, num_layers, hidden);
+    index.vocab_size = weights.vocab_size;
+
+    let attn_mmap = arc_mmap_from_bytes(&attn_payload);
+    let ffn_mmap = arc_mmap_from_bytes(&ffn_payload);
+    {
+        let storage = std::sync::Arc::make_mut(&mut index.storage);
+        storage.set_attn_q4k(attn_mmap, Some(attn_manifest));
+        storage.set_interleaved_q4k(ffn_mmap, Some(ffn_manifest));
+    }
+
+    // Synth Q4_K lm_head from tied embedding (same lifecycle as
+    // `synthesize_lm_head_q4` on a real tied-embedding vindex).
+    let lm_head_slice = weights
+        .lm_head
+        .as_slice()
+        .expect("lm_head contiguous row-major");
+    let lm_head_q4 = quantize_q4_k(lm_head_slice);
+    let lm_head_mmap = arc_mmap_from_bytes(&lm_head_q4);
+    {
+        let storage = std::sync::Arc::make_mut(&mut index.storage);
+        storage.set_lm_head_q4_mmap(lm_head_mmap);
+    }
+    index
+}
+
+/// Bundled fixture for Q4_K decode-path tests. Mirrors `TestFixtures`.
+pub struct Q4KTestFixtures {
+    pub weights: ModelWeights,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub index: larql_vindex::VectorIndex,
+}
+
+impl Q4KTestFixtures {
+    pub fn build() -> Self {
+        let weights = make_test_q4k_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let index = make_test_q4k_vindex(&weights);
+        Self {
+            weights,
+            tokenizer,
+            index,
+        }
+    }
+}

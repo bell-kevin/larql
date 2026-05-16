@@ -681,12 +681,12 @@ mod tests {
             id: "model".into(),
             path: std::path::PathBuf::from("/nonexistent"),
             config,
-            patched: RwLock::new(PatchedVindex::new(VectorIndex::new(
+            patched: Arc::new(RwLock::new(PatchedVindex::new(VectorIndex::new(
                 vec![Some(gate)],
                 vec![Some(meta)],
                 1,
                 4,
-            ))),
+            )))),
             embeddings,
             embed_scale: 1.0,
             tokenizer: functional_tokenizer(),

@@ -287,6 +287,7 @@ unsafe fn sdot_acc(
 /// kernels (which has the same hints in its hand-asm path).
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
+#[allow(dead_code)] // kept for future re-enablement on harder access patterns; see DIAGNOSIS-2026-05-16-thread-scaling.md
 unsafe fn prefetch_l1_keep(ptr: *const u8) {
     unsafe {
         core::arch::asm!(
@@ -359,14 +360,23 @@ pub fn q4k_q8k_matvec_neon(
             // sum1 = Σ_sb scales[sb] · dot_int(q4_nibbles, q8_y) (i32)
             // sum2 = Σ_sb mins[sb]   ·  Σ q8_y in this sb        (i32)
             //
-            // Per-group accumulators (one i32 slot per group) so the 4
-            // groups have no scalar dependency chain between them —
-            // gives LLVM/OoO the freedom to issue group g+1's loads
-            // and SDOTs while group g's vaddvq + scalar mul retire.
-            // Reduced into `sum1`/`sum2` at the end of the
-            // super-block.
-            let mut sum1_g = [0i32; 4];
-            let mut sum2_g = [0i32; 4];
+            // Vector-running accumulator: keep the i32x4 partial sums
+            // across all 4 groups in `sum1_v`, only horizontal-reduce
+            // once per super-block instead of once per group. Each
+            // group's lo/hi partial dot is scaled (vmulq_n_s32) and
+            // added into `sum1_v` via vector mla. Eliminates the
+            // 4-per-super-block `vaddvq_s32` + scalar mul chain that
+            // forced a forced retire of the prior group's SDOTs.
+            //
+            // Independent SDOT pairs: instead of chaining
+            //   acc = sdot(prev, lo1, y_lo1)
+            // (which serialises on `prev` at 4-cycle latency), issue
+            // both SDOTs into separate destination registers and
+            // combine via vaddq_s32. Drops per-half latency from
+            // 8 cycles → ~5 cycles on M3's OoO scheduler.
+            let zero_v = unsafe { vdupq_n_s32(0) };
+            let mut sum1_v = unsafe { vdupq_n_s32(0) };
+            let mut sum2_acc: i32 = 0;
 
             for g in 0..4 {
                 let sb_lo = 2 * g;
@@ -374,8 +384,7 @@ pub fn q4k_q8k_matvec_neon(
                 // Paired load: 32 nibble bytes in one `ld1.2d` instead
                 // of two `ldr`. Same total bandwidth but a single
                 // pipeline slot and a clearer hint to the memory
-                // subsystem. On M3 Max the LSU's load-pair has lower
-                // dispatch overhead than two independent loads.
+                // subsystem.
                 let nibs_pair = unsafe { vld1q_u8_x2(quants_ptr.add(g * 32)) };
                 let nib0 = nibs_pair.0;
                 let nib1 = nibs_pair.1;
@@ -395,27 +404,31 @@ pub fn q4k_q8k_matvec_neon(
                 let y_hi0 = y_hi_pair.0;
                 let y_hi1 = y_hi_pair.1;
 
-                // Two SDOTs per half cover all 32 lanes; one across-vector
-                // sum collapses each half to scalar i32.
-                let zero = unsafe { vdupq_n_s32(0) };
-                let dlo_acc = unsafe {
-                    let a = sdot_acc(zero, lo0, y_lo0);
-                    sdot_acc(a, lo1, y_lo1)
-                };
-                let dhi_acc = unsafe {
-                    let a = sdot_acc(zero, hi0, y_hi0);
-                    sdot_acc(a, hi1, y_hi1)
-                };
-                let dot_lo = unsafe { vaddvq_s32(dlo_acc) };
-                let dot_hi = unsafe { vaddvq_s32(dhi_acc) };
+                // Independent SDOT pairs: 4 SDOTs into 4 destination
+                // registers (no inter-SDOT data dependency), then sum
+                // pairs with vaddq.
+                let dlo0 = unsafe { sdot_acc(zero_v, lo0, y_lo0) };
+                let dlo1 = unsafe { sdot_acc(zero_v, lo1, y_lo1) };
+                let dhi0 = unsafe { sdot_acc(zero_v, hi0, y_hi0) };
+                let dhi1 = unsafe { sdot_acc(zero_v, hi1, y_hi1) };
+                let dlo_acc = unsafe { vaddq_s32(dlo0, dlo1) };
+                let dhi_acc = unsafe { vaddq_s32(dhi0, dhi1) };
 
-                sum1_g[g] = scales[sb_lo] as i32 * dot_lo + scales[sb_hi] as i32 * dot_hi;
-                sum2_g[g] = mins[sb_lo] as i32 * q8_sums[sb_lo] as i32
+                // Scale and accumulate into running i32x4. The two
+                // vmulq_n_s32 + two vaddq_s32 per group adds ~3 cycles
+                // but saves the forced `vaddvq + scalar mul + scalar
+                // add` chain (which serialised group g+1 behind it).
+                let scaled_lo = unsafe { vmulq_n_s32(dlo_acc, scales[sb_lo] as i32) };
+                let scaled_hi = unsafe { vmulq_n_s32(dhi_acc, scales[sb_hi] as i32) };
+                sum1_v = unsafe { vaddq_s32(sum1_v, vaddq_s32(scaled_lo, scaled_hi)) };
+
+                // `sum2` stays scalar — the input here is the
+                // precomputed Q8_K sums, so no SDOT involved.
+                sum2_acc += mins[sb_lo] as i32 * q8_sums[sb_lo] as i32
                     + mins[sb_hi] as i32 * q8_sums[sb_hi] as i32;
             }
-            let sum1 = sum1_g[0] + sum1_g[1] + sum1_g[2] + sum1_g[3];
-            let sum2 = sum2_g[0] + sum2_g[1] + sum2_g[2] + sum2_g[3];
-            acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2 as f32;
+            let sum1 = unsafe { vaddvq_s32(sum1_v) };
+            acc += d_w * d_y * sum1 as f32 - dmin_w * d_y * sum2_acc as f32;
         }
         *out_slot = acc;
     }

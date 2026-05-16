@@ -265,7 +265,7 @@ fn make_loaded_model(
         id: "test-moe".into(),
         path: PathBuf::from("/nonexistent"),
         config,
-        patched: tokio::sync::RwLock::new(patched),
+        patched: std::sync::Arc::new(tokio::sync::RwLock::new(patched)),
         embeddings: Array2::zeros((VOCAB, HIDDEN)),
         embed_scale: 1.0,
         tokenizer,

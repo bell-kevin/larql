@@ -2291,6 +2291,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "clap",
+ "criterion",
  "futures",
  "half",
  "larql-compute",

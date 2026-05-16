@@ -139,6 +139,9 @@ impl PatchedVindex {
                 }
             }
         }
+        // Any op in the patch may have touched `overrides_gate`; one
+        // invalidation per patch is cheaper than per-op invalidation.
+        self.invalidate_gate_cache();
         self.patches.push(patch);
     }
 
@@ -156,6 +159,7 @@ impl PatchedVindex {
         self.overrides_gate.clear();
         self.deleted.clear();
         self.knn_store = super::knn_store::KnnStore::default();
+        self.invalidate_gate_cache();
         let patches: Vec<VindexPatch> = self.patches.drain(..).collect();
         for patch in patches {
             self.apply_patch(patch);

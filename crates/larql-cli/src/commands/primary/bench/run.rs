@@ -181,7 +181,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                         )?);
                     }
                     None => eprintln!(
-                        "unknown engine {:?} — supported: markov-rs, unlimited-context",
+                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
                         engine_name
                     ),
                 }
@@ -217,7 +217,7 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                         )?);
                     }
                     None => eprintln!(
-                        "unknown engine {:?} — supported: markov-rs, unlimited-context",
+                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
                         engine_name
                     ),
                 }
@@ -365,15 +365,17 @@ fn configure_rayon_threads(threads_arg: usize) {
 /// Pick a sensible default thread count when the user hasn't set one.
 /// Returns 0 to fall through to rayon's own default on unknown CPUs.
 fn auto_default_threads() -> usize {
+    // Apple silicon: 8 threads is the empirical optimum for the
+    // Q4_K × Q8_K matvec on M3 Max LPDDR5. Confirmed across the
+    // 12-P-core M3 Max (best 24.6 tok/s) — see thread-scaling
+    // diagnosis doc. M1/M2/M4 are likely similar but unverified;
+    // user can override with `--threads`.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
     {
-        // Apple silicon: 8 threads is the empirical optimum for the
-        // Q4_K × Q8_K matvec on M3 Max LPDDR5. Confirmed across the
-        // 12-P-core M3 Max (best 24.6 tok/s) — see thread-scaling
-        // diagnosis doc. M1/M2/M4 are likely similar but unverified;
-        // user can override with `--threads`.
-        return 8;
+        8
     }
     #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
-    0
+    {
+        0
+    }
 }
