@@ -39,6 +39,11 @@ pub struct ServerEntry {
     /// Shard-scoped request rate (requests/sec) from the most recent
     /// heartbeat. Drives the hot-shard rebalancer tick.
     pub req_per_sec: f32,
+    /// Active-probe wire RTT in ms (router → server). Populated by the
+    /// optional probe loop spawned when `--rtt-probe-interval-secs > 0`.
+    /// `None` until the first probe completes. Used by `route()` as a
+    /// tie-breaker when no GT3 per-layer latency data is available yet.
+    pub rtt_ms: Option<f32>,
 }
 
 // ── Mode B: available server entry ───────────────────────────────────────────

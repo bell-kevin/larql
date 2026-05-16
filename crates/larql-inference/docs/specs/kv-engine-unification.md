@@ -1,6 +1,6 @@
 # KV Engine Unification — Specification
 
-**Status:** Implementation in progress (steps 1-5 of 7 landed; step 6 — surface — pending).
+**Status:** All 7 steps landed (2026-05-16). Step 6 ships run/walk only; server wiring deferred to the ComputeBackend redesign (§10.6). Step 7 cleanup is partial-by-design: `KvCacheKind` and `generate_cached_backend` are intentionally retained (see §8.7).
 **Audience:** LARQL contributors.
 **Scope:** Replace the parallel "live decode cache" and "research KV engine"
 code paths with a single `KvEngine`-based dispatch, so `larql run` / `larql
@@ -389,15 +389,28 @@ byte-for-byte.
   UnlimitedContext / TurboQuant opt-in; Apollo bench-only".
 - Update bench help text (§6.3).
 
-### 8.7 Step 7 — cleanup
+### 8.7 Step 7 — cleanup ✅ landed (partial-by-design, 2026-05-16)
 
-- Delete `KvCacheKind` if all call sites can move to `EngineKind`.
-  Leave it if backward-compat on the `--kv-cache` flag earns its keep.
-- Delete `generate_cached_backend` wrapper (its body now lives in
-  `StandardEngine`).
-- Audit `larql-inference/Cargo.toml:104` — `larql-kv` is now a live
-  dep (consumed by the dispatch code path). Confirm and remove any
-  stale doc comments around it.
+- **`KvCacheKind` retained** (`larql-cli/src/commands/primary/run_cmd.rs:45`).
+  Backward-compat on the `--kv-cache` flag earns its keep — `--kv-cache
+  standard|markov-bounded|none` continues to parse and resolve to
+  `EngineKind` via the table in §6.1.
+- **`generate_cached_backend` retained as parity oracle**
+  (`larql-inference/src/forward/kv_generate.rs:69`). Step 4's
+  bit-parity gate (`larql-kv/src/engines/standard.rs:264`) and the
+  legacy arm of `engine_decode.rs` bench measure new engine dispatch
+  against it. Deleting the wrapper would erase the reference
+  implementation that future engines' bit-parity claims are validated
+  against. Kept on purpose; not a TODO.
+- **`larql-inference` → `larql-kv` dep is dev-only**
+  (`larql-inference/Cargo.toml:104` under `[dev-dependencies]`). The
+  spec originally predicted this would become a live dep "consumed by
+  the dispatch code path"; what landed is cleaner. `larql-cli` bridges
+  `larql-kv` (builds engines via `EngineKind::build`) and
+  `larql-inference` (calls `generate_with_engine`), so
+  `larql-inference` core code never names `larql-kv`. The only
+  remaining consumer in `larql-inference/` is
+  `examples/apollo_rd_backend.rs`, which justifies the dev-dep.
 
 ### 8.8 Rollback
 

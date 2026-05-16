@@ -146,10 +146,12 @@ pub use ::metal::Buffer as MetalBuffer;
 pub fn default_backend() -> Box<dyn ComputeBackend> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        return default_backend_from_optional_metal(metal::MetalBackend::new());
+        default_backend_from_optional_metal(metal::MetalBackend::new())
     }
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
-    Box::new(cpu::CpuBackend)
+    {
+        Box::new(cpu::CpuBackend)
+    }
 }
 
 /// Internal seam for [`default_backend`]: takes a pre-constructed
