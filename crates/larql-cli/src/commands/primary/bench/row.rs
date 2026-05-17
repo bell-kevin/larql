@@ -164,7 +164,6 @@ mod tests {
             lm_head_ms_total: 1.75,
             detok_ms_total: 0.012,
             dequant_ms_total: 0.0,
-            ..Default::default()
         };
         let j: BenchJsonStages = s.into();
         assert!((j.embed_ms - 1.0).abs() < 1e-9);

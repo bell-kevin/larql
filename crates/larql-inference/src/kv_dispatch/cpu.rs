@@ -639,4 +639,133 @@ mod tests {
             "expected panic when foreign handle passed to CpuBackend"
         );
     }
+
+    /// `cpu_handle_mut` panics when handed a foreign handle. The
+    /// `read_kv_to_host` test above checks the immutable variant via
+    /// `cpu_handle`; this exercises the `_mut` panic body at L117-118.
+    #[test]
+    fn cpu_handle_mut_panics_on_foreign_handle() {
+        struct FakeHandle;
+        impl KvHandleInner for FakeHandle {
+            fn cached_len(&self) -> usize {
+                0
+            }
+            fn kv_dim(&self) -> usize {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "fake"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+        let backend = backend();
+        let mut fake = KvHandle::new(FakeHandle);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // `append_kv` goes through `cpu_handle_mut`.
+            backend.append_kv(&mut fake, &[0.0; 4], &[0.0; 4], 0);
+        }));
+        assert!(
+            result.is_err(),
+            "expected panic on cross-backend mut handle"
+        );
+    }
+
+    /// `cpu_residual` panics when handed a foreign residual handle —
+    /// covers the panic body at L154-155, 158.
+    #[test]
+    fn cpu_residual_panics_on_foreign_handle() {
+        struct FakeResidual;
+        impl ResidualHandleInner for FakeResidual {
+            fn shape(&self) -> (usize, usize) {
+                (0, 0)
+            }
+            fn backend_name(&self) -> &'static str {
+                "fake-residual"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let backend = backend();
+        // Build a synthetic ModelWeights through the existing helper, just
+        // enough that `forward_from_layer` reaches the residual downcast
+        // before noticing anything else.
+        let fake = ResidualHandle::new(FakeResidual);
+        let weights = make_test_weights();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            backend.forward_from_layer(&weights, 0, &fake, &[0u32]);
+        }));
+        assert!(
+            result.is_err(),
+            "expected panic on cross-backend residual handle"
+        );
+    }
+
+    /// `CpuQ4kCacheHandle` getters return the K-row's cached length and
+    /// kv_dim from the first populated layer entry; both return 0 when
+    /// the cache is empty. Covers L178-206.
+    #[test]
+    fn cpu_q4k_cache_handle_getters() {
+        let empty = CpuQ4kCacheHandle {
+            cache: vec![None; 3],
+        };
+        assert_eq!(empty.cached_len(), 0);
+        assert_eq!(empty.kv_dim(), 0);
+        assert_eq!(empty.backend_name(), "cpu-q4k");
+
+        // Populate layer 1 with a (K, V) pair shaped [seq=5, kv=8].
+        let k = Array2::<f32>::zeros((5, 8));
+        let v = Array2::<f32>::zeros((5, 8));
+        let mut populated = CpuQ4kCacheHandle {
+            cache: vec![None, Some((k, v)), None],
+        };
+        assert_eq!(populated.cached_len(), 5);
+        assert_eq!(populated.kv_dim(), 8);
+        // `as_any` / `as_any_mut` are downcast-roundtrip — covers L200-206.
+        assert!(populated
+            .as_any()
+            .downcast_ref::<CpuQ4kCacheHandle>()
+            .is_some());
+        assert!(populated
+            .as_any_mut()
+            .downcast_mut::<CpuQ4kCacheHandle>()
+            .is_some());
+    }
+
+    /// `cpu_q4k_cache_mut` panics when handed a foreign handle —
+    /// covers the L209-221 downcast guard.
+    #[test]
+    fn cpu_q4k_cache_mut_panics_on_foreign_handle() {
+        struct FakeHandle;
+        impl KvHandleInner for FakeHandle {
+            fn cached_len(&self) -> usize {
+                0
+            }
+            fn kv_dim(&self) -> usize {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "fake"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
+        }
+        let mut fake = KvHandle::new(FakeHandle);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::cpu_q4k_cache_mut(&mut fake);
+        }));
+        assert!(
+            result.is_err(),
+            "expected panic on cross-backend Q4K cache handle"
+        );
+    }
 }

@@ -14,7 +14,6 @@
     "crates/larql-server/src/routes/walk_ffn/core.rs",
     "crates/larql-server/src/routes/walk_ffn/q8k.rs",
     "crates/larql-server/src/routes/openai/chat.rs",
-    "crates/larql-server/src/routes/openai/completions.rs",
     "crates/larql-server/src/routes/expert/batch_legacy.rs",
     "crates/larql-server/src/routes/expert/cpu.rs",
     "crates/larql-server/src/routes/expert/layer_batch.rs",
@@ -32,6 +31,7 @@
     "crates/larql-server/src/routes/openai/schema/fsm.rs": 85.6,
     "crates/larql-server/src/routes/openai/schema/tools.rs": 88.2,
     "crates/larql-server/src/routes/topology.rs": 60.6,
+    "crates/larql-server/src/routes/openai/completions.rs": 86.0,
     "crates/larql-server/src/routes/walk_ffn/handler.rs": 86.0,
     "crates/larql-server/src/routes/warmup.rs": 84.0
   }
