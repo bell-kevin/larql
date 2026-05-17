@@ -217,9 +217,11 @@ pub fn load_model_weights_kquant_shard(
         }
     }
 
-    // lm_head_q4.bin (Q4_K of the output projection) — dequant to f32. If
+    // k-quant LM head (Q4_K of the output projection) — dequant to f32.
+    // Resolves the new `lm_head_kquant.bin` first; falls back to the
+    // legacy `lm_head_q4.bin` for vindexes built before the rename. If
     // absent (tied embeddings), fall back to embed.clone() below.
-    let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
+    let lm_q4_path = crate::format::filenames::resolve_lm_head_kquant(dir).bin;
     if lm_q4_path.exists() {
         let bytes = std::fs::read(&lm_q4_path)?;
         let num_floats = config.vocab_size * config.hidden_size;

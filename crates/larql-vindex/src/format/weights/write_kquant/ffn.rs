@@ -30,7 +30,7 @@ pub(super) fn write_interleaved_ffn_kquant(
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
-    let ff_path = dir.join(INTERLEAVED_Q4K_BIN);
+    let ff_path = dir.join(INTERLEAVED_KQUANT_BIN);
     let mut ff_file = BufWriter::new(std::fs::File::create(&ff_path)?);
     let mut ff_offset: u64 = 0;
     let mut ff_manifest: Vec<Q4kManifestEntry> = Vec::with_capacity(num_layers * 3);
@@ -44,7 +44,7 @@ pub(super) fn write_interleaved_ffn_kquant(
     // extracts pay nothing.
     let mut fm_state: Option<FeatureMajorDownState> = if opts.feature_major_down {
         Some(FeatureMajorDownState::new(
-            &dir.join(DOWN_FEATURES_Q4K_BIN),
+            &dir.join(DOWN_FEATURES_KQUANT_BIN),
             num_layers,
         )?)
     } else {
@@ -108,10 +108,10 @@ pub(super) fn write_interleaved_ffn_kquant(
 
     let ff_manifest_json = serde_json::to_string_pretty(&ff_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join(INTERLEAVED_Q4K_MANIFEST_JSON), ff_manifest_json)?;
+    std::fs::write(dir.join(INTERLEAVED_KQUANT_MANIFEST_JSON), ff_manifest_json)?;
 
     if let Some(state) = fm_state.take() {
-        state.finalize(&dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON))?;
+        state.finalize(&dir.join(DOWN_FEATURES_KQUANT_MANIFEST_JSON))?;
     }
     Ok(())
 }

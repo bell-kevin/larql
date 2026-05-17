@@ -66,8 +66,8 @@
       "description": "Storage precision for non-quantised float tensors."
     },
     "quant": {
-      "enum": ["none", "q4k"],
-      "description": "Quant scheme for FFN weight files. Closed enum in v1."
+      "enum": ["none", "q4k", "kquant"],
+      "description": "Quant scheme for FFN weight files. v1 readers accept either `q4k` or `kquant` (the post-rename canonical tag); v1 writers continue to emit `q4k` so vindexes published before the rename keep their wire format. A v2 schema will flip the writer to `kquant`."
     },
     "layers": {
       "type": "array",

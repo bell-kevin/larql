@@ -523,15 +523,18 @@ mod tests {
     fn attn_matches_quant_variants() {
         assert!(Part::Attn.matches(ATTN_WEIGHTS_BIN));
         assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4_BIN));
-        assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_BIN));
-        assert!(Part::Attn.matches(ATTN_WEIGHTS_Q4K_MANIFEST_JSON));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_KQUANT_BIN));
+        assert!(Part::Attn.matches(ATTN_WEIGHTS_KQUANT_MANIFEST_JSON));
+        assert!(Part::Attn.matches(LEGACY_ATTN_WEIGHTS_Q4K_BIN));
+        assert!(Part::Attn.matches(LEGACY_ATTN_WEIGHTS_Q4K_MANIFEST_JSON));
         assert!(!Part::Attn.matches(GATE_VECTORS_BIN));
     }
 
     #[test]
     fn ffn_matches_interleaved_and_hidden_major() {
         assert!(Part::Ffn.matches(INTERLEAVED_BIN));
-        assert!(Part::Ffn.matches(INTERLEAVED_Q4K_BIN));
+        assert!(Part::Ffn.matches(INTERLEAVED_KQUANT_BIN));
+        assert!(Part::Ffn.matches(LEGACY_INTERLEAVED_Q4K_BIN));
         assert!(Part::Ffn.matches("up_weights.bin"));
         assert!(Part::Ffn.matches(DOWN_FEATURES_BIN));
         // Gate vectors are their own part even though they share the FFN role.

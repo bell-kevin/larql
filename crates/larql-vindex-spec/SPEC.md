@@ -51,7 +51,7 @@ Lives at the vindex root. Top-level fields:
 | `embed_scale` | f32 | yes | Embedding scaling factor. |
 | `extract_level` | enum | yes | `browse` < `attention` < `inference` < `all`. See §4. |
 | `dtype` | enum | yes | `f32` or `f16`. See §5. |
-| `quant` | enum | yes | `none` or `q4k`. See §6. |
+| `quant` | enum | yes | `none`, `q4k`, or `kquant`. See §6. |
 | `layers` | array | yes | Per-layer offset table — see §7. |
 | `down_top_k` | u32 | yes | K used at runtime for top-K gate-feature lookup. |
 | `has_model_weights` | bool | yes | Whether full weight tensors (not just gate vectors) are present. |
@@ -108,12 +108,30 @@ weights are governed by `quant`; everything else by `dtype`.
 
 ## 6. Quant format (`quant`)
 
-Quant scheme for FFN weight files. Closed enum in v1:
+Quant scheme for FFN weight files. v1 enum:
 
 | Value | Notes |
 |---|---|
 | `none` | Float storage controlled by `dtype`. |
-| `q4k` | Q4_K / Q6_K blocks in `interleaved_q4k.bin` and `attn_weights_q4k.bin`. |
+| `q4k` | Q4_K / Q6_K family — the v1 canonical tag. Writers emit this for v1 vindexes. |
+| `kquant` | Same Q4_K / Q6_K family as `q4k`; the post-rename canonical tag. Readers MUST accept it as an alias of `q4k`. A future v2 schema bump flips writers to emit `kquant` by default. |
+
+Filename convention (set by the Rust constants in
+`larql_vindex::format::filenames`):
+
+- New canonical: `interleaved_kquant.bin`,
+  `attn_weights_kquant.bin`, `lm_head_kquant.bin`,
+  `down_features_kquant.bin` (each paired with a
+  `*_manifest.json` sidecar where applicable). Writers emit these.
+- Legacy: `interleaved_q4k.bin`, `attn_weights_q4k.bin`,
+  `lm_head_q4.bin`, `down_features_q4k.bin`. Readers MUST accept
+  these as the read-only fallback; writers no longer emit them.
+
+The dual-naming is the on-disk counterpart of the `q4k` / `kquant`
+enum alias: both names describe the same k-quant family of block
+formats (Q4_K plus Q6_K mixed for the FFN down projection by
+default). A vindex extracted with a pre-rename binary keeps loading
+under post-rename readers without re-extraction.
 
 FP4 storage is governed by a separate `fp4` loader field (see §11);
 the spec doesn't model its internal config, but FP4 vindexes still
@@ -128,12 +146,12 @@ vindexes carry optional `num_experts` + `num_features_per_expert`.
 ```jsonc
 // Single-file (typical):
 { "layer": 0, "num_features": 10240,
-  "file": "interleaved_q4k.bin", "offset": 0, "length": 52428800 }
+  "file": "interleaved_kquant.bin", "offset": 0, "length": 52428800 }
 
 // Sharded (only when the underlying file exceeds MAX_SHARD_BYTES):
 { "layer": 0, "num_features": 10240,
   "shards": [
-    { "file": "interleaved_q4k-00001-of-00003.bin", "offset": 0, "length": 52428800 }
+    { "file": "interleaved_kquant-00001-of-00003.bin", "offset": 0, "length": 52428800 }
   ] }
 
 // MoE (optional fields):
@@ -182,12 +200,13 @@ from `(quant, dtype)`:
 
 | `quant` | `dtype` | `cosine_min` | `max_diff` |
 |---|---|---|---|
-| `q4k` | (any) | 0.995 | 0.05 |
+| `q4k` / `kquant` | (any) | 0.995 | 0.05 |
 | `none` | `f16` | 0.9999 | 0.01 |
 | `none` | `f32` | 0.99999 | 0.001 |
 
-When `quant == q4k` the quant dominates loss and the dtype is
-ignored.
+The two k-quant tags share thresholds because they describe the same
+on-disk format family. When `quant` is either tag the quant
+dominates loss and the dtype is ignored.
 
 Sampled layers: `[0, L/4, L/2, 3L/4, L-1]` — five reads (deduped for
 shallow models), deterministic, cheap even on 31B-class models.
@@ -227,7 +246,7 @@ library_name: larql
 tags:
   - vindex
   - vindex-v1
-  - vindex-q4k                 # mirrors quant value
+  - vindex-q4k                 # mirrors quant value (legacy alias `vindex-kquant` also accepted)
   - vindex-extract-inference   # mirrors extract_level
 vindex_spec_version: 1
 pipeline_tag: text-generation

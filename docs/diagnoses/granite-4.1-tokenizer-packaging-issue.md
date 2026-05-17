@@ -145,15 +145,17 @@ against that regex. The two files have to agree.
 
 ## Affected repos
 
-Confirmed empirically:
-- [ ] `ibm-granite/granite-4.1-3b`
+Confirmed empirically (cl100k regex in `tokenizer.json` +
+`GPT2Tokenizer` declared in `tokenizer_config.json`):
+- [x] `ibm-granite/granite-4.1-3b`
+- [x] `ibm-granite/granite-4.1-8b`
+- [x] `ibm-granite/granite-4.1-30b`
 
 Inferred (same `tokenizer_config.json` / `tokenizer.json` packaging
-pattern in the same collection — please verify with the snippet above):
+pattern shared with the chat-tuned variant — please verify with the
+snippet above):
 - [ ] `ibm-granite/granite-4.1-3b-base`
-- [ ] `ibm-granite/granite-4.1-8b`
 - [ ] `ibm-granite/granite-4.1-8b-base`
-- [ ] `ibm-granite/granite-4.1-30b`
 - [ ] `ibm-granite/granite-4.1-30b-base`
 
 (`ibm-granite/granite-4.0-micro` and the 3.x family use the same

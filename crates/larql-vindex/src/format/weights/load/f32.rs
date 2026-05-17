@@ -200,7 +200,7 @@ pub fn load_model_weights_with_opts(
     // final logits projection. Falls through to embed-tied derivation below
     // if the file is absent (or dequantisation fails).
     if lm_head_loaded.is_none() && !opts.skip_lm_head {
-        let lm_q4_path = dir.join(LM_HEAD_Q4_BIN);
+        let lm_q4_path = crate::format::filenames::resolve_lm_head_kquant(dir).bin;
         if lm_q4_path.exists() {
             if let Some(model_cfg) = config.model_config.as_ref() {
                 // lm_head shape is (vocab_size, hidden_size) — same as embed.

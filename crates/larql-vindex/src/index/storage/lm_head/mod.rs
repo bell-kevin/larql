@@ -263,7 +263,7 @@ mod tests {
         let payload = vec![0u8; bytes];
 
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_KQUANT_BIN), &payload).unwrap();
 
         // Build a minimal index — vocab_size starts at 0.
         let mut index = VectorIndex::empty(1, hidden);
@@ -285,7 +285,7 @@ mod tests {
         let bytes = 256 * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
         let payload = vec![0u8; bytes];
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_KQUANT_BIN), &payload).unwrap();
 
         let mut index = VectorIndex::empty(1, hidden);
         index.vocab_size = 999; // pretend index.json already set this
@@ -300,7 +300,7 @@ mod tests {
     fn load_lm_head_q4_skips_vocab_inference_when_hidden_size_zero() {
         let payload = vec![0u8; 100];
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), &payload).unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_KQUANT_BIN), &payload).unwrap();
 
         let mut index = VectorIndex::empty(1, 0);
         index.load_lm_head_kquant(tmp.path()).unwrap();
@@ -489,7 +489,7 @@ mod tests {
         let bytes = vocab * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
 
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), vec![0u8; bytes]).unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_KQUANT_BIN), vec![0u8; bytes]).unwrap();
 
         // Manifest claims lm_head is f16 — incompatible with Q4_K dispatch.
         let manifest = serde_json::json!([{
@@ -528,7 +528,7 @@ mod tests {
         let bytes = vocab * hidden * Q4_BYTES_PER_ELEM_NUM / Q4_BYTES_PER_ELEM_DEN;
 
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join(LM_HEAD_Q4_BIN), vec![0u8; bytes]).unwrap();
+        std::fs::write(tmp.path().join(LM_HEAD_KQUANT_BIN), vec![0u8; bytes]).unwrap();
 
         let manifest = serde_json::json!([{
             "key": "lm_head.weight",

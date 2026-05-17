@@ -5,7 +5,8 @@ use super::cpu::{
 };
 use super::eos::EosConfig;
 use super::gpu_setup::{
-    build_gpu_decode_setup, ensure_prompt_fits, prefill_kquant_prompt, reset_and_preallocate_kv_cache,
+    build_gpu_decode_setup, ensure_prompt_fits, prefill_kquant_prompt,
+    reset_and_preallocate_kv_cache,
 };
 use super::lm_head::pick_next_token_masked_sampled;
 use super::sampling::{Sampler, SamplingConfig};

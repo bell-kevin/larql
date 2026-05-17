@@ -436,11 +436,11 @@ fn q4k_feature_major_down_round_trip() {
 
     // ── Files emitted ──
     assert!(
-        dst_dir.join(DOWN_FEATURES_Q4K_BIN).exists(),
+        dst_dir.join(DOWN_FEATURES_KQUANT_BIN).exists(),
         "down_features_q4k.bin must be emitted when feature_major_down=true"
     );
     assert!(
-        dst_dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON).exists(),
+        dst_dir.join(DOWN_FEATURES_KQUANT_MANIFEST_JSON).exists(),
         "down_features_q4k_manifest.json must be emitted alongside it"
     );
 

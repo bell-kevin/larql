@@ -24,7 +24,7 @@ pub(super) fn write_lm_head_kquant(
     if let Some((data, rows, cols)) = source.lm_head() {
         let (padded, padded_cols) = pad_rows_to_block(&data, rows, cols);
         let q_bytes = quantize_q4_k(&padded);
-        std::fs::write(dir.join(LM_HEAD_Q4_BIN), &q_bytes)?;
+        std::fs::write(dir.join(LM_HEAD_KQUANT_BIN), &q_bytes)?;
         // Record in norms manifest so a single weight_manifest.json references
         // everything non-quantised-via-layout. Shape records the stored
         // `padded_cols` — callers route through the matvec dispatch which
@@ -36,7 +36,7 @@ pub(super) fn write_lm_head_kquant(
             shape: vec![rows, padded_cols],
             offset: 0,
             length: q_bytes.len() as u64,
-            file: LM_HEAD_Q4_BIN.into(),
+            file: LM_HEAD_KQUANT_BIN.into(),
         });
     }
     Ok(())

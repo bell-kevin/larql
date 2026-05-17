@@ -194,14 +194,21 @@ pub enum StorageDtype {
 }
 
 /// Quant scheme for FFN weight files. Mirrors larql-vindex's
-/// `config::quantization::QuantFormat`. Closed enum in v1.
+/// `config::quantization::QuantFormat`. The v1 schema's `quant` enum
+/// accepts `"none"`, `"q4k"`, and `"kquant"` — the latter two both map
+/// to [`QuantFormat::Kquant`] (Q4_K / Q6_K family). Writers continue to
+/// emit `"q4k"` so v1 vindexes published by old binaries keep their
+/// wire format; a v2 schema (separate change) will flip the canonical
+/// tag to `"kquant"`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuantFormat {
     /// Float storage controlled by [`StorageDtype`].
     None,
     /// Q4_K / Q6_K blocks in `interleaved_kquant.bin` /
-    /// `attn_weights_q4k.bin`.
+    /// `attn_weights_kquant.bin` (or legacy `*_q4k` filenames). Accepts
+    /// both `"q4k"` (default Serialize) and `"kquant"` on Deserialize.
+    #[serde(alias = "kquant")]
     Q4K,
 }
 
@@ -503,9 +510,23 @@ mod tests {
     fn quant_format_serialises_lowercase() {
         let m = sample_manifest();
         let json = serde_json::to_string(&m).unwrap();
-        // QuantFormat::Q4K → "q4k", matches the existing larql-vindex
-        // serde tag.
+        // v1 wire-format contract: writers emit `"q4k"`. Readers also
+        // accept `"kquant"` via the deserialize alias — see the next
+        // test. Flip this assertion only when v2 lands.
         assert!(json.contains("\"quant\":\"q4k\""));
+    }
+
+    #[test]
+    fn quant_format_deserialize_accepts_kquant_alias() {
+        // Forward-compat: a v1 reader must accept manifests written
+        // under the future canonical tag `"kquant"`.
+        let json = "{\"quant\":\"kquant\"}";
+        #[derive(Deserialize)]
+        struct OnlyQuant {
+            quant: QuantFormat,
+        }
+        let q: OnlyQuant = serde_json::from_str(json).unwrap();
+        assert_eq!(q.quant, QuantFormat::Q4K);
     }
 
     #[test]

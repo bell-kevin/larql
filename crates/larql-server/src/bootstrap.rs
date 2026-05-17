@@ -232,14 +232,14 @@ pub fn load_single_vindex(
             if path.join(LM_HEAD_BIN).is_file() {
                 let _ = index.load_lm_head(&path);
             }
-            if path.join(LM_HEAD_Q4_BIN).is_file() {
+            if has_kquant_lm_head(&path) {
                 let _ = index.load_lm_head_kquant(&path);
             }
-            if path.join(ATTN_WEIGHTS_Q4K_BIN).is_file() {
+            if has_kquant_attn_weights(&path) {
                 if let Err(e) = index.load_attn_kquant(&path) {
-                    warn!("  Attn Q4K: failed to load ({e}) — generation may not work");
+                    warn!("  Attn k-quant: failed to load ({e}) — generation may not work");
                 } else {
-                    info!("  Attn Q4K: loaded (inference path enabled)");
+                    info!("  Attn k-quant: loaded (inference path enabled)");
                 }
             } else if path.join(ATTN_WEIGHTS_Q8_BIN).is_file() {
                 if let Err(e) = index.load_attn_q8(&path) {
@@ -248,11 +248,11 @@ pub fn load_single_vindex(
             }
         }
         if need_ffn_mmap {
-            if path.join(INTERLEAVED_Q4K_BIN).is_file() {
+            if has_kquant_interleaved(&path) {
                 if let Err(e) = index.load_interleaved_kquant(&path) {
-                    warn!("  Interleaved Q4K: failed to load ({e})");
+                    warn!("  Interleaved k-quant: failed to load ({e})");
                 } else if opts.ffn_only {
-                    info!("  Interleaved Q4K: loaded (ffn-service)");
+                    info!("  Interleaved k-quant: loaded (ffn-service)");
                 }
             } else if path.join(INTERLEAVED_Q4_BIN).is_file() {
                 if let Err(e) = index.load_interleaved_q4(&path) {

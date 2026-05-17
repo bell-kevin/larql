@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use crate::error::VindexError;
 use crate::format::filenames::{
-    DOWN_FEATURES_Q4K_BIN, DOWN_FEATURES_Q4K_MANIFEST_JSON, INTERLEAVED_Q4K_BIN,
-    INTERLEAVED_Q4K_MANIFEST_JSON,
+    resolve_down_features_kquant, resolve_interleaved_kquant, INTERLEAVED_KQUANT_BIN,
+    LEGACY_INTERLEAVED_Q4K_BIN,
 };
 use crate::format::weights::Q4kManifestEntry;
 use crate::index::core::VectorIndex;
@@ -62,23 +62,31 @@ impl VectorIndex {
     /// vindexes from `build_q4k_weights.rs` — callers fall back to the legacy
     /// uniform-stride path.
     pub fn load_interleaved_kquant(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(INTERLEAVED_Q4K_BIN);
+        let resolved = resolve_interleaved_kquant(dir);
+        let path = resolved.bin;
         if !path.exists() {
-            return Err(VindexError::Parse(
-                "interleaved_kquant.bin not found".into(),
-            ));
+            return Err(VindexError::Parse(format!(
+                "interleaved k-quant FFN not found (looked for {} and legacy {})",
+                INTERLEAVED_KQUANT_BIN, LEGACY_INTERLEAVED_Q4K_BIN
+            )));
         }
         let file = std::fs::File::open(&path)?;
-        // Demand-paged: the q4k forward walk reads only the activated features'
-        // byte ranges per layer, not the entire 13 GB file.
+        // Demand-paged: the kquant forward walk reads only the activated
+        // features' byte ranges per layer, not the entire 13 GB file.
         let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
-        let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
+        let manifest_path = resolved
+            .manifest
+            .expect("interleaved kquant resolver always pairs a manifest");
+        let display_name = manifest_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("interleaved kquant manifest");
         let manifest = if manifest_path.exists() {
             // Typed deserialise — `Q4kManifestEntry` matches the writer's
             // shape, so a renamed field on either side fails loudly here
             // instead of silently producing zero-byte slices.
-            let raw = read_q4k_manifest(&manifest_path, INTERLEAVED_Q4K_MANIFEST_JSON)?;
+            let raw = read_q4k_manifest(&manifest_path, display_name)?;
             Some(
                 raw.into_iter()
                     .map(|e| {
@@ -101,18 +109,23 @@ impl VectorIndex {
         self.storage.has_interleaved_kquant()
     }
 
-    /// Load `down_features_q4k.bin` if present (W2 feature-major down).
-    /// Silent no-op when the file is absent — older vindexes still work
-    /// via the `kquant_ffn_layer` cache fallback. Idempotent.
+    /// Load feature-major k-quant down weights if present (W2). Silent
+    /// no-op when the file is absent — older vindexes still work via the
+    /// `kquant_ffn_layer` cache fallback. Idempotent.
     pub fn load_down_features_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(DOWN_FEATURES_Q4K_BIN);
+        let resolved = resolve_down_features_kquant(dir);
+        let path = resolved.bin;
         if !path.exists() {
             return Ok(());
         }
-        let manifest_path = dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON);
+        let manifest_path = resolved
+            .manifest
+            .expect("down-features kquant resolver always pairs a manifest");
         if !manifest_path.exists() {
             return Err(VindexError::Parse(format!(
-                "{DOWN_FEATURES_Q4K_BIN} present but {DOWN_FEATURES_Q4K_MANIFEST_JSON} missing"
+                "{} present but manifest {} missing",
+                path.display(),
+                manifest_path.display()
             )));
         }
         let file = std::fs::File::open(&path)?;
@@ -120,13 +133,17 @@ impl VectorIndex {
         // layer get read in. Same access pattern as `interleaved_kquant.bin`.
         let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
-        let raw = read_q4k_manifest(&manifest_path, DOWN_FEATURES_Q4K_MANIFEST_JSON)?;
+        let manifest_display = manifest_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("down-features kquant manifest");
+        let raw = read_q4k_manifest(&manifest_path, manifest_display)?;
         let entries: Vec<DownFeaturesQ4kEntry> = raw
             .into_iter()
             .map(|e| {
                 let padded_width = e.padded_width().ok_or_else(|| {
                     VindexError::Parse(format!(
-                        "{DOWN_FEATURES_Q4K_MANIFEST_JSON} entry has no shape[1] (padded_width)"
+                        "{manifest_display} entry has no shape[1] (padded_width)"
                     ))
                 })?;
                 Ok(DownFeaturesQ4kEntry {

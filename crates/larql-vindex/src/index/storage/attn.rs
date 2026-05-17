@@ -83,14 +83,18 @@ impl VectorIndex {
 
     /// Load Q4_K/Q6_K attention weights for Ollama-compatible GPU pipeline.
     pub fn load_attn_kquant(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
+        let resolved = resolve_attn_weights_kquant(dir);
+        let path = resolved.bin;
         if !path.exists() {
-            return Err(VindexError::Parse("attn_weights_q4k.bin not found".into()));
+            return Err(VindexError::Parse(format!(
+                "attention k-quant weights not found (looked for {} and legacy {})",
+                ATTN_WEIGHTS_KQUANT_BIN, LEGACY_ATTN_WEIGHTS_Q4K_BIN
+            )));
         }
         let file = std::fs::File::open(&path)?;
         let mmap = Arc::new(unsafe { mmap_optimized(&file)? });
 
-        let manifest_path = dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON);
+        let manifest_path = resolved.manifest.expect("attn weights resolver always pairs a manifest");
         let manifest = if manifest_path.exists() {
             let json: Vec<serde_json::Value> = serde_json::from_str(
                 &std::fs::read_to_string(&manifest_path)
@@ -111,12 +115,12 @@ impl VectorIndex {
                     let length = e["length"].as_u64().unwrap_or(0) as usize;
                     let tag = e["format"].as_str().ok_or_else(|| {
                         VindexError::Parse(
-                            "attn_weights_q4k_manifest entry missing `format` field".into(),
+                            "attn kquant manifest entry missing `format` field".into(),
                         )
                     })?;
                     let qfmt = crate::quant::registry::lookup(tag).ok_or_else(|| {
                         VindexError::Parse(format!(
-                            "attn_weights_q4k_manifest: unknown format tag {tag:?} \
+                            "attn kquant manifest: unknown format tag {tag:?} \
                              — quant::registry has no entry"
                         ))
                     })?;
@@ -137,11 +141,11 @@ impl VectorIndex {
                     if let Some(expected) = qfmt.expected_bytes(&shape) {
                         if expected != length {
                             return Err(VindexError::Parse(format!(
-                                "attn_weights_q4k_manifest: tensor {key:?} ({tag}, shape {shape:?}) \
+                                "attn kquant manifest: tensor {key:?} ({tag}, shape {shape:?}) \
                                  has length {length} but format expects {expected} \
                                  ({} bytes/block × {}). \
                                  Likely cause: vindex built with legacy 148-byte block_q4_K layout — \
-                                 rebuild the vindex with current code (`larql q4k <model>` or equivalent).",
+                                 rebuild the vindex with current code (`larql kquant <model>` or equivalent).",
                                 qfmt.bytes_per_block,
                                 length / qfmt.bytes_per_block.max(1),
                             )));
@@ -241,9 +245,9 @@ mod tests {
     /// passed straight to `load_attn_kquant`.
     fn make_vindex_with_attn_kquant(payload: &[u8], manifest: serde_json::Value) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(tmp.path().join(ATTN_WEIGHTS_Q4K_BIN), payload).unwrap();
+        std::fs::write(tmp.path().join(ATTN_WEIGHTS_KQUANT_BIN), payload).unwrap();
         std::fs::write(
-            tmp.path().join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON),
+            tmp.path().join(ATTN_WEIGHTS_KQUANT_MANIFEST_JSON),
             serde_json::to_string(&manifest).unwrap(),
         )
         .unwrap();

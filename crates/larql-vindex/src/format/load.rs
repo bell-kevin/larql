@@ -9,9 +9,8 @@ use ndarray::Array2;
 use crate::config::VindexConfig;
 use crate::error::VindexError;
 use crate::format::filenames::{
-    DOWN_META_BIN, DOWN_META_JSONL, EMBEDDINGS_BIN, GATE_VECTORS_BIN, INDEX_JSON,
-    INTERLEAVED_Q4K_BIN, INTERLEAVED_Q4K_MANIFEST_JSON, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
-    TOKENIZER_JSON,
+    has_kquant_lm_head, resolve_interleaved_kquant, DOWN_META_BIN, DOWN_META_JSONL, EMBEDDINGS_BIN,
+    GATE_VECTORS_BIN, INDEX_JSON, LM_HEAD_BIN, TOKENIZER_JSON,
 };
 use crate::index::storage::ffn_store::FFN_COMPONENTS_PER_LAYER;
 use crate::index::{IndexLoadCallbacks, VectorIndex};
@@ -59,7 +58,7 @@ impl VectorIndex {
         // that's dedup #2 in action (a Q4K vindex extracted with
         // `--drop-gate-vectors` carries gate weights only once, Q4K).
         let gate_path = dir.join(GATE_VECTORS_BIN);
-        let interleaved_q4k_path = dir.join(INTERLEAVED_Q4K_BIN);
+        let interleaved_kquant_path = resolve_interleaved_kquant(dir).bin;
 
         let (gate_mmap, gate_slices, gate_dtype) = if gate_path.exists() {
             callbacks.on_file_start("gate_vectors", &gate_path.display().to_string());
@@ -91,10 +90,10 @@ impl VectorIndex {
                 start.elapsed().as_secs_f64() * 1000.0,
             );
             (gate_mmap, gate_slices, config.dtype)
-        } else if interleaved_q4k_path.exists() {
+        } else if interleaved_kquant_path.exists() {
             callbacks.on_file_start(
-                "gate_vectors (synth from Q4K)",
-                &interleaved_q4k_path.display().to_string(),
+                "gate_vectors (synth from k-quant)",
+                &interleaved_kquant_path.display().to_string(),
             );
             let start = std::time::Instant::now();
             let (gate_mmap, gate_slices) =
@@ -218,8 +217,7 @@ impl VectorIndex {
         // `lm_head_q4.bin` is present in the vindex directory. The
         // untied models that ship those files are always extracted with
         // one of them, so presence is a reliable untied-signal.
-        let has_separate_lm_head =
-            dir.join(LM_HEAD_BIN).exists() || dir.join(LM_HEAD_Q4_BIN).exists();
+        let has_separate_lm_head = dir.join(LM_HEAD_BIN).exists() || has_kquant_lm_head(dir);
         if !has_separate_lm_head {
             if let Ok(f) = std::fs::File::open(dir.join(EMBEDDINGS_BIN)) {
                 if let Ok(mmap) = unsafe { memmap2::Mmap::map(&f) } {
@@ -251,11 +249,14 @@ fn synthesize_gate_from_q4k(
     hidden_size: usize,
     layer_range: Option<(usize, usize)>,
 ) -> Result<(memmap2::Mmap, Vec<crate::index::core::GateLayerSlice>), VindexError> {
-    let interleaved_path = dir.join(INTERLEAVED_Q4K_BIN);
-    let manifest_path = dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
+    let resolved = resolve_interleaved_kquant(dir);
+    let interleaved_path = resolved.bin;
+    let manifest_path = resolved
+        .manifest
+        .expect("interleaved kquant resolver always pairs a manifest");
     if !manifest_path.exists() {
         return Err(VindexError::Parse(format!(
-            "interleaved_kquant_manifest.json missing alongside {}",
+            "interleaved k-quant manifest missing alongside {}",
             interleaved_path.display()
         )));
     }

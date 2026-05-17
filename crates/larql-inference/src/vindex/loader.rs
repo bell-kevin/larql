@@ -37,9 +37,12 @@ use std::path::Path;
 
 use crate::error::InferenceError;
 use larql_vindex::format::filenames::{
-    ATTN_WEIGHTS_Q4K_BIN as ATTN_Q4K_BIN, ATTN_WEIGHTS_Q8_BIN as ATTN_Q8_BIN, INTERLEAVED_Q4K_BIN,
-    INTERLEAVED_Q4_BIN, LM_HEAD_BIN, LM_HEAD_Q4_BIN,
+    has_kquant_attn_weights, has_kquant_interleaved, has_kquant_lm_head, ATTN_WEIGHTS_KQUANT_BIN,
+    ATTN_WEIGHTS_Q8_BIN as ATTN_Q8_BIN, INTERLEAVED_KQUANT_BIN, INTERLEAVED_Q4_BIN,
+    LEGACY_ATTN_WEIGHTS_Q4K_BIN, LEGACY_INTERLEAVED_Q4K_BIN, LM_HEAD_BIN,
 };
+#[cfg(test)]
+use larql_vindex::format::filenames::{LEGACY_LM_HEAD_Q4_BIN, LM_HEAD_KQUANT_BIN};
 use larql_vindex::{SilentLoadCallbacks, VectorIndex, VindexError};
 
 /// Env var pointing at a real `*.vindex` directory. Real-model
@@ -65,31 +68,31 @@ pub fn open_inference_vindex(path: &Path) -> Result<VectorIndex, InferenceError>
     if path.join(LM_HEAD_BIN).is_file() {
         let _ = index.load_lm_head(path);
     }
-    if path.join(LM_HEAD_Q4_BIN).is_file() {
+    if has_kquant_lm_head(path) {
         let _ = index.load_lm_head_kquant(path);
     }
 
-    // ── attention: strict, prefer Q4_K when present.
-    if path.join(ATTN_Q4K_BIN).is_file() {
+    // ── attention: strict, prefer k-quant when present.
+    if has_kquant_attn_weights(path) {
         index.load_attn_kquant(path)?;
     } else if path.join(ATTN_Q8_BIN).is_file() {
         index.load_attn_q8(path)?;
     } else {
         return Err(InferenceError::Vindex(VindexError::Parse(format!(
             "no attention weights in vindex {path:?} \
-             (looked for {ATTN_Q4K_BIN}, {ATTN_Q8_BIN})"
+             (looked for {ATTN_WEIGHTS_KQUANT_BIN}, legacy {LEGACY_ATTN_WEIGHTS_Q4K_BIN}, {ATTN_Q8_BIN})"
         ))));
     }
 
-    // ── FFN: strict, prefer Q4_K when present.
-    if path.join(INTERLEAVED_Q4K_BIN).is_file() {
+    // ── FFN: strict, prefer k-quant when present.
+    if has_kquant_interleaved(path) {
         index.load_interleaved_kquant(path)?;
     } else if path.join(INTERLEAVED_Q4_BIN).is_file() {
         index.load_interleaved_q4(path)?;
     } else {
         return Err(InferenceError::Vindex(VindexError::Parse(format!(
             "no FFN weights in vindex {path:?} \
-             (looked for {INTERLEAVED_Q4K_BIN}, {INTERLEAVED_Q4_BIN})"
+             (looked for {INTERLEAVED_KQUANT_BIN}, legacy {LEGACY_INTERLEAVED_Q4K_BIN}, {INTERLEAVED_Q4_BIN})"
         ))));
     }
 
@@ -152,12 +155,15 @@ mod tests {
         // These must equal `larql_vindex::format::filenames::*`. The
         // loader is colocated with the inference crate so it pins the
         // names; a divergence here is the warning sign.
-        assert_eq!(super::ATTN_Q4K_BIN, "attn_weights_q4k.bin");
+        assert_eq!(super::ATTN_WEIGHTS_KQUANT_BIN, "attn_weights_kquant.bin");
+        assert_eq!(super::LEGACY_ATTN_WEIGHTS_Q4K_BIN, "attn_weights_q4k.bin");
         assert_eq!(super::ATTN_Q8_BIN, "attn_weights_q8.bin");
-        assert_eq!(super::INTERLEAVED_Q4K_BIN, "interleaved_q4k.bin");
+        assert_eq!(super::INTERLEAVED_KQUANT_BIN, "interleaved_kquant.bin");
+        assert_eq!(super::LEGACY_INTERLEAVED_Q4K_BIN, "interleaved_q4k.bin");
         assert_eq!(super::INTERLEAVED_Q4_BIN, "interleaved_q4.bin");
         assert_eq!(super::LM_HEAD_BIN, "lm_head.bin");
-        assert_eq!(super::LM_HEAD_Q4_BIN, "lm_head_q4.bin");
+        assert_eq!(super::LM_HEAD_KQUANT_BIN, "lm_head_kquant.bin");
+        assert_eq!(super::LEGACY_LM_HEAD_Q4_BIN, "lm_head_q4.bin");
     }
 
     /// File-presence helper smoke test — confirms `touch` writes a real
@@ -225,7 +231,11 @@ mod tests {
         // fixture, then delete the interleaved files.
         use crate::test_utils::write_synthetic_q4k_model_dir;
         write_synthetic_q4k_model_dir(tmp.path()).expect("write q4k fixture");
-        let _ = std::fs::remove_file(tmp.path().join(INTERLEAVED_Q4K_BIN));
+        // Synthetic fixture writes under the new kquant names; remove both
+        // pairs to be safe in case the fixture grows back-compat dual-write.
+        let _ = std::fs::remove_file(tmp.path().join(INTERLEAVED_KQUANT_BIN));
+        let _ = std::fs::remove_file(tmp.path().join("interleaved_kquant_manifest.json"));
+        let _ = std::fs::remove_file(tmp.path().join(LEGACY_INTERLEAVED_Q4K_BIN));
         let _ = std::fs::remove_file(tmp.path().join("interleaved_q4k_manifest.json"));
         let result = open_inference_vindex(tmp.path());
         let msg = match result {

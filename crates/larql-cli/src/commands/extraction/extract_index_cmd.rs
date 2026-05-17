@@ -114,8 +114,14 @@ pub struct ExtractIndexArgs {
 fn parse_quant(s: &str) -> Result<larql_vindex::QuantFormat, String> {
     match s.to_lowercase().as_str() {
         "none" | "" => Ok(larql_vindex::QuantFormat::None),
-        "q4k" | "q4_k" => Ok(larql_vindex::QuantFormat::Q4K),
-        _ => Err(format!("unknown quant format: {s} (expected: none, q4k)")),
+        // `q4k` is the legacy tag preserved for back-compat; `kquant`
+        // is the post-rename canonical tag. Both map to the same
+        // `QuantFormat::Q4K` variant — they differ only in how the
+        // value is spelled on disk in `index.json` / on the CLI.
+        "q4k" | "q4_k" | "kquant" => Ok(larql_vindex::QuantFormat::Q4K),
+        _ => Err(format!(
+            "unknown quant format: {s} (expected: none, q4k, kquant)"
+        )),
     }
 }
 

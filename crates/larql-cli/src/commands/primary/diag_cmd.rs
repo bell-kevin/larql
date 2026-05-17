@@ -17,10 +17,13 @@
 
 use clap::Args;
 use larql_vindex::format::filenames::{
-    ATTN_WEIGHTS_Q4K_BIN, ATTN_WEIGHTS_Q4K_MANIFEST_JSON, ATTN_WEIGHTS_Q4_BIN, ATTN_WEIGHTS_Q8_BIN,
-    EMBEDDINGS_BIN, GENERATION_CONFIG_JSON, INDEX_JSON, INTERLEAVED_Q4K_BIN,
-    INTERLEAVED_Q4K_MANIFEST_JSON, INTERLEAVED_Q4_BIN, LM_HEAD_BIN, LM_HEAD_Q4_BIN, NORMS_BIN,
-    TOKENIZER_CONFIG_JSON, TOKENIZER_JSON, WEIGHT_MANIFEST_JSON,
+    ATTN_WEIGHTS_KQUANT_BIN, ATTN_WEIGHTS_KQUANT_MANIFEST_JSON, ATTN_WEIGHTS_Q4_BIN,
+    ATTN_WEIGHTS_Q8_BIN, EMBEDDINGS_BIN, GENERATION_CONFIG_JSON, INDEX_JSON,
+    INTERLEAVED_KQUANT_BIN, INTERLEAVED_KQUANT_MANIFEST_JSON, INTERLEAVED_Q4_BIN,
+    LEGACY_ATTN_WEIGHTS_Q4K_BIN, LEGACY_ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+    LEGACY_INTERLEAVED_Q4K_BIN, LEGACY_INTERLEAVED_Q4K_MANIFEST_JSON, LEGACY_LM_HEAD_Q4_BIN,
+    LM_HEAD_BIN, LM_HEAD_KQUANT_BIN, NORMS_BIN, TOKENIZER_CONFIG_JSON, TOKENIZER_JSON,
+    WEIGHT_MANIFEST_JSON,
 };
 
 use crate::commands::primary::cache;
@@ -68,15 +71,20 @@ pub fn run(args: DiagArgs) -> Result<(), Box<dyn std::error::Error>> {
         TOKENIZER_JSON,
         TOKENIZER_CONFIG_JSON,
         EMBEDDINGS_BIN,
-        ATTN_WEIGHTS_Q4K_BIN,
-        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+        ATTN_WEIGHTS_KQUANT_BIN,
+        ATTN_WEIGHTS_KQUANT_MANIFEST_JSON,
+        LEGACY_ATTN_WEIGHTS_Q4K_BIN,
+        LEGACY_ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
         ATTN_WEIGHTS_Q4_BIN,
         ATTN_WEIGHTS_Q8_BIN,
-        INTERLEAVED_Q4K_BIN,
-        INTERLEAVED_Q4K_MANIFEST_JSON,
+        INTERLEAVED_KQUANT_BIN,
+        INTERLEAVED_KQUANT_MANIFEST_JSON,
+        LEGACY_INTERLEAVED_Q4K_BIN,
+        LEGACY_INTERLEAVED_Q4K_MANIFEST_JSON,
         INTERLEAVED_Q4_BIN,
         LM_HEAD_BIN,
-        LM_HEAD_Q4_BIN,
+        LM_HEAD_KQUANT_BIN,
+        LEGACY_LM_HEAD_Q4_BIN,
         NORMS_BIN,
         WEIGHT_MANIFEST_JSON,
         GENERATION_CONFIG_JSON,
@@ -156,13 +164,17 @@ pub fn run(args: DiagArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Walk every Q4_K manifest in the vindex, compare each entry's recorded
-/// `length` to `format.expected_bytes(&shape)`. Returns a single line
-/// summary; on mismatch, the kernel reads off-stride and produces NaN.
+/// Walk every k-quant manifest in the vindex, compare each entry's
+/// recorded `length` to `format.expected_bytes(&shape)`. Returns a single
+/// line summary; on mismatch, the kernel reads off-stride and produces NaN.
+/// Checks both the new kquant-named manifests and their legacy q4k
+/// counterparts so existing vindexes still get validated.
 fn validate_strides(dir: &std::path::Path) -> Result<String, Box<dyn std::error::Error>> {
     let manifests = [
-        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
-        INTERLEAVED_Q4K_MANIFEST_JSON,
+        ATTN_WEIGHTS_KQUANT_MANIFEST_JSON,
+        INTERLEAVED_KQUANT_MANIFEST_JSON,
+        LEGACY_ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
+        LEGACY_INTERLEAVED_Q4K_MANIFEST_JSON,
     ];
     let mut total_clean = 0usize;
     let mut total_bad = 0usize;

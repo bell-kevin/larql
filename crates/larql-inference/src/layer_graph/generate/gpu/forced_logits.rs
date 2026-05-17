@@ -8,7 +8,9 @@
 //! step extends the KV cache instead of recomputing the full prefix.
 
 use crate::layer_graph::generate::cpu::backend_supports_fused_q4_pipeline;
-use crate::layer_graph::generate::gpu_setup::{prefill_kquant_prompt, reset_and_preallocate_kv_cache};
+use crate::layer_graph::generate::gpu_setup::{
+    prefill_kquant_prompt, reset_and_preallocate_kv_cache,
+};
 use crate::model::ModelWeights;
 use larql_compute::prelude::*;
 

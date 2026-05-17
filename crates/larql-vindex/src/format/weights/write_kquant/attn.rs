@@ -27,7 +27,7 @@ pub(super) fn write_attn_weights_kquant(
     callbacks: &mut dyn IndexBuildCallbacks,
 ) -> Result<(), VindexError> {
     let arch = source.arch();
-    let attn_path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
+    let attn_path = dir.join(ATTN_WEIGHTS_KQUANT_BIN);
     let mut attn_file = BufWriter::new(std::fs::File::create(&attn_path)?);
     let mut attn_offset: u64 = 0;
     let mut attn_manifest: Vec<Q4kManifestEntry> = Vec::with_capacity(num_layers * 4);
@@ -101,6 +101,6 @@ pub(super) fn write_attn_weights_kquant(
 
     let manifest_json = serde_json::to_string_pretty(&attn_manifest)
         .map_err(|e| VindexError::Parse(e.to_string()))?;
-    std::fs::write(dir.join(ATTN_WEIGHTS_Q4K_MANIFEST_JSON), manifest_json)?;
+    std::fs::write(dir.join(ATTN_WEIGHTS_KQUANT_MANIFEST_JSON), manifest_json)?;
     Ok(())
 }

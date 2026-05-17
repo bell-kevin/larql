@@ -406,7 +406,8 @@ pub fn fused_prefill(
         backend.preallocate_kv_cache_per_layer(&kv_shapes, DEFAULT_GPU_KV_CACHE_MAX_SEQ);
     }
 
-    let h_vec = backend.prefill_kquant(&layers, &x, hidden, intermediate, seq_len, qk_norm, softcap)?;
+    let h_vec =
+        backend.prefill_kquant(&layers, &x, hidden, intermediate, seq_len, qk_norm, softcap)?;
 
     let h_2d = Array2::from_shape_vec((seq_len, hidden), h_vec).ok()?;
     let last = h_2d.shape()[0] - 1;

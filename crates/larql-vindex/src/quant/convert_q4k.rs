@@ -162,11 +162,11 @@ pub fn vindex_to_q4k(
     let handled_by_writer: std::collections::HashSet<&str> = [
         INDEX_JSON,
         // Written by write_model_weights_kquant:
-        ATTN_WEIGHTS_Q4K_BIN,
-        ATTN_WEIGHTS_Q4K_MANIFEST_JSON,
-        INTERLEAVED_Q4K_BIN,
-        INTERLEAVED_Q4K_MANIFEST_JSON,
-        LM_HEAD_Q4_BIN,
+        ATTN_WEIGHTS_KQUANT_BIN,
+        ATTN_WEIGHTS_KQUANT_MANIFEST_JSON,
+        INTERLEAVED_KQUANT_BIN,
+        INTERLEAVED_KQUANT_MANIFEST_JSON,
+        LM_HEAD_KQUANT_BIN,
         NORMS_BIN,
     ]
     .iter()
@@ -244,7 +244,7 @@ pub fn vindex_to_q4k(
     let src_ffn_bytes = size_of(&src.join(UP_WEIGHTS_BIN)).unwrap_or(0)
         + size_of(&src.join(DOWN_WEIGHTS_BIN)).unwrap_or(0)
         + size_of(&src.join(GATE_VECTORS_BIN)).unwrap_or(0);
-    let dst_ffn_bytes = size_of(&dst.join(INTERLEAVED_Q4K_BIN)).unwrap_or(0)
+    let dst_ffn_bytes = size_of(&dst.join(INTERLEAVED_KQUANT_BIN)).unwrap_or(0)
         + size_of(&dst.join(GATE_VECTORS_BIN)).unwrap_or(0);
     let compression = if dst_ffn_bytes == 0 {
         1.0
@@ -329,8 +329,8 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
     use crate::format::weights::Q4kManifestEntry;
 
     let started = Instant::now();
-    let dst = vindex_dir.join(DOWN_FEATURES_Q4K_BIN);
-    let dst_manifest = vindex_dir.join(DOWN_FEATURES_Q4K_MANIFEST_JSON);
+    let dst = vindex_dir.join(DOWN_FEATURES_KQUANT_BIN);
+    let dst_manifest = vindex_dir.join(DOWN_FEATURES_KQUANT_MANIFEST_JSON);
 
     if dst.exists() && dst_manifest.exists() {
         let config = crate::format::load::load_vindex_config(vindex_dir)?;
@@ -344,25 +344,25 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
     }
 
     // Source: interleaved_kquant.bin + manifest.
-    let interleaved_path = vindex_dir.join(INTERLEAVED_Q4K_BIN);
-    let interleaved_manifest_path = vindex_dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
+    let interleaved_path = vindex_dir.join(INTERLEAVED_KQUANT_BIN);
+    let interleaved_manifest_path = vindex_dir.join(INTERLEAVED_KQUANT_MANIFEST_JSON);
     if !interleaved_path.exists() || !interleaved_manifest_path.exists() {
         return Err(VindexError::Parse(format!(
             "{} expects {} + {} (run extract with --quant q4k first)",
             vindex_dir.display(),
-            INTERLEAVED_Q4K_BIN,
-            INTERLEAVED_Q4K_MANIFEST_JSON,
+            INTERLEAVED_KQUANT_BIN,
+            INTERLEAVED_KQUANT_MANIFEST_JSON,
         )));
     }
     let manifest_text = std::fs::read_to_string(&interleaved_manifest_path)?;
     let entries: Vec<Q4kManifestEntry> = serde_json::from_str(&manifest_text)
-        .map_err(|e| VindexError::Parse(format!("{INTERLEAVED_Q4K_MANIFEST_JSON}: {e}")))?;
+        .map_err(|e| VindexError::Parse(format!("{INTERLEAVED_KQUANT_MANIFEST_JSON}: {e}")))?;
 
     let config = crate::format::load::load_vindex_config(vindex_dir)?;
     let num_layers = config.num_layers;
     if entries.len() < num_layers * FFN_COMPONENTS_PER_LAYER {
         return Err(VindexError::Parse(format!(
-            "{INTERLEAVED_Q4K_MANIFEST_JSON} has {} entries, expected {} \
+            "{INTERLEAVED_KQUANT_MANIFEST_JSON} has {} entries, expected {} \
              ({FFN_COMPONENTS_PER_LAYER} per layer for {num_layers} layers)",
             entries.len(),
             num_layers * FFN_COMPONENTS_PER_LAYER,
@@ -371,7 +371,7 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
 
     let file = std::fs::File::open(&interleaved_path)?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| VindexError::Parse(format!("mmap {INTERLEAVED_Q4K_BIN}: {e}")))?;
+        .map_err(|e| VindexError::Parse(format!("mmap {INTERLEAVED_KQUANT_BIN}: {e}")))?;
 
     let mut state = FeatureMajorDownState::new(&dst, num_layers)?;
 
@@ -381,18 +381,18 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
         let format = down.format.clone();
         let info = crate::quant::registry::lookup(down.format_tag()).ok_or_else(|| {
             VindexError::Parse(format!(
-                "unknown quant format {:?} in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}",
+                "unknown quant format {:?} in {INTERLEAVED_KQUANT_MANIFEST_JSON} for layer {layer}",
                 down.format_tag(),
             ))
         })?;
         let rows = down.shape.first().copied().ok_or_else(|| {
             VindexError::Parse(format!(
-                "down shape missing rows in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}"
+                "down shape missing rows in {INTERLEAVED_KQUANT_MANIFEST_JSON} for layer {layer}"
             ))
         })?;
         let cols = down.shape.get(1).copied().ok_or_else(|| {
             VindexError::Parse(format!(
-                "down shape missing cols in {INTERLEAVED_Q4K_MANIFEST_JSON} for layer {layer}"
+                "down shape missing cols in {INTERLEAVED_KQUANT_MANIFEST_JSON} for layer {layer}"
             ))
         })?;
         // Source disk layout for down is `[hidden=rows, padded_intermediate=cols]`.

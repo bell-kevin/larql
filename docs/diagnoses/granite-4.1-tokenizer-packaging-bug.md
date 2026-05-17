@@ -14,10 +14,13 @@ Affected repos:
 - [ibm-granite/granite-4.1-30b](https://huggingface.co/ibm-granite/granite-4.1-30b)
 - [ibm-granite/granite-4.1-30b-base](https://huggingface.co/ibm-granite/granite-4.1-30b-base)
 
-(3B confirmed empirically; 8B / 30B inferred from identical
-`tokenizer_config.json` / `tokenizer.json` packaging in the same
-collection. Verifying on 8B/30B is a one-line snippet — see the repro
-below.)
+(3B, 8B, 30B all **confirmed empirically** by inspecting
+`tokenizer.json::pre_tokenizer.pretokenizers[0].pattern.Regex` and
+`tokenizer_config.json::tokenizer_class` on each snapshot, 2026-05-17.
+All three carry the cl100k regex in `tokenizer.json` and declare
+`GPT2Tokenizer` in `tokenizer_config.json`. The `-base` variants
+inherit the same tokenizer artefacts and are presumed affected;
+please verify with the snippet below.)
 
 ## TL;DR
 

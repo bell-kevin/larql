@@ -29,14 +29,17 @@ impl VectorIndex {
     /// Older vindexes without a manifest entry for lm_head still load (the
     /// extractor wrote the file directly), but no format check happens.
     pub fn load_lm_head_kquant(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
-        let path = dir.join(LM_HEAD_Q4_BIN);
+        let path = resolve_lm_head_kquant(dir).bin;
         if !path.exists() {
-            return Err(VindexError::Parse("lm_head_q4.bin not found".into()));
+            return Err(VindexError::Parse(format!(
+                "lm_head k-quant file not found (looked for {} and legacy {})",
+                LM_HEAD_KQUANT_BIN, LEGACY_LM_HEAD_Q4_BIN
+            )));
         }
         if let Some(manifest_kind) = read_lm_head_manifest_kind(dir) {
             if manifest_kind != crate::format::weights::write_f32::kind::TENSOR_Q4K {
                 return Err(VindexError::Parse(format!(
-                    "lm_head_q4.bin manifest mismatch: expected kind \"{}\", \
+                    "lm_head k-quant manifest mismatch: expected kind \"{}\", \
                      found \"{}\". This indicates the vindex was extracted with \
                      a writer that disagrees with the Q4_K matvec dispatch path \
                      — refusing to load to avoid silent garbage logits.",
