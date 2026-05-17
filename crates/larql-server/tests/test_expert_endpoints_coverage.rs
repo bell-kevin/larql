@@ -85,10 +85,7 @@ async fn single_expert_invalid_json_returns_400() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
-async fn post_expert_batch(
-    layer: usize,
-    body: serde_json::Value,
-) -> axum::http::Response<Body> {
+async fn post_expert_batch(layer: usize, body: serde_json::Value) -> axum::http::Response<Body> {
     let (model, _fixture) = common::model_with_q4k_weights("synthetic");
     let state = common::state(vec![model]);
     let app = larql_server::routes::single_model_router(state);

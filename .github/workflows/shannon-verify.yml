@@ -28,7 +28,7 @@ on:
       - 'crates/larql-models/**'
       - 'scripts/shannon_score_*.py'
       - 'scripts/diagnose_models.py'
-      - 'data/gutenberg/**'
+      - 'tests/fixtures/shannon_frankenstein_2k.txt'
       - '.github/workflows/shannon-verify.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -40,7 +40,7 @@ on:
       - 'crates/larql-models/**'
       - 'scripts/shannon_score_*.py'
       - 'scripts/diagnose_models.py'
-      - 'data/gutenberg/**'
+      - 'tests/fixtures/shannon_frankenstein_2k.txt'
       - '.github/workflows/shannon-verify.yml'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -110,10 +110,12 @@ jobs:
         run: |
           .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('$LARQL_VERIFY_MODEL')"
 
-      - name: Prep corpus (strip BOM + CRLF, truncate to 1 KB)
+      - name: Prep corpus (truncate to 1 KB)
+        # The committed fixture is already BOM/CR stripped, so we just
+        # truncate to `LARQL_VERIFY_BYTES` here.
         run: |
           mkdir -p target/ci
-          tail -c +4 data/gutenberg/frankenstein.txt | head -c "$LARQL_VERIFY_BYTES" | tr -d '\r' > target/ci/corpus.txt
+          head -c "$LARQL_VERIFY_BYTES" tests/fixtures/shannon_frankenstein_2k.txt > target/ci/corpus.txt
           wc -c target/ci/corpus.txt
 
       - name: Run shannon verify (LARQL Rust vs HF F32)

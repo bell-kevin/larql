@@ -102,6 +102,14 @@ MATRIX: list[TestCase] = [
         family="granite (scaling multipliers)",
     ),
     TestCase(
+        name="Granite-4.1-3B",
+        model_id="ibm-granite/granite-4.1-3b",
+        family="granite (4.1 dense, all 4 scalars + tied embed)",
+        note="GraniteForCausalLM v4.1, hidden=2560 / 40L / 40Q / 8KV, vocab=100352, "
+             "attention_multiplier=1/64, embedding_multiplier=12, logits_scaling=10, "
+             "residual_multiplier=0.22. Same dense arch as 8B/30B with different scalars.",
+    ),
+    TestCase(
         name="Gemma-2-2B",
         model_id="google/gemma-2-2b",
         family="gemma2 (softcap, post-norms)",

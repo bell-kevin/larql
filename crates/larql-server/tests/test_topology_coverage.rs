@@ -44,8 +44,13 @@ async fn topology_with_expert_filter_returns_200_with_owned_range() {
     // since we hold the only reference at this point Arc::try_unwrap
     // succeeds — no Clone needed.
     let (model_arc, fixture) = common::model_with_real_weights("synthetic-experts");
-    let model = Arc::try_unwrap(model_arc).expect("sole Arc reference");
-    let mut model = model;
+    // `LoadedModel` doesn't implement `Debug`, so we can't `.expect()` on
+    // the `Result<T, Arc<T>>` returned by `try_unwrap`; match the Err arm
+    // explicitly to surface the same failure mode.
+    let mut model = match Arc::try_unwrap(model_arc) {
+        Ok(m) => m,
+        Err(_) => panic!("sole Arc reference"),
+    };
     // Pretend this shard owns experts 4..=11 (half-open in storage).
     model.expert_filter = Some((4, 12));
     let model = Arc::new(model);

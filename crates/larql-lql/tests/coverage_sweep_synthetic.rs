@@ -33,7 +33,9 @@ fn fresh_session() -> (Session, tempfile::TempDir, String) {
 /// error path is the correct branch for the test.
 fn try_run(session: &mut Session, sql: &str) -> Result<Vec<String>, String> {
     let parsed = parser::parse(sql).map_err(|e| format!("parse {sql:?}: {e}"))?;
-    session.execute(&parsed).map_err(|e| format!("execute: {e}"))
+    session
+        .execute(&parsed)
+        .map_err(|e| format!("execute: {e}"))
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────
@@ -54,8 +56,7 @@ fn use_nonexistent_vindex_errors() {
 #[test]
 fn use_model_nonexistent_errors() {
     let mut session = Session::new();
-    let err = try_run(&mut session, r#"USE MODEL "/nonexistent/model";"#)
-        .expect_err("should fail");
+    let err = try_run(&mut session, r#"USE MODEL "/nonexistent/model";"#).expect_err("should fail");
     assert!(!err.is_empty());
 }
 
@@ -172,10 +173,7 @@ fn insert_into_edges_synthetic() {
 #[test]
 fn delete_from_edges_no_matches() {
     let (mut session, _dir, _) = fresh_session();
-    let _ = try_run(
-        &mut session,
-        r#"DELETE FROM EDGES WHERE entity = "[99]";"#,
-    );
+    let _ = try_run(&mut session, r#"DELETE FROM EDGES WHERE entity = "[99]";"#);
 }
 
 #[test]
@@ -214,7 +212,10 @@ fn compile_current_into_model_errors_without_target() {
     // Synthetic vindex doesn't carry the source weight files COMPILE
     // requires; we just want the executor's argument-validation /
     // error-formatting branch to fire.
-    let _ = try_run(&mut session, r#"COMPILE CURRENT INTO MODEL "/tmp/larql_test_compile_out";"#);
+    let _ = try_run(
+        &mut session,
+        r#"COMPILE CURRENT INTO MODEL "/tmp/larql_test_compile_out";"#,
+    );
 }
 
 // ── EXPLAIN INFER + INFER (already covered separately) ────────────────

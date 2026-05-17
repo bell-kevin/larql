@@ -790,6 +790,124 @@ fn test_real_granite_2b() {
 }
 
 #[test]
+fn test_real_granite_4_1_3b() {
+    // Exact config from ibm-granite/granite-4.1-3b. Same `model_type:
+    // "granite"` as the 3.x line; the 4.1 family is the same dense
+    // GraniteForCausalLM architecture with the four scaling multipliers
+    // (`attention_multiplier`, `embedding_multiplier`, `logits_scaling`,
+    // `residual_multiplier`) populated. Pinning the 3B numbers here so a
+    // regression in the parser (e.g. dropping the multiplier fields) or
+    // the family-dispatch (a future "granite4*" prefix sneaking past
+    // `t.starts_with("granite")`) trips before the cross-engine sweep.
+    let config = serde_json::json!({
+        "architectures": ["GraniteForCausalLM"],
+        "model_type": "granite",
+        "hidden_size": 2560,
+        "intermediate_size": 8192,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "vocab_size": 100352,
+        "rope_theta": 10000000.0,
+        "rms_norm_eps": 1e-05,
+        "tie_word_embeddings": true,
+        "attention_multiplier": 0.015625,
+        "embedding_multiplier": 12.0,
+        "logits_scaling": 10.0,
+        "residual_multiplier": 0.22,
+        "max_position_embeddings": 131072,
+        "bos_token_id": 100257,
+        "eos_token_id": 100257,
+        "pad_token_id": 100256,
+    });
+
+    let arch = detect_from_json(&config);
+    assert_eq!(arch.family(), "granite");
+    assert_eq!(arch.config().num_layers, 40);
+    assert_eq!(arch.config().hidden_size, 2560);
+    assert_eq!(arch.config().head_dim, 64); // 2560/40
+    assert_eq!(arch.config().num_q_heads, 40);
+    assert_eq!(arch.config().num_kv_heads, 8);
+    assert_eq!(arch.config().vocab_size, Some(100352));
+    assert_eq!(arch.config().rope_base, 10_000_000.0);
+    assert_eq!(arch.norm_eps(), 1e-05);
+    // All four Granite scalars must propagate through to the trait getters,
+    // since the forward path reads them through these accessors (see
+    // `attention/{gpu,decode,block}.rs`, `forward/{embed,layer}.rs`,
+    // `predict/*`, `vocab_proj.rs`).
+    assert_eq!(arch.embed_scale(), 12.0);
+    assert_eq!(arch.attention_multiplier(), 0.015625);
+    assert_eq!(arch.residual_multiplier(), 0.22);
+    assert_eq!(arch.logits_scaling(), 10.0);
+    assert!(!arch.is_moe());
+}
+
+#[test]
+fn test_real_granite_4_1_8b() {
+    // Exact config from ibm-granite/granite-4.1-8b. Larger dense Granite
+    // (hidden_size=4096, 40 layers, intermediate=12800), tighter
+    // attention_multiplier (0.0078125 = 1/128) and larger logits_scaling
+    // (16.0). Pinned here so the 8B path stays correctness-verified by
+    // construction once the 3B sweep is green.
+    let config = serde_json::json!({
+        "architectures": ["GraniteForCausalLM"],
+        "model_type": "granite",
+        "hidden_size": 4096,
+        "intermediate_size": 12800,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "vocab_size": 100352,
+        "rope_theta": 10000000.0,
+        "rms_norm_eps": 1e-05,
+        "tie_word_embeddings": true,
+        "attention_multiplier": 0.0078125,
+        "embedding_multiplier": 12.0,
+        "logits_scaling": 16.0,
+        "residual_multiplier": 0.22,
+    });
+
+    let arch = detect_from_json(&config);
+    assert_eq!(arch.family(), "granite");
+    assert_eq!(arch.config().hidden_size, 4096);
+    assert_eq!(arch.config().head_dim, 128); // 4096/32
+    assert_eq!(arch.attention_multiplier(), 0.0078125);
+    assert_eq!(arch.logits_scaling(), 16.0);
+    assert!(!arch.is_moe());
+}
+
+#[test]
+fn test_real_granite_4_1_30b() {
+    // Exact config from ibm-granite/granite-4.1-30b. 64 layers,
+    // intermediate=32768, rope_theta bumped to 50M (vs 10M on 3B/8B),
+    // residual_multiplier 0.175 (vs 0.22 on 3B/8B — μP-init scaling).
+    let config = serde_json::json!({
+        "architectures": ["GraniteForCausalLM"],
+        "model_type": "granite",
+        "hidden_size": 4096,
+        "intermediate_size": 32768,
+        "num_hidden_layers": 64,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "vocab_size": 100352,
+        "rope_theta": 50000000.0,
+        "rms_norm_eps": 1e-05,
+        "tie_word_embeddings": true,
+        "attention_multiplier": 0.0078125,
+        "embedding_multiplier": 12.0,
+        "logits_scaling": 16.0,
+        "residual_multiplier": 0.175,
+    });
+
+    let arch = detect_from_json(&config);
+    assert_eq!(arch.family(), "granite");
+    assert_eq!(arch.config().num_layers, 64);
+    assert_eq!(arch.config().rope_base, 50_000_000.0);
+    assert_eq!(arch.residual_multiplier(), 0.175);
+    assert!(!arch.is_moe());
+}
+
+#[test]
 fn test_real_granitemoe() {
     // Exact config from ibm-granite/granite-3.0-1b-a400m-instruct
     let config = serde_json::json!({

@@ -328,3 +328,80 @@ pub mod research {
         TracePositions, TraceStore, TraceWriter,
     };
 }
+
+#[cfg(test)]
+mod factory_tests {
+    //! Coverage for the engine/backend factory functions at the crate root.
+    //!
+    //! Each factory exists so engines can construct themselves without the
+    //! caller branching on `#[cfg(feature = "metal")]`. The tests verify
+    //! that the returned trait object is the CPU backend on the default
+    //! build (no `metal` feature on the test runner CI matrix) and that
+    //! each factory's pipeline-back name plumbs through.
+    //!
+    //! On Apple Silicon with the `metal` feature these tests still pass —
+    //! the factories fall back to CPU when `MetalBackend::new()` returns
+    //! `None`, and on metal-capable hardware the returned backend just
+    //! reports a different name. The assertions are deliberately scoped
+    //! to "factory returned a usable backend" rather than "the backend is
+    //! CPU" so both build configurations pass.
+    use super::*;
+    use larql_models::Activation as ArchActivation;
+
+    #[test]
+    fn cpu_engine_backend_returns_named_backend() {
+        let backend = cpu_engine_backend();
+        // CpuBackend's name starts with "cpu" — exact suffix varies with
+        // BLAS / kernel selection (e.g. "cpu (BLAS + C Q4 kernel)").
+        assert!(backend.as_compute().name().starts_with("cpu"));
+    }
+
+    #[test]
+    fn cpu_async_engine_backend_returns_named_backend() {
+        let backend = cpu_async_engine_backend();
+        let name = <dyn AsyncComputeBackend as larql_compute::ComputeBackend>::name(&*backend);
+        assert!(name.starts_with("cpu"));
+    }
+
+    #[test]
+    fn default_engine_backend_constructs() {
+        // Returns Metal when the feature + hardware align, CPU otherwise.
+        // The factory is exercised either way — we only check it returns
+        // a backend with a non-empty name.
+        let backend = default_engine_backend();
+        assert!(!backend.as_compute().name().is_empty());
+    }
+
+    #[test]
+    fn default_async_engine_backend_constructs() {
+        let backend = default_async_engine_backend();
+        assert!(
+            !<dyn AsyncComputeBackend as larql_compute::ComputeBackend>::name(&*backend).is_empty()
+        );
+    }
+
+    #[test]
+    fn default_compute_backend_constructs() {
+        let backend = default_compute_backend();
+        assert!(!backend.name().is_empty());
+    }
+
+    #[test]
+    fn activation_from_arch_maps_gelu_tanh() {
+        // Use a tiny ModelWeights so we have a real ModelArchitecture.
+        let weights = test_utils::make_test_weights();
+        // make_test_weights uses TinyModelArch which reports Silu — verify
+        // the non-tanh branch maps to Silu.
+        let act = activation_from_arch(&*weights.arch);
+        assert!(matches!(act, larql_compute::Activation::Silu));
+
+        // For the GeluTanh branch we need an arch that reports it. Build
+        // a Gemma 3 arch via the existing fixture (gemma3 uses GeluTanh).
+        let gemma = test_utils::make_gemma3_test_weights();
+        assert!(matches!(gemma.arch.activation(), ArchActivation::GeluTanh));
+        assert!(matches!(
+            activation_from_arch(&*gemma.arch),
+            larql_compute::Activation::GeluTanh
+        ));
+    }
+}
