@@ -123,7 +123,10 @@ pub fn run(args: DiagArgs) -> Result<(), Box<dyn std::error::Error>> {
     // ── LM head path resolution ──
     let backend = larql_compute::default_backend();
     println!("\nBackend: {}", backend.name());
-    println!("  has_q4 (Q4 matvec available) : {}", backend.has_q4());
+    println!(
+        "  supports_quant(Q4_K)  : {}",
+        backend.supports_quant(::larql_compute::QuantFormat::Q4_K)
+    );
 
     println!("\nLM-head path resolution (which kernel fires per next-token):");
     let path_table = resolve_lm_head_path(&index, backend.as_ref());
@@ -238,7 +241,9 @@ fn resolve_lm_head_path(
     backend: &dyn larql_compute::ComputeBackend,
 ) -> Vec<PathDecision> {
     let has_q4_data = index.has_lm_head_q4();
-    let q4_ready = backend.has_q4() && has_q4_data && index.vocab_size > 0;
+    let q4_ready = backend.supports_quant(::larql_compute::QuantFormat::Q4_K)
+        && has_q4_data
+        && index.vocab_size > 0;
     let f16_ready = index.has_lm_head_f16() && index.vocab_size > 0;
     let is_non_cpu_backend =
         backend.as_any().type_id() != std::any::TypeId::of::<larql_compute::CpuBackend>();
@@ -274,9 +279,9 @@ fn resolve_lm_head_path(
             label: "Q4 matvec (fast, default)",
             will_fire: q4_will_fire,
             note: format!(
-                "lm_head_q4 mmap/synth = {}, backend.has_q4 = {}, skip_q4k override = {}  → default Metal lm_head path post 2026-05-02 dispatch fix",
+                "lm_head_q4 mmap/synth = {}, backend.supports_quant(Q4_K) = {}, skip_q4k override = {}  → default Metal lm_head path post 2026-05-02 dispatch fix",
                 has_q4_data,
-                backend.has_q4(),
+                backend.supports_quant(::larql_compute::QuantFormat::Q4_K),
                 skip_q4k,
             ),
         },
@@ -321,8 +326,8 @@ fn probe_run(
 
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let mut q4_index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)?;
-    q4_index.load_attn_q4k(vindex_path)?;
-    q4_index.load_interleaved_q4k(vindex_path)?;
+    q4_index.load_attn_kquant(vindex_path)?;
+    q4_index.load_interleaved_kquant(vindex_path)?;
     let _ = q4_index.load_lm_head_q4(vindex_path);
     let mut weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(vindex_path)?;

@@ -306,7 +306,7 @@ impl MetalBackend {
             // Both the new cached kernel AND the existing production
             // `q6k_geglu_gelu_tanh_down_pipeline` (which a prior memory
             // claimed was "parity-tested") produce wrong output on the
-            // current `interleaved_q4k.bin` layout — model emits "The"
+            // current `interleaved_kquant.bin` layout — model emits "The"
             // and stops (early EOS / NaN propagation). Likely the
             // kernel's Q6_K block layout offsets drifted vs the
             // writer in `format/weights/write_q4k`. Real fix needs a

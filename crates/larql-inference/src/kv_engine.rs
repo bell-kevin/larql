@@ -182,7 +182,7 @@ pub trait KvEngine: Send {
     ///
     /// When the backend supports the fused Q4 pipeline (Metal), this routes
     /// through `backend.prefill_q4` for full GPU speed. Falls back to the
-    /// f32 path when `backend.has_q4() == false` or `index` has no Q4K data.
+    /// f32 path when `backend.supports_quant(::larql_compute::QuantFormat::Q4_K) == false` or `index` has no Q4K data.
     ///
     /// `weights` is `&mut` so the engine can lazily insert dequantised f32
     /// attention tensors into `weights.tensors` on the first call (one-time

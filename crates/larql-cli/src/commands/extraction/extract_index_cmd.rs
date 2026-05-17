@@ -80,7 +80,7 @@ pub struct ExtractIndexArgs {
 
     /// Skip writing `gate_vectors.bin`. Only valid with `--quant q4k`
     /// — the loader rebuilds the f16 gate by dequantizing
-    /// `interleaved_q4k.bin` at vindex-load time. Saves ~1.7 GB on a
+    /// `interleaved_kquant.bin` at vindex-load time. Saves ~1.7 GB on a
     /// 4B q4k vindex / ~14 GB on a 31B q4k vindex; costs ~1.6 s / ~12 s
     /// of CPU at load. See
     /// `cargo run --release -p larql-vindex --example bench_gate_dequant`

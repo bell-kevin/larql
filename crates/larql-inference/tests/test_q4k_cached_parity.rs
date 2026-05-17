@@ -81,9 +81,11 @@ fn cached_decode_matches_uncached_tokens() {
     let mut weights_a = load_model_weights_q4k(&vindex_path, &mut cb).expect("load weights A");
     let mut weights_b = load_model_weights_q4k(&vindex_path, &mut cb).expect("load weights B");
     let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb).expect("load index");
-    q4_index.load_attn_q4k(&vindex_path).expect("load attn Q4K");
     q4_index
-        .load_interleaved_q4k(&vindex_path)
+        .load_attn_kquant(&vindex_path)
+        .expect("load attn Q4K");
+    q4_index
+        .load_interleaved_kquant(&vindex_path)
         .expect("load FFN Q4K");
 
     assert!(
@@ -151,9 +153,11 @@ fn direct_matvec_decode_matches_dequant_path() {
     let mut weights_a = load_model_weights_q4k(&vindex_path, &mut cb).expect("load weights A");
     let mut weights_b = load_model_weights_q4k(&vindex_path, &mut cb).expect("load weights B");
     let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb).expect("load index");
-    q4_index.load_attn_q4k(&vindex_path).expect("load attn Q4K");
     q4_index
-        .load_interleaved_q4k(&vindex_path)
+        .load_attn_kquant(&vindex_path)
+        .expect("load attn Q4K");
+    q4_index
+        .load_interleaved_kquant(&vindex_path)
         .expect("load FFN Q4K");
 
     assert!(

@@ -571,7 +571,7 @@ fn default_quant_matvec_stubs_return_none() {
     assert!(be
         .q4_matvec_pair_batch(&dummy, &dummy, &dummy_f32[..256], 1, 1, 256)
         .is_none());
-    assert!(!be.has_q4());
+    assert!(!be.supports_quant(::larql_compute::QuantFormat::Q4_K));
 }
 
 #[test]

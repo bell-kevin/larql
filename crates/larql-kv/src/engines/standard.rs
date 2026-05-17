@@ -698,4 +698,69 @@ mod tests {
         // the same window size.
         assert_eq!(sync_engine.window_tokens(), async_engine.window_tokens());
     }
+
+    // ── Q4K paths via Q4K fixture ─────────────────────────────────────────
+    //
+    // `prefill_quant` / `decode_step_quant` first try the backend's
+    // `coarse_prefill` / `coarse_decode_step`. On `CpuBackend` the coarse
+    // path returns None (no fused decode kernel), so the engine falls
+    // through to `ensure_attn_tensors_dequantised` + `do_prefill`. The
+    // Q4K-equipped fixture (`make_test_q4k_vindex` + `make_test_q4k_weights`)
+    // has the attn Q4K slices `insert_q4k_layer_tensors` needs to dequant
+    // without panicking, unlocking the dequant-then-f32 fallback branch.
+
+    #[test]
+    fn prefill_quant_cpu_fallback_runs_via_dequant() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        let h = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill_quant Q4K cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.memory_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_quant_cpu_fallback_extends_cache() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill_quant");
+        let mem_before = engine.memory_bytes();
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode_step_quant Q4K cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "K/V cache should grow after Q4K decode step"
+        );
+    }
+
+    #[test]
+    fn decode_step_quant_without_prefill_returns_none() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = StandardEngine::new(None);
+        // self.handles is None → decode_step_quant returns None at
+        // `self.handles.as_mut()?`.
+        assert!(engine
+            .decode_step_quant(&mut weights, &ffn, &index, 0, &*backend)
+            .is_none());
+    }
 }

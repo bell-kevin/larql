@@ -124,11 +124,11 @@ fn run_case(case: &ParityCase) -> Result<(), String> {
     let mut q4_index =
         VectorIndex::load_vindex(&vindex_path, &mut cb).map_err(|e| format!("load vindex: {e}"))?;
     q4_index
-        .load_attn_q4k(&vindex_path)
-        .map_err(|e| format!("load_attn_q4k: {e}"))?;
+        .load_attn_kquant(&vindex_path)
+        .map_err(|e| format!("load_attn_kquant: {e}"))?;
     q4_index
-        .load_interleaved_q4k(&vindex_path)
-        .map_err(|e| format!("load_interleaved_q4k: {e}"))?;
+        .load_interleaved_kquant(&vindex_path)
+        .map_err(|e| format!("load_interleaved_kquant: {e}"))?;
     let _ = q4_index.load_lm_head_q4(&vindex_path);
 
     // Disjoint weight handles — CPU's per-layer dequant inserts into

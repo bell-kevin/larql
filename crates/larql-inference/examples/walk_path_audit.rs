@@ -18,7 +18,7 @@
 //! enough to survive an Accelerate point release reordering FMAs:
 //!
 //!   - exact paths (interleaved, full_mmap, exact):            cos ≥ 0.99999, rel_L2 ≤ 1e-2
-//!   - quantized (interleaved_q4k:dequant, interleaved_q4):    cos ≥ 0.99,    rel_L2 ≤ 5e-3
+//!   - quantized (interleaved_kquant:dequant, interleaved_q4):    cos ≥ 0.99,    rel_L2 ≤ 5e-3
 //!   - fp4 (fp4_storage:sparse):                               cos ≥ 0.98,    rel_L2 ≤ 1e-2
 //!
 //! `rel_L2` opens loose; tighten to `measured_worst × 4` per path in a
@@ -125,7 +125,7 @@ const BOUND_QUANTIZED: PathBound = PathBound {
     // similar-magnitude vectors, rel_L2 ≈ √(2(1-cos)), so cos = 0.99
     // implies rel_L2 ≈ 0.14, and the f16-style 1e-2 ceiling would be
     // mathematically impossible here. Canonical Q4K measurement on Gemma
-    // 3 4B is rel_L2 = 1.205e-1 (worst at L10/code/1, interleaved_q4k
+    // 3 4B is rel_L2 = 1.205e-1 (worst at L10/code/1, interleaved_kquant
     // path); 4× headroom puts the ceiling at ~5e-1. See
     // walk_path_audit_gemma3_4b_q4k_baseline.md for the derivation.
     rel_l2: 5e-1,
@@ -167,7 +167,7 @@ fn bound_for_bucket(bucket: StorageBucket) -> PathBound {
 fn bound_for(path: &str) -> PathBound {
     if path.starts_with("fp4_storage") {
         BOUND_FP4
-    } else if path.starts_with("interleaved_q4k") || path.starts_with("interleaved_q4") {
+    } else if path.starts_with("interleaved_kquant") || path.starts_with("interleaved_q4") {
         BOUND_QUANTIZED
     } else {
         BOUND_EXACT
@@ -465,7 +465,7 @@ struct PathSpec {
     sparse_k: Option<usize>,
     /// Assertion bound for this path. Set explicitly per spec — for paths
     /// whose precision is fixed by the path itself (e.g. `interleaved` is
-    /// always f32; `interleaved_q4k` is always Q4K), this is hardcoded to
+    /// always f32; `interleaved_kquant` is always Q4K), this is hardcoded to
     /// the right bucket. For `sparse`, which dispatches through the
     /// unified `ffn_row_*` chain and walks whatever data the vindex
     /// carries, the bucket is determined by `index.primary_storage_bucket()`.
@@ -545,11 +545,11 @@ fn enumerate_paths(index: &VectorIndex) -> Vec<PathSpec> {
         });
     }
 
-    // interleaved_q4k:dequant — mask everything above it. Always
+    // interleaved_kquant:dequant — mask everything above it. Always
     // Quantized: dequants Q4K bytes per layer.
     if index.has_interleaved_kquant() {
         out.push(PathSpec {
-            name: "interleaved_q4k",
+            name: "interleaved_kquant",
             mask: PathMask {
                 hide_fp4: true,
                 hide_q4: true,

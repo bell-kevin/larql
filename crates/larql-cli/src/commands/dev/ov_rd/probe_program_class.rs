@@ -330,8 +330,8 @@ pub(super) fn run_probe_program_class(
 
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
-    index.load_attn_q4k(&args.index)?;
-    index.load_interleaved_q4k(&args.index)?;
+    index.load_attn_kquant(&args.index)?;
+    index.load_interleaved_kquant(&args.index)?;
     let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
     if weights.arch.is_hybrid_moe() {
         return Err("ov-rd probe-program-class currently supports dense FFN vindexes only".into());

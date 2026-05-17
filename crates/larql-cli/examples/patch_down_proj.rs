@@ -11,7 +11,7 @@
 //! Re-extracting from scratch works (`larql extract ...`) but is slow and
 //! forces the user to re-apply any manual patches (e.g. the outer-norm
 //! tensors we back-filled earlier). This tool rebuilds only the `down_proj`
-//! bytes in `interleaved_q4k.bin` and updates the manifest.
+//! bytes in `interleaved_kquant.bin` and updates the manifest.
 //!
 //! Run with:
 //! ```bash
@@ -49,8 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("hf-root  = {}", hf_root.display());
 
     // ── Read vindex manifest ──────────────────────────────────────────────
-    let ff_path = vindex_path.join("interleaved_q4k_manifest.json");
-    let bin_path = vindex_path.join("interleaved_q4k.bin");
+    let ff_path = vindex_path.join("interleaved_kquant_manifest.json");
+    let bin_path = vindex_path.join("interleaved_kquant.bin");
     let manifest_json = fs::read_to_string(&ff_path)?;
     let mut manifest: Value = serde_json::from_str(&manifest_json)?;
     let manifest_entries = manifest.as_array_mut().ok_or("manifest not array")?;

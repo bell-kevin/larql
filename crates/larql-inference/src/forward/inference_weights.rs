@@ -48,8 +48,8 @@ impl InferenceWeights {
     ) -> Result<Self, VindexError> {
         if config.quant != QuantFormat::None {
             let mut idx = VectorIndex::load_vindex(path, cb)?;
-            idx.load_attn_q4k(path)?;
-            idx.load_interleaved_q4k(path)?;
+            idx.load_attn_kquant(path)?;
+            idx.load_interleaved_kquant(path)?;
             let weights = larql_vindex::load_model_weights_q4k(path, cb)?;
             Ok(Self::Quantised {
                 weights,

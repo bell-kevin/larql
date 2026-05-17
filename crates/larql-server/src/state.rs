@@ -166,7 +166,7 @@ impl LoadedModel {
             if self.ffn_only {
                 tracing::info!(
                     "ffn-only (q4k): loading norms + lm_head + embed only; \
-                     FFN dequantises per layer from interleaved_q4k.bin on request"
+                     FFN dequantises per layer from interleaved_kquant.bin on request"
                 );
             }
             larql_vindex::load_model_weights_q4k_shard(&self.path, &mut cb, self.expert_filter)

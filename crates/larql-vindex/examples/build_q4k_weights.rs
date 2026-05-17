@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let bytes_per_matrix = floats_per_matrix * 4;
             let bytes_per_layer = bytes_per_matrix * 3; // gate, up, down
 
-            let mut out = std::fs::File::create(dir.join("interleaved_q4k.bin"))?;
+            let mut out = std::fs::File::create(dir.join("interleaved_kquant.bin"))?;
             let mut total_bytes = 0usize;
 
             for layer in 0..num_layers {

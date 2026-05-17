@@ -2814,8 +2814,8 @@ fn streaming_extract_q4k_from_safetensors() {
     // ── File layout ──
     assert!(output_dir.join("attn_weights_q4k.bin").exists());
     assert!(output_dir.join("attn_weights_q4k_manifest.json").exists());
-    assert!(output_dir.join("interleaved_q4k.bin").exists());
-    assert!(output_dir.join("interleaved_q4k_manifest.json").exists());
+    assert!(output_dir.join("interleaved_kquant.bin").exists());
+    assert!(output_dir.join("interleaved_kquant_manifest.json").exists());
     assert!(output_dir.join("norms.bin").exists());
     assert!(output_dir.join("weight_manifest.json").exists());
     assert!(output_dir.join("index.json").exists());
@@ -2867,7 +2867,7 @@ fn streaming_extract_q4k_from_safetensors() {
 
     // ── interleaved (FFN) manifest ──
     let ff_manifest_json =
-        std::fs::read_to_string(output_dir.join("interleaved_q4k_manifest.json")).unwrap();
+        std::fs::read_to_string(output_dir.join("interleaved_kquant_manifest.json")).unwrap();
     let ff_entries: Vec<serde_json::Value> = serde_json::from_str(&ff_manifest_json).unwrap();
 
     // 3 tensors (gate, up, down) × num_layers
@@ -2908,7 +2908,7 @@ fn streaming_extract_q4k_from_safetensors() {
         "attn_weights_q4k.bin size must equal sum of manifest lengths"
     );
 
-    let ff_bytes = std::fs::metadata(output_dir.join("interleaved_q4k.bin"))
+    let ff_bytes = std::fs::metadata(output_dir.join("interleaved_kquant.bin"))
         .unwrap()
         .len();
     let ff_manifest_total: u64 = ff_entries
@@ -2917,30 +2917,30 @@ fn streaming_extract_q4k_from_safetensors() {
         .sum();
     assert_eq!(
         ff_bytes, ff_manifest_total,
-        "interleaved_q4k.bin size must equal sum of manifest lengths"
+        "interleaved_kquant.bin size must equal sum of manifest lengths"
     );
 
     // ── load_model_weights on a Q4K vindex must surface a clear error ──
     // The float-weight loader can't reconstruct a ModelWeights struct
     // from Q4_K/Q6_K blocks; callers must go through
-    // `VectorIndex::load_attn_q4k` / `load_interleaved_q4k` instead.
+    // `VectorIndex::load_attn_kquant` / `load_interleaved_kquant` instead.
     let mut lcb = larql_vindex::SilentLoadCallbacks;
     match larql_vindex::load_model_weights(&output_dir, &mut lcb) {
         Ok(_) => panic!("load_model_weights on a Q4K vindex must error"),
         Err(e) => {
             let msg = e.to_string();
             assert!(
-                msg.contains("quantised") && msg.contains("load_attn_q4k"),
+                msg.contains("quantised") && msg.contains("load_attn_kquant"),
                 "expected quant-dispatch error, got: {msg}"
             );
         }
     }
 
-    // ── VectorIndex::load_attn_q4k + load_interleaved_q4k must read
+    // ── VectorIndex::load_attn_kquant + load_interleaved_kquant must read
     //     back what the writer emitted ──
     let mut index = larql_vindex::VectorIndex::load_vindex(&output_dir, &mut lcb).unwrap();
-    index.load_attn_q4k(&output_dir).unwrap();
-    index.load_interleaved_q4k(&output_dir).unwrap();
+    index.load_attn_kquant(&output_dir).unwrap();
+    index.load_interleaved_kquant(&output_dir).unwrap();
     assert!(
         index.has_interleaved_kquant(),
         "interleaved Q4K should be loaded"
@@ -4087,7 +4087,7 @@ fn streaming_extract_preserves_per_layer_intermediate_for_variable_ffn() {
     //     dequantising with the wrong width silently produced half-width
     //     weights on wide layers, so this assertion is the invariant. ──
     let ff_manifest_json =
-        std::fs::read_to_string(output_dir.join("interleaved_q4k_manifest.json")).unwrap();
+        std::fs::read_to_string(output_dir.join("interleaved_kquant_manifest.json")).unwrap();
     let ff_entries: Vec<serde_json::Value> = serde_json::from_str(&ff_manifest_json).unwrap();
     for (layer, &inter) in intermediates.iter().enumerate() {
         let base = layer * 3; // gate, up, down per layer

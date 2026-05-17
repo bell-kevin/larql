@@ -1,4 +1,4 @@
-//! Stage 2 — `interleaved_q4k.bin` + manifest, plus opt-in
+//! Stage 2 — `interleaved_kquant.bin` + manifest, plus opt-in
 //! `down_features_q4k.bin` (W2 feature-major down).
 
 use std::io::{BufWriter, Write};
@@ -17,7 +17,7 @@ use super::feature_major_down::FeatureMajorDownState;
 use super::{pad_rows_to_block, Q4kWriteOptions, QuantBlockFormat};
 
 /// Write the FFN gate/up/down legs of every layer to
-/// `interleaved_q4k.bin` in `[gate Q4_K | up Q4_K | down Q6_K]`
+/// `interleaved_kquant.bin` in `[gate Q4_K | up Q4_K | down Q6_K]`
 /// layer-major order, plus a sidecar manifest. When
 /// `opts.feature_major_down` is set, also emit `down_features_q4k.bin`
 /// with the down weights transposed into `[intermediate, hidden]`
@@ -37,7 +37,7 @@ pub(super) fn write_interleaved_ffn_q4k(
 
     // ── down_features_q4k.bin (W2 feature-major down, opt-in) ──
     //
-    // Captures the same down-proj data as interleaved_q4k.bin's down
+    // Captures the same down-proj data as interleaved_kquant.bin's down
     // slot, but transposed to [intermediate, hidden] orientation and
     // re-quantised at the same precision. Lets per-feature decode at
     // load time skip the cache. Allocated lazily so non-opt-in

@@ -167,6 +167,55 @@ pub fn attach_interleaved_f32_to_test_vindex(
     storage.set_interleaved_f32(mmap);
 }
 
+/// Extend an existing `VectorIndex` with feature-major f32 up/down
+/// projections (the `up_features.bin` + `down_features.bin` layout).
+///
+/// `up_layer_matrix` and `down_layer_matrix` read from this storage,
+/// distinct from the `interleaved.bin` layout used by `interleaved_up`
+/// / `interleaved_down`. Tests that exercise the `walk_ffn_sparse`
+/// fast path (which dispatches via `up_layer_matrix` /
+/// `down_layer_matrix` when both return Some) need this fixture.
+pub fn attach_feature_major_f32_to_test_vindex(
+    weights: &ModelWeights,
+    index: &mut larql_vindex::VectorIndex,
+) {
+    let arch = &*weights.arch;
+    let mut up_payload: Vec<u8> = Vec::new();
+    let mut down_payload: Vec<u8> = Vec::new();
+    for layer in 0..weights.num_layers {
+        // up_features layout: per-layer [intermediate × hidden] f32.
+        let up = weights
+            .tensors
+            .get(&arch.ffn_up_key(layer))
+            .unwrap_or_else(|| panic!("missing ffn_up tensor"));
+        let up_slice = up.as_slice().expect("contiguous row-major");
+        up_payload.extend(up_slice.iter().flat_map(|v| v.to_le_bytes()));
+        // down_features layout: per-layer [intermediate × hidden] f32 —
+        // note the transpose vs the in-memory `[hidden × intermediate]`
+        // shape. Walk through manually so the on-disk layout is
+        // intermediate-major.
+        let down = weights
+            .tensors
+            .get(&arch.ffn_down_key(layer))
+            .unwrap_or_else(|| panic!("missing ffn_down tensor"));
+        let h = weights.hidden_size;
+        let i = weights.intermediate_size;
+        // down: [hidden × intermediate] → write as [intermediate × hidden]
+        // by transposing rows/cols at write time.
+        for inter in 0..i {
+            for hid in 0..h {
+                let val = down[[hid, inter]];
+                down_payload.extend_from_slice(&val.to_le_bytes());
+            }
+        }
+    }
+    let up_mmap = arc_mmap_from_bytes(&up_payload);
+    let down_mmap = arc_mmap_from_bytes(&down_payload);
+    let storage = std::sync::Arc::make_mut(&mut index.storage);
+    storage.set_up_features(up_mmap);
+    storage.set_down_features(down_mmap);
+}
+
 /// Bundled f32-interleaved fixture: same as [`TestFixtures`] but with
 /// the test vindex extended via [`attach_interleaved_f32_to_test_vindex`].
 /// Use for tests that need `up_layer_matrix` / `down_layer_matrix` /
@@ -382,7 +431,7 @@ pub fn write_synthetic_model_dir(dir: &std::path::Path) -> Result<(), String> {
 ///
 /// Companion to [`write_synthetic_model_dir`]. Use this when a test
 /// needs to exercise the Q4_K loader resolution order (attn_weights_q4k
-/// → interleaved_q4k → lm_head_q4) without a real Gemma snapshot on
+/// → interleaved_kquant → lm_head_q4) without a real Gemma snapshot on
 /// disk.
 ///
 /// Layout written:
@@ -394,8 +443,8 @@ pub fn write_synthetic_model_dir(dir: &std::path::Path) -> Result<(), String> {
 ///   down_meta.bin                    -- empty per-layer
 ///   attn_weights_q4k.bin             -- Q/K/V/O quantised per layer
 ///   attn_weights_q4k_manifest.json
-///   interleaved_q4k.bin              -- [gate|up|down] per layer
-///   interleaved_q4k_manifest.json
+///   interleaved_kquant.bin              -- [gate|up|down] per layer
+///   interleaved_kquant_manifest.json
 ///   lm_head_q4.bin                   -- tied embed quantised
 ///   norms.bin                        -- f32 norms (unchanged from non-Q4 path)
 /// ```
@@ -477,7 +526,7 @@ pub fn write_synthetic_q4k_model_dir(dir: &std::path::Path) -> Result<(), String
         .save_vindex(dir, &mut config)
         .map_err(|e| format!("save_vindex: {e}"))?;
 
-    // ── Q4K weights (attn_weights_q4k + interleaved_q4k + lm_head_q4 + norms) ──
+    // ── Q4K weights (attn_weights_q4k + interleaved_kquant + lm_head_q4 + norms) ──
     let mut cb = SilentBuildCallbacks;
     write_model_weights_q4k(&weights, dir, &mut cb)
         .map_err(|e| format!("write_model_weights_q4k: {e}"))?;
@@ -1151,8 +1200,8 @@ pub fn make_test_q4k_vindex(weights: &ModelWeights) -> larql_vindex::VectorIndex
     let ffn_mmap = arc_mmap_from_bytes(&ffn_payload);
     {
         let storage = std::sync::Arc::make_mut(&mut index.storage);
-        storage.set_attn_q4k(attn_mmap, Some(attn_manifest));
-        storage.set_interleaved_q4k(ffn_mmap, Some(ffn_manifest));
+        storage.set_attn_kquant(attn_mmap, Some(attn_manifest));
+        storage.set_interleaved_kquant(ffn_mmap, Some(ffn_manifest));
     }
 
     // Synth Q4_K lm_head from tied embedding (same lifecycle as
@@ -1245,5 +1294,250 @@ mod synthetic_model_dir_tests {
         let bytes = std::fs::read(dir.path().join("embeddings.bin")).expect("embeddings.bin");
         // 32 vocab × 16 hidden × 4 bytes = 2048
         assert_eq!(bytes.len(), 32 * 16 * 4);
+    }
+}
+
+// ── MockGpuBackend — Q4-capable mock for the GPU decode/prefill paths ────────
+//
+// Production Metal-only paths (`gpu/decode_loop.rs`, `gpu/prefill.rs`,
+// `gpu/forced_logits.rs`, `gpu/mod.rs`, `vindex/kquant_forward/metal.rs`)
+// short-circuit when `backend.supports(Capability::DecodeToken | PrefillQ4)`
+// returns false — which is the case for `CpuBackend`. To exercise the
+// actual function bodies under test we need a backend that advertises
+// those capabilities and returns shape-correct (but content-garbage) data
+// from `decode_token` / `prefill_q4`.
+//
+// Math methods delegate to a wrapped `CpuBackend` so test code that
+// happens to read intermediate tensors gets non-garbage values where it
+// can; the canned-shape returns from `decode_token` / `prefill_q4` are
+// fine for coverage because the calling code's contract is just
+// `Some(Vec<f32>)` of the right length.
+
+/// Minimal Q4-capable compute backend for tests. Delegates math to
+/// `CpuBackend` and overrides `supports` + `decode_token` + `prefill_q4`
+/// so the GPU paths in `larql-inference` execute end-to-end. Output
+/// values are zeros — tests assert *shape* and *that the call returned
+/// Some*, not numerical correctness.
+pub struct MockGpuBackend {
+    inner: larql_compute::CpuBackend,
+    kv_len: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for MockGpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MockGpuBackend {
+    pub fn new() -> Self {
+        Self {
+            inner: larql_compute::CpuBackend,
+            kv_len: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl larql_compute::MatMul for MockGpuBackend {
+    fn matmul(
+        &self,
+        a: ndarray::ArrayView2<f32>,
+        b: ndarray::ArrayView2<f32>,
+    ) -> ndarray::Array2<f32> {
+        self.inner.matmul(a, b)
+    }
+    fn matmul_transb(
+        &self,
+        a: ndarray::ArrayView2<f32>,
+        b: ndarray::ArrayView2<f32>,
+    ) -> ndarray::Array2<f32> {
+        self.inner.matmul_transb(a, b)
+    }
+}
+
+impl larql_compute::QuantMatVec for MockGpuBackend {
+    fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
+        self.inner.supports_quant(format)
+    }
+}
+
+impl larql_compute::DecodeBackend for MockGpuBackend {
+    fn has_kv_cache(&self) -> bool {
+        true
+    }
+
+    fn reset_kv_cache(&self) {
+        self.kv_len.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn kv_cache_len(&self) -> usize {
+        self.kv_len.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn truncate_kv_cache(&self, len: usize) {
+        self.kv_len.store(len, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn preallocate_kv_cache_per_layer(&self, _shapes: &[(usize, usize)], _max_seq: usize) {
+        // No-op — we don't actually hold a cache, just a length counter.
+    }
+
+    fn decode_token(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        _x: &[f32],
+        hidden: usize,
+        _inter: usize,
+    ) -> Option<Vec<f32>> {
+        self.kv_len
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(vec![0.0f32; hidden])
+    }
+
+    fn decode_token_with_moe(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        _x: &[f32],
+        hidden: usize,
+        _inter: usize,
+        moe_fn: &mut dyn FnMut(usize, &[f32]) -> Vec<f32>,
+    ) -> Option<Vec<f32>> {
+        // Invoke the MoE callback once with a zero residual so the
+        // expert dispatch path runs end-to-end.
+        let _ = moe_fn(0, &vec![0.0f32; hidden]);
+        self.kv_len
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(vec![0.0f32; hidden])
+    }
+
+    fn decode_token_q4k_moe<'w>(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        _x: &[f32],
+        hidden: usize,
+        _inter: usize,
+        _norm_eps: f32,
+        get_expert: &dyn Fn(usize, usize) -> Option<(&'w [u8], &'w [u8])>,
+    ) -> Option<Vec<f32>> {
+        let _ = get_expert(0, 0);
+        self.kv_len
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(vec![0.0f32; hidden])
+    }
+
+    fn prefill_q4(
+        &self,
+        _layers: &[larql_compute::FullPipelineLayer<'_>],
+        _x: &[f32],
+        hidden: usize,
+        _inter: usize,
+        seq_len: usize,
+        _use_qk_norm: bool,
+        _softcap: f32,
+    ) -> Option<Vec<f32>> {
+        self.kv_len
+            .store(seq_len, std::sync::atomic::Ordering::Relaxed);
+        Some(vec![0.0f32; seq_len * hidden])
+    }
+}
+
+impl larql_compute::ComputeBackend for MockGpuBackend {
+    fn name(&self) -> &str {
+        "mock-gpu"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn supports(&self, cap: larql_compute::backend::Capability) -> bool {
+        use larql_compute::backend::Capability::*;
+        matches!(
+            cap,
+            DecodeToken
+                | DecodeMoe
+                | DecodeQ4KMoe
+                | PrefillQ4
+                | FullPipelineQ4
+                | QuantMatVec
+                | Q4VecMat
+                | Q4PairBatch
+        )
+    }
+}
+
+#[cfg(test)]
+mod mock_gpu_backend_tests {
+    use super::*;
+    use larql_compute::backend::Capability;
+    use larql_compute::prelude::*;
+
+    #[test]
+    fn mock_advertises_decode_token_capability() {
+        let mock = MockGpuBackend::new();
+        assert!(mock.supports(Capability::DecodeToken));
+        assert!(mock.supports(Capability::PrefillQ4));
+        assert!(mock.supports(Capability::DecodeQ4KMoe));
+        assert_eq!(mock.name(), "mock-gpu");
+    }
+
+    #[test]
+    fn mock_decode_token_returns_hidden_sized_vector() {
+        let mock = MockGpuBackend::new();
+        let out = mock.decode_token(&[], &[], 8, 16).expect("Some");
+        assert_eq!(out.len(), 8);
+        assert_eq!(mock.kv_cache_len(), 1);
+    }
+
+    #[test]
+    fn mock_prefill_q4_returns_seq_x_hidden_vector() {
+        let mock = MockGpuBackend::new();
+        let out = mock
+            .prefill_q4(&[], &[], 4, 16, 3, false, 0.0)
+            .expect("Some");
+        assert_eq!(out.len(), 3 * 4);
+        assert_eq!(mock.kv_cache_len(), 3);
+    }
+
+    #[test]
+    fn mock_reset_clears_kv_len() {
+        let mock = MockGpuBackend::new();
+        let _ = mock.prefill_q4(&[], &[], 4, 16, 5, false, 0.0);
+        assert_eq!(mock.kv_cache_len(), 5);
+        mock.reset_kv_cache();
+        assert_eq!(mock.kv_cache_len(), 0);
+    }
+
+    #[test]
+    fn mock_truncate_sets_kv_len() {
+        let mock = MockGpuBackend::new();
+        let _ = mock.prefill_q4(&[], &[], 4, 16, 10, false, 0.0);
+        mock.truncate_kv_cache(3);
+        assert_eq!(mock.kv_cache_len(), 3);
+    }
+
+    #[test]
+    fn mock_decode_with_moe_invokes_callback() {
+        let mock = MockGpuBackend::new();
+        let mut callback_fired = false;
+        let mut moe_fn = |_layer: usize, _h: &[f32]| -> Vec<f32> {
+            callback_fired = true;
+            vec![0.0f32; 8]
+        };
+        let _ = mock.decode_token_with_moe(&[], &[], 8, 16, &mut moe_fn);
+        assert!(callback_fired);
+    }
+
+    #[test]
+    fn mock_decode_q4k_moe_invokes_expert_lookup() {
+        let mock = MockGpuBackend::new();
+        let lookup_count = std::cell::Cell::new(0);
+        let bytes = [0u8; 16];
+        let get_expert = |_layer: usize, _expert: usize| -> Option<(&[u8], &[u8])> {
+            lookup_count.set(lookup_count.get() + 1);
+            Some((&bytes[..], &bytes[..]))
+        };
+        let _ = mock.decode_token_q4k_moe(&[], &[], 8, 16, 1e-6, &get_expert);
+        assert!(lookup_count.get() >= 1);
     }
 }

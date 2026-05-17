@@ -111,8 +111,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut weights_sync = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
     let mut weights_async = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
     let mut index = larql_vindex::VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    index.load_attn_q4k(&vindex_path)?;
-    index.load_interleaved_q4k(&vindex_path)?;
+    index.load_attn_kquant(&vindex_path)?;
+    index.load_interleaved_kquant(&vindex_path)?;
     let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
     let token_ids =
         larql_inference::encode_prompt(&tokenizer, &*weights_sync.arch, prompt.as_str())

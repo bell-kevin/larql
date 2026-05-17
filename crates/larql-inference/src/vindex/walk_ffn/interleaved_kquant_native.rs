@@ -125,7 +125,7 @@ mod tests {
         // Regression for the LARQL_INSTRUMENT_MARKOV diagnosis: a Q4K-
         // only vindex (no gate_vectors.bin, no FP4) must NOT fall
         // through to `zero_features_dense`. After the num_features Q4K
-        // fallback, the ladder reaches `interleaved_q4k:native`.
+        // fallback, the ladder reaches `interleaved_kquant:native`.
         let f = fx();
         let walk = WalkFfn::new_unlimited(&f.weights, &f.index).with_dispatch_trace();
         let x = input(1, f.weights.hidden_size);

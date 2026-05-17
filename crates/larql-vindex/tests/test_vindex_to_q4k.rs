@@ -313,8 +313,8 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
         "index.json",
         "attn_weights_q4k.bin",
         "attn_weights_q4k_manifest.json",
-        "interleaved_q4k.bin",
-        "interleaved_q4k_manifest.json",
+        "interleaved_kquant.bin",
+        "interleaved_kquant_manifest.json",
         "lm_head_q4.bin",
         "norms.bin",
         "weight_manifest.json",
@@ -356,7 +356,7 @@ fn q4k_end_to_end_from_synthetic_safetensors() {
     // pattern as `streaming_extract_q4k_from_safetensors`'s round-trip.
     let mut lcb = larql_vindex::SilentLoadCallbacks;
     let mut index = larql_vindex::VectorIndex::load_vindex(&dst_dir, &mut lcb).unwrap();
-    index.load_attn_q4k(&dst_dir).unwrap();
+    index.load_attn_kquant(&dst_dir).unwrap();
     let slices = index.attn_kquant_layer_data(0).expect("layer 0 attn data");
     assert_eq!(slices[0].1, "Q4_K", "Q slot format");
     assert_eq!(slices[2].1, "Q6_K", "V slot format");

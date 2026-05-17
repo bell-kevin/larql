@@ -412,6 +412,151 @@ mod tests {
         }
     }
 
+    // ── BoundaryKv parsing ───────────────────────────────────────────────
+
+    #[test]
+    fn engine_kind_from_name_boundary_kv_aliases() {
+        for name in &["boundary-kv", "boundary_kv", "boundary"] {
+            assert!(
+                matches!(
+                    EngineKind::from_name(name),
+                    Some(EngineKind::BoundaryKv { .. })
+                ),
+                "failed to parse {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_boundary_kv_with_params() {
+        match EngineKind::from_name("boundary-kv:chunk_tokens=64,sequence_id=demo") {
+            Some(EngineKind::BoundaryKv {
+                chunk_tokens: 64,
+                sequence_id,
+                window_size: None,
+            }) => assert_eq!(sequence_id, "demo"),
+            other => panic!("expected BoundaryKv with custom params, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_boundary_kv_defaults() {
+        match EngineKind::from_name("boundary-kv") {
+            Some(EngineKind::BoundaryKv {
+                chunk_tokens: 512,
+                sequence_id,
+                window_size: None,
+            }) => assert_eq!(sequence_id, "default"),
+            other => panic!("expected default BoundaryKv, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_boundary_kv_with_window() {
+        match EngineKind::from_name("boundary-kv:window=128,chunk_tokens=32") {
+            Some(EngineKind::BoundaryKv {
+                window_size: Some(128),
+                chunk_tokens: 32,
+                ..
+            }) => {}
+            other => panic!("expected BoundaryKv{{window=128,chunk=32}}, got {other:?}"),
+        }
+    }
+
+    // ── MarkovResidualCodec parsing ──────────────────────────────────────
+
+    #[test]
+    fn engine_kind_from_name_markov_rs_codec_aliases() {
+        for name in &[
+            "markov-rs-codec",
+            "markov_rs_codec",
+            "markov-residual-codec",
+            "markov_residual_codec",
+        ] {
+            assert!(
+                matches!(
+                    EngineKind::from_name(name),
+                    Some(EngineKind::MarkovResidualCodec {
+                        codec: markov_residual_codec::ColdResidualCodec::Bf16,
+                        ..
+                    })
+                ),
+                "failed to parse {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_kind_from_name_markov_rs_codec_with_window() {
+        match EngineKind::from_name("markov-rs-codec:window=256") {
+            Some(EngineKind::MarkovResidualCodec {
+                window_size: Some(256),
+                codec: markov_residual_codec::ColdResidualCodec::Bf16,
+            }) => {}
+            other => panic!("expected MarkovResidualCodec{{window=256,codec=Bf16}}, got {other:?}"),
+        }
+    }
+
+    // ── display_name for new variants ────────────────────────────────────
+
+    #[test]
+    fn engine_kind_display_name_covers_new_variants() {
+        let kinds = [
+            EngineKind::BoundaryKv {
+                window_size: None,
+                chunk_tokens: 512,
+                sequence_id: "x".into(),
+            },
+            EngineKind::MarkovResidualCodec {
+                window_size: None,
+                codec: markov_residual_codec::ColdResidualCodec::Bf16,
+            },
+        ];
+        let expected = ["boundary-kv", "markov-rs-codec"];
+        for (k, name) in kinds.into_iter().zip(expected) {
+            assert_eq!(k.display_name(), name);
+        }
+    }
+
+    // ── build() for new variants ─────────────────────────────────────────
+
+    #[test]
+    fn engine_kind_build_boundary_kv_returns_engine() {
+        let kind = EngineKind::BoundaryKv {
+            window_size: None,
+            chunk_tokens: 16,
+            sequence_id: "test".into(),
+        };
+        let engine = kind.build(larql_inference::cpu_engine_backend());
+        assert_eq!(engine.name(), "boundary-kv");
+    }
+
+    #[test]
+    fn engine_kind_build_markov_rs_codec_returns_engine() {
+        let kind = EngineKind::MarkovResidualCodec {
+            window_size: Some(32),
+            codec: markov_residual_codec::ColdResidualCodec::Bf16,
+        };
+        let engine = kind.build(larql_inference::cpu_engine_backend());
+        assert_eq!(engine.name(), "markov-rs-codec");
+    }
+
+    // ── split_specs edge: first piece doesn't parse ───────────────────────
+
+    #[test]
+    fn split_specs_first_piece_unparseable_is_preserved() {
+        // The first comma piece doesn't match a known engine name. The
+        // splitter keeps it so the caller can surface a parse error rather
+        // than silently dropping it (lines 239-242).
+        let v = EngineKind::split_specs("garbage_engine,standard");
+        // garbage_engine doesn't parse → kept as the first spec; then
+        // 'standard' parses → becomes second spec.
+        assert_eq!(v, vec!["garbage_engine", "standard"]);
+        // The caller's `from_name` will then fail on "garbage_engine".
+        assert!(EngineKind::from_name(&v[0]).is_none());
+        assert!(EngineKind::from_name(&v[1]).is_some());
+    }
+
     #[test]
     fn engine_info_summary_with_config() {
         let info = EngineInfo {

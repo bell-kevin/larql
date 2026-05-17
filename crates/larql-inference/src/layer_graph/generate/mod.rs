@@ -113,8 +113,8 @@ mod tests {
         let path = std::path::Path::new(&vpath);
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut index = larql_vindex::VectorIndex::load_vindex(path, &mut cb).ok()?;
-        index.load_attn_q4k(path).ok()?;
-        index.load_interleaved_q4k(path).ok()?;
+        index.load_attn_kquant(path).ok()?;
+        index.load_interleaved_kquant(path).ok()?;
         let weights = larql_vindex::load_model_weights_q4k(path, &mut cb).ok()?;
         Some((index, weights))
     }
@@ -252,10 +252,12 @@ mod tests {
         let mut cb = larql_vindex::SilentLoadCallbacks;
         let mut index =
             larql_vindex::VectorIndex::load_vindex(tmp.path(), &mut cb).expect("load_vindex");
-        index.load_attn_q4k(tmp.path()).expect("load_attn_q4k");
         index
-            .load_interleaved_q4k(tmp.path())
-            .expect("load_interleaved_q4k");
+            .load_attn_kquant(tmp.path())
+            .expect("load_attn_kquant");
+        index
+            .load_interleaved_kquant(tmp.path())
+            .expect("load_interleaved_kquant");
         let weights = larql_vindex::load_model_weights_q4k(tmp.path(), &mut cb)
             .expect("load_model_weights_q4k");
         let tokenizer =
@@ -264,10 +266,12 @@ mod tests {
     }
 
     #[test]
-    fn generate_routes_through_cpu_fallback_when_backend_lacks_q4() {
-        // `CpuBackend::has_q4()` is false → generate() takes the CPU
-        // fallback branch. Drives a real prompt through the full
-        // generation pipeline against the synthetic Q4K fixture.
+    fn generate_routes_through_cpu_fallback_when_backend_lacks_fused_decode() {
+        // `CpuBackend` advertises Q4_K matvec via `supports_quant(Q4_K)`
+        // but doesn't implement the fused `decode_token` kernel, so
+        // `generate()` takes the CPU fallback branch. Drives a real
+        // prompt through the full generation pipeline against the
+        // synthetic Q4K fixture.
         let (_tmp, tokenizer, mut weights, index) = synthetic_q4k_setup();
         // Synthetic tokenizer treats `[N]` as token N — use single-token
         // prompts so the encode succeeds.

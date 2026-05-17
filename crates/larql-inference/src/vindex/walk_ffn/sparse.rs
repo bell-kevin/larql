@@ -305,3 +305,84 @@ impl<'a> WalkFfn<'a> {
         Some((out, full_activation))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::{
+        make_test_q4k_vindex, make_test_q4k_weights, make_test_vindex, make_test_weights,
+    };
+    use crate::vindex::{WalkFfn, WalkFfnConfig};
+    use ndarray::Array2;
+
+    fn x(seq: usize, hidden: usize) -> Array2<f32> {
+        Array2::from_shape_vec(
+            (seq, hidden),
+            (0..seq * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect(),
+        )
+        .unwrap()
+    }
+
+    /// Sparse walk over the Q4K fixture — `up_layer_matrix`/`down_layer_matrix`
+    /// both return None (Q4K storage is byte-only) so the function
+    /// routes through the row-fallback ladder dispatching via
+    /// `ffn_row_dot` / `ffn_row_scaled_add`.
+    #[test]
+    fn walk_ffn_sparse_routes_through_q4k_fixture() {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 8);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let result = ffn.walk_ffn_sparse(0, &x(1, weights.hidden_size));
+        if let Some((out, activation)) = result {
+            assert_eq!(out.shape(), &[1, weights.hidden_size]);
+            assert_eq!(activation.shape()[0], 1);
+        }
+    }
+
+    /// Sparse walk over the feature-major f32 fixture — `up_layer_matrix`
+    /// + `down_layer_matrix` both return Some so the function bypasses
+    ///   the row-fallback and goes through the BLAS gemm fast path.
+    #[test]
+    fn walk_ffn_sparse_routes_through_feature_major_f32_fixture() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut index = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut index);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 4);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let result = ffn
+            .walk_ffn_sparse(0, &x(2, weights.hidden_size))
+            .expect("feature-major f32 fixture should produce output");
+        let (out, _activation) = result;
+        assert_eq!(out.shape(), &[2, weights.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    /// Sparse walk with full-K (K >= num_features) routes through the
+    /// gemv fast path. Drives the `hits_len_ge_intermediate` branch.
+    #[test]
+    fn walk_ffn_sparse_full_k_takes_gemv_path() {
+        use crate::test_utils::attach_feature_major_f32_to_test_vindex;
+        let weights = make_test_weights();
+        let mut index = make_test_vindex(&weights);
+        attach_feature_major_f32_to_test_vindex(&weights, &mut index);
+        let cfg = WalkFfnConfig::dense(weights.num_layers);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let out = ffn
+            .walk_ffn_sparse(0, &x(1, weights.hidden_size))
+            .expect("dense-K sparse walk should succeed");
+        assert_eq!(out.0.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// Sparse walk against a bare vindex (no FFN data) returns None —
+    /// no native f32, no Q4K, no FP4 → the `row_fallback` guard fires.
+    #[test]
+    fn walk_ffn_sparse_returns_none_when_no_ffn_data() {
+        let weights = make_test_weights();
+        let index = make_test_vindex(&weights);
+        let cfg = WalkFfnConfig::sparse(weights.num_layers, 4);
+        let ffn = WalkFfn::from_config(&weights, &index, cfg);
+        let result = ffn.walk_ffn_sparse(0, &x(1, weights.hidden_size));
+        assert!(result.is_none());
+    }
+}

@@ -44,7 +44,7 @@ pub enum ExtractPhase {
     /// `attn_weights.bin` / `up_weights.bin` / `down_weights.bin` /
     /// `norms.bin` / `lm_head.bin` (f32 path).
     Weights,
-    /// `attn_weights_q4k.bin` + `interleaved_q4k.bin` (Q4K path).
+    /// `attn_weights_q4k.bin` + `interleaved_kquant.bin` (Q4K path).
     Q4kWeights,
 }
 

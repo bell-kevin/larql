@@ -269,4 +269,46 @@ mod tests {
         assert!(mem2 > mem1);
         assert!(mem3 > mem2);
     }
+
+    // ── Q4K paths via CPU fallback ────────────────────────────────────────
+    //
+    // prefill_quant + decode_step_quant dequant attn tensors into
+    // `weights.tensors`, then route through the f32 prefill/decode.
+    // Mirrors the markov_residual::engine CPU-fallback test pattern.
+
+    #[test]
+    fn prefill_quant_cpu_fallback_runs_end_to_end() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = NoCacheEngine::new();
+        let h = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill_quant cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn decode_step_quant_cpu_fallback_appends_token() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = NoCacheEngine::new();
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill_quant");
+        let mem_before = engine.memory_bytes();
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode_step_quant cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(
+            engine.memory_bytes() > mem_before,
+            "no-cache memory should grow with each new token"
+        );
+    }
 }

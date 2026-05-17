@@ -825,4 +825,54 @@ mod tests {
             None => std::env::remove_var(L),
         }
     }
+
+    // ── StageCapture::len / is_empty / num_layers accessors ──────────────
+
+    #[test]
+    fn stage_capture_len_and_is_empty() {
+        let empty = cap(&[], 0, "x");
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        let one = cap(&[("a", vec![1.0])], 0, "x");
+        assert_eq!(one.len(), 1);
+        assert!(!one.is_empty());
+    }
+
+    // ── cpu_prefill (full path against Q4K fixture) ──────────────────────
+
+    #[test]
+    fn cpu_prefill_runs_end_to_end_against_q4k_fixture() {
+        use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        // cpu_prefill drives `predict_kquant_hidden` with the env vars
+        // set, then reads back every `cpu_L0_<stage>.f32` file written
+        // into the temp dir. Note: the dump config in
+        // `crate::forward::dump_config` uses a `OnceLock`-cached env-var
+        // read, so other tests may have observed the unset state first
+        // — in that case the dump never fires and the `stages` map is
+        // empty. We assert the capture *shape* (layer/seq_len/backend
+        // labels) without depending on the cache miss.
+        let cap = StageCapture::cpu_prefill(&mut weights, &[0u32, 1, 2], &index, 0)
+            .expect("cpu_prefill against Q4K fixture must succeed");
+        assert_eq!(cap.layer, 0);
+        assert_eq!(cap.seq_len, 3);
+        assert_eq!(cap.backend, "cpu_prefill");
+    }
+
+    /// Round-trip on `project_to_last_position`: the prefill capture
+    /// returns `seq_len > 1`, projection slices each stage down to the
+    /// last position and reports `seq_len=1`.
+    #[test]
+    fn cpu_prefill_then_project_to_last_position_returns_single_row_capture() {
+        use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let cap = StageCapture::cpu_prefill(&mut weights, &[0u32, 1, 2], &index, 0).unwrap();
+        let projected = cap.project_to_last_position();
+        assert_eq!(projected.seq_len, 1);
+        // Projection produces a fresh map with the same keys (whether
+        // or not the dump fired — empty in, empty out).
+        assert_eq!(projected.stages.len(), cap.stages.len());
+    }
 }

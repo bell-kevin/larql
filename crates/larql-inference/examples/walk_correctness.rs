@@ -121,7 +121,7 @@ impl<'a> FfnBackend for DualFfn<'a> {
 /// (the `--down-q4k` build variant). Falls back to `false` — the safer,
 /// tighter-threshold default — on any parse or IO error.
 fn detect_down_q4k(vindex: &std::path::Path) -> bool {
-    let manifest_path = vindex.join("interleaved_q4k_manifest.json");
+    let manifest_path = vindex.join("interleaved_kquant_manifest.json");
     let Ok(bytes) = std::fs::read(&manifest_path) else {
         return false;
     };

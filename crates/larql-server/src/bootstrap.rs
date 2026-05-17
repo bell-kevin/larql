@@ -225,7 +225,7 @@ pub fn load_single_vindex(
         // these the Q4K decode panics with "attn Q4K slices missing".
         //
         // `--ffn-only` skips attention weights (no infer path) but MUST
-        // still mmap interleaved_q4k so per-layer walk-ffn requests can
+        // still mmap interleaved_kquant so per-layer walk-ffn requests can
         // call `kquant_ffn_forward_layer`.
         let need_ffn_mmap = opts.ffn_only || (!opts.no_infer && has_weights);
         if !opts.no_infer && !opts.ffn_only && has_weights {
@@ -236,7 +236,7 @@ pub fn load_single_vindex(
                 let _ = index.load_lm_head_q4(&path);
             }
             if path.join(ATTN_WEIGHTS_Q4K_BIN).is_file() {
-                if let Err(e) = index.load_attn_q4k(&path) {
+                if let Err(e) = index.load_attn_kquant(&path) {
                     warn!("  Attn Q4K: failed to load ({e}) — generation may not work");
                 } else {
                     info!("  Attn Q4K: loaded (inference path enabled)");
@@ -249,7 +249,7 @@ pub fn load_single_vindex(
         }
         if need_ffn_mmap {
             if path.join(INTERLEAVED_Q4K_BIN).is_file() {
-                if let Err(e) = index.load_interleaved_q4k(&path) {
+                if let Err(e) = index.load_interleaved_kquant(&path) {
                     warn!("  Interleaved Q4K: failed to load ({e})");
                 } else if opts.ffn_only {
                     info!("  Interleaved Q4K: loaded (ffn-service)");

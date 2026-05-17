@@ -1,4 +1,4 @@
-//! Q4_K / Q6_K interleaved FFN (`interleaved_q4k.bin`) plus the
+//! Q4_K / Q6_K interleaved FFN (`interleaved_kquant.bin`) plus the
 //! feature-major down sidecar (`down_features_q4k.bin`).
 //!
 //! Both files come with a JSON manifest declaring per-slice format
@@ -30,7 +30,7 @@ use super::{DownFeaturesQ4kEntry, FFN_COMPONENTS_PER_LAYER};
 /// Read + typed-deserialise a Q4_K manifest JSON file. Validates each
 /// entry's format tag against `quant::registry`. `display_name` is the
 /// filename used in error messages so a parse failure reports which
-/// manifest broke. Centralised so both `load_interleaved_q4k` and
+/// manifest broke. Centralised so both `load_interleaved_kquant` and
 /// `load_down_features_q4k` go through the same parse + validation
 /// path.
 fn read_q4k_manifest(
@@ -55,16 +55,18 @@ fn read_q4k_manifest(
 impl VectorIndex {
     /// Load Q4_K/Q6_K interleaved FFN data (Ollama-compatible, matches attn format).
     ///
-    /// Also reads the optional `interleaved_q4k_manifest.json` sidecar emitted
+    /// Also reads the optional `interleaved_kquant_manifest.json` sidecar emitted
     /// by the streaming Q4 writer. When the manifest is present callers get
     /// per-matrix layout (offsets, lengths, formats) via
     /// [`VectorIndex::interleaved_kquant_layer_data`]. When it's absent — older
     /// vindexes from `build_q4k_weights.rs` — callers fall back to the legacy
     /// uniform-stride path.
-    pub fn load_interleaved_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+    pub fn load_interleaved_kquant(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join(INTERLEAVED_Q4K_BIN);
         if !path.exists() {
-            return Err(VindexError::Parse("interleaved_q4k.bin not found".into()));
+            return Err(VindexError::Parse(
+                "interleaved_kquant.bin not found".into(),
+            ));
         }
         let file = std::fs::File::open(&path)?;
         // Demand-paged: the q4k forward walk reads only the activated features'
@@ -91,7 +93,7 @@ impl VectorIndex {
         } else {
             None
         };
-        Arc::make_mut(&mut self.storage).set_interleaved_q4k(mmap, manifest);
+        Arc::make_mut(&mut self.storage).set_interleaved_kquant(mmap, manifest);
         Ok(())
     }
 
@@ -115,7 +117,7 @@ impl VectorIndex {
         }
         let file = std::fs::File::open(&path)?;
         // Demand-paged: only the activated features' byte ranges per
-        // layer get read in. Same access pattern as `interleaved_q4k.bin`.
+        // layer get read in. Same access pattern as `interleaved_kquant.bin`.
         let mmap = Arc::new(unsafe { mmap_demand_paged(&file)? });
 
         let raw = read_q4k_manifest(&manifest_path, DOWN_FEATURES_Q4K_MANIFEST_JSON)?;

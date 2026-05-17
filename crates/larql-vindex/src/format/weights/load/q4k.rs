@@ -1,7 +1,7 @@
 //! Q4_K weight loader — reconstructs the minimum `ModelWeights` needed
 //! to drive a Q4_K vindex forward pass: embeddings, norms, optional
 //! `lm_head`, and packed-byte-range references for `attn_weights_q4k.bin`,
-//! `interleaved_q4k.bin`, and the per-layer `layers/layer_{L:02}.weights`
+//! `interleaved_kquant.bin`, and the per-layer `layers/layer_{L:02}.weights`
 //! files. The forward pass dequantises on demand.
 
 use std::collections::HashMap;

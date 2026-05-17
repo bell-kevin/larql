@@ -90,7 +90,7 @@ impl VectorIndex {
     /// The FP4 fallback fires when an FP4-only vindex has no legacy
     /// `gate_vectors.bin` mapped. The Q4K fallback fires for
     /// quantised-FFN-only vindexes (Gemma 3 4B Q4K and similar) where
-    /// gate vectors live inside `interleaved_q4k.bin` and no separate
+    /// gate vectors live inside `interleaved_kquant.bin` and no separate
     /// `gate_vectors.bin` is emitted. Without these fallbacks the walk
     /// kernel sees `num_features == 0` and falls through to the
     /// safetensors weights path — silently bypassing the vindex and

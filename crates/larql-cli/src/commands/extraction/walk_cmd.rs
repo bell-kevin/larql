@@ -417,7 +417,7 @@ fn run_with_vindex_weights(
             load_start.elapsed().as_secs_f64()
         );
         // RSS now = attn weights + embeddings + norms. FFN payload (gate_vectors,
-        // interleaved_q4k) is demand-paged; pages fault in during inference.
+        // interleaved_kquant) is demand-paged; pages fault in during inference.
         vlog!(verbose, "  RSS after weights: {:.1} GB", rss_mb() / 1024.0);
         if args.ffn_remote.is_some() {
             return run_predict_q4k_remote(&mut weights, &tokenizer, args, vindex_path);
@@ -497,7 +497,7 @@ fn run_predict_q4k(
 
     // The Q4 vindex we loaded already lives inside the VectorIndex used by
     // the walk caller, but we need our OWN VectorIndex with the Q4 mmaps
-    // loaded (load_attn_q4k, load_interleaved_q4k) since the caller's index
+    // loaded (load_attn_kquant, load_interleaved_kquant) since the caller's index
     // might have been constructed without those accessors wired up.
     let vindex_path = args
         .index
@@ -505,8 +505,8 @@ fn run_predict_q4k(
         .ok_or("--index required for Q4 predict path")?;
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let mut q4_index = VectorIndex::load_vindex(vindex_path, &mut cb)?;
-    q4_index.load_attn_q4k(vindex_path)?;
-    q4_index.load_interleaved_q4k(vindex_path)?;
+    q4_index.load_attn_kquant(vindex_path)?;
+    q4_index.load_interleaved_kquant(vindex_path)?;
     let _ = q4_index.load_lm_head_q4(vindex_path);
 
     // Metal Q4K path (`--metal`) routes autoregressive generation through the
@@ -530,7 +530,7 @@ fn run_predict_q4k(
 
     let result = if args.metal {
         let backend = larql_compute::default_backend();
-        if !backend.has_q4() {
+        if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
             return Err(
                 "Metal backend unavailable — rebuild with `--features metal` \
                 and run on an M-series Mac."
@@ -645,7 +645,7 @@ fn run_predict_q4k_remote(
     // Q4K FFN mmap is NOT loaded — FFN runs on the server.
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let mut q4_index = VectorIndex::load_vindex(vindex_path, &mut cb)?;
-    q4_index.load_attn_q4k(vindex_path)?;
+    q4_index.load_attn_kquant(vindex_path)?;
 
     let token_ids = larql_inference::encode_prompt(tokenizer, &*weights.arch, args.prompt.as_str())
         .map_err(|e| format!("tokenize error: {e}"))?;
@@ -935,12 +935,12 @@ fn run_predict_remote(
                 .expect("index required for batch dispatch"),
             &mut cb,
         )?;
-        q4_index.load_attn_q4k(
+        q4_index.load_attn_kquant(
             args.index
                 .as_deref()
                 .expect("index required for batch dispatch"),
         )?;
-        q4_index.load_interleaved_q4k(
+        q4_index.load_interleaved_kquant(
             args.index
                 .as_deref()
                 .expect("index required for batch dispatch"),

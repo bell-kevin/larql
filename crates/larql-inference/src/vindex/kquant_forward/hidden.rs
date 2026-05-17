@@ -239,3 +239,43 @@ fn run_moe_layer_cpu(
 
     Some((h_out, kv_out))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+    /// `predict_kquant_hidden` on the Gemma 3-style Q4K fixture — drives
+    /// the non-MoE branch (every layer's `run_layer_with_ffn` call) for
+    /// the full prompt. The MoE branch is unreachable without a Gemma 4
+    /// hybrid-MoE arch fixture; this test covers the rest.
+    #[test]
+    fn predict_kquant_hidden_returns_shape_and_finite() {
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let h = predict_kquant_hidden(&mut weights, &[0u32, 1, 2], &index, None);
+        assert_eq!(h.shape(), &[3, weights.hidden_size]);
+        assert!(
+            h.iter().all(|v| v.is_finite()),
+            "Q4K hidden state must be finite"
+        );
+    }
+
+    #[test]
+    fn predict_kquant_hidden_single_token() {
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let h = predict_kquant_hidden(&mut weights, &[5u32], &index, None);
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    /// `build_moe_router_weights` returns `None` for non-MoE archs
+    /// (every standard arch's `moe_router_key` returns None). Drives
+    /// the early-return.
+    #[test]
+    fn build_moe_router_weights_none_for_non_moe_arch() {
+        let weights = make_test_q4k_weights();
+        let arch = &*weights.arch;
+        assert!(build_moe_router_weights(&weights, arch, 0).is_none());
+    }
+}

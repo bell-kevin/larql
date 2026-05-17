@@ -137,7 +137,7 @@ pub fn vindex_to_q4k(
         .map_err(|e| VindexError::Parse(format!("seed staging index.json: {e}")))?;
 
     // Write Q4K files into the staging directory. Produces
-    // attn_weights_q4k.bin + manifest, interleaved_q4k.bin + manifest,
+    // attn_weights_q4k.bin + manifest, interleaved_kquant.bin + manifest,
     // lm_head_q4.bin, norms.bin, weight_manifest.json. Also rewrites
     // index.json with quant=q4k.
     let opts = Q4kWriteOptions {
@@ -236,7 +236,7 @@ pub fn vindex_to_q4k(
     })?;
 
     // Size reporting. FFN src = up_weights.bin + down_weights.bin
-    // (already dense f32). FFN dst = interleaved_q4k.bin.
+    // (already dense f32). FFN dst = interleaved_kquant.bin.
     let src_ffn_bytes = size_of(&src.join(UP_WEIGHTS_BIN)).unwrap_or(0)
         + size_of(&src.join(DOWN_WEIGHTS_BIN)).unwrap_or(0)
         + size_of(&src.join(GATE_VECTORS_BIN)).unwrap_or(0);
@@ -310,15 +310,15 @@ pub struct AddFeatureMajorDownReport {
 
 /// Retrofit `down_features_q4k.bin` into an existing Q4K vindex
 /// without re-quantising the rest of the weights. Reads the down
-/// portion of `interleaved_q4k.bin` per layer, transposes to
+/// portion of `interleaved_kquant.bin` per layer, transposes to
 /// `[intermediate, hidden]`, re-quantises at the same precision the
 /// source used, and writes the W2 file + manifest in place.
 ///
 /// Idempotent: if `down_features_q4k.bin` already exists, returns
 /// `Ok` with `skipped: true` and doesn't touch the directory.
 ///
-/// Precondition: the vindex must have `interleaved_q4k.bin` +
-/// `interleaved_q4k_manifest.json` (i.e. `quant: q4k` in
+/// Precondition: the vindex must have `interleaved_kquant.bin` +
+/// `interleaved_kquant_manifest.json` (i.e. `quant: q4k` in
 /// `index.json`). Browse-only / f32-only vindexes don't.
 pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownReport, VindexError> {
     use crate::format::weights::write_q4k::feature_major_down::FeatureMajorDownState;
@@ -339,7 +339,7 @@ pub fn add_feature_major_down(vindex_dir: &Path) -> Result<AddFeatureMajorDownRe
         });
     }
 
-    // Source: interleaved_q4k.bin + manifest.
+    // Source: interleaved_kquant.bin + manifest.
     let interleaved_path = vindex_dir.join(INTERLEAVED_Q4K_BIN);
     let interleaved_manifest_path = vindex_dir.join(INTERLEAVED_Q4K_MANIFEST_JSON);
     if !interleaved_path.exists() || !interleaved_manifest_path.exists() {

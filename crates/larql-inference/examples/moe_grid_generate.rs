@@ -73,8 +73,8 @@ fn main() -> Result<(), BoxErr> {
     let t0 = std::time::Instant::now();
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    index.load_attn_q4k(&vindex_path).ok();
-    index.load_interleaved_q4k(&vindex_path).ok();
+    index.load_attn_kquant(&vindex_path).ok();
+    index.load_interleaved_kquant(&vindex_path).ok();
 
     let cfg = larql_vindex::load_vindex_config(&vindex_path)?;
     let weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;

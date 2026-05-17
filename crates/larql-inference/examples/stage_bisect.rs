@@ -108,8 +108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tokenizer = load_vindex_tokenizer(&vindex_path)?;
 
     let mut q4_index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    q4_index.load_attn_q4k(&vindex_path)?;
-    q4_index.load_interleaved_q4k(&vindex_path)?;
+    q4_index.load_attn_kquant(&vindex_path)?;
+    q4_index.load_interleaved_kquant(&vindex_path)?;
     let _ = q4_index.load_lm_head_q4(&vindex_path);
 
     let mut w_metal = load_model_weights_q4k(&vindex_path, &mut cb)?;

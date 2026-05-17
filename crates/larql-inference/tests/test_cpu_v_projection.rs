@@ -154,7 +154,7 @@ fn cpu_q4k_load_produces_distinct_w_k_and_w_v_for_gemma4_global() {
     use larql_vindex::VectorIndex;
     let mut cb2 = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&vindex, &mut cb2).expect("load vindex");
-    index.load_attn_q4k(&vindex).expect("load_attn_q4k");
+    index.load_attn_kquant(&vindex).expect("load_attn_kquant");
 
     let layer: usize = 5;
     let attn = index

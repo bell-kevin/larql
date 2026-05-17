@@ -142,7 +142,7 @@ fn install_synthetic_q4k(v: &mut VectorIndex, intermediate: usize) {
     anon.copy_from_slice(&payload);
     let mmap = std::sync::Arc::new(anon.make_read_only().unwrap());
     let storage = std::sync::Arc::make_mut(&mut v.storage);
-    storage.set_interleaved_q4k(mmap, Some(manifest));
+    storage.set_interleaved_kquant(mmap, Some(manifest));
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn q4k_ffn_intermediate_width_none_on_unknown_format() {
         (512, 256, "QX_K".to_string()),
     ];
     let storage = std::sync::Arc::make_mut(&mut v.storage);
-    storage.set_interleaved_q4k(mmap, Some(manifest));
+    storage.set_interleaved_kquant(mmap, Some(manifest));
     assert!(v.kquant_ffn_intermediate_width(0).is_none());
 }
 
@@ -234,7 +234,7 @@ fn q4k_ffn_intermediate_width_none_when_bytes_not_a_whole_row() {
     offset += up_len;
     manifest.push((offset, down_len, "Q4_K".to_string()));
     let storage = std::sync::Arc::make_mut(&mut v.storage);
-    storage.set_interleaved_q4k(mmap, Some(manifest));
+    storage.set_interleaved_kquant(mmap, Some(manifest));
     assert!(v.kquant_ffn_intermediate_width(0).is_none());
 }
 
@@ -272,7 +272,7 @@ fn num_features_q4k_fallback_real_gemma_test_fixture() {
         offset += down;
     }
     let storage = std::sync::Arc::make_mut(&mut v.storage);
-    storage.set_interleaved_q4k(mmap, Some(manifest));
+    storage.set_interleaved_kquant(mmap, Some(manifest));
     for layer in 0..num_layers {
         assert_eq!(
             v.num_features(layer),

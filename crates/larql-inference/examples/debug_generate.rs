@@ -6,8 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vd = std::path::PathBuf::from("output/gemma3-4b-v2.vindex");
     let mut index =
         larql_vindex::VectorIndex::load_vindex(&vd, &mut larql_vindex::SilentLoadCallbacks)?;
-    let _ = index.load_attn_q4k(&vd);
-    let _ = index.load_interleaved_q4k(&vd);
+    let _ = index.load_attn_kquant(&vd);
+    let _ = index.load_interleaved_kquant(&vd);
     let _ = index.load_interleaved_q4(&vd);
     let _ = index.load_lm_head(&vd);
     let _ = index.load_down_features(&vd);
@@ -16,7 +16,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gate_index: &dyn larql_vindex::GateIndex = &index;
 
     println!("=== Debug Generate Pipeline ===\n");
-    println!("Backend: {} (has_q4={})", backend.name(), backend.has_q4());
+    println!(
+        "Backend: {} (supports Q4_K = {})",
+        backend.name(),
+        backend.supports_quant(::larql_compute::QuantFormat::Q4_K)
+    );
     println!(
         "has_q4k attn L0: {}",
         index.attn_kquant_layer_data(0).is_some()

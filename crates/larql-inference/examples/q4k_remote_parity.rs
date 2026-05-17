@@ -131,8 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Local path: full q4k forward in-process ──
     let mut local_index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    local_index.load_attn_q4k(&vindex_path)?;
-    local_index.load_interleaved_q4k(&vindex_path)?;
+    local_index.load_attn_kquant(&vindex_path)?;
+    local_index.load_interleaved_kquant(&vindex_path)?;
 
     let t_local = Instant::now();
     let local_result = predict_kquant(
@@ -159,10 +159,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "remote hidden_size mismatch",
     );
 
-    // Client-side VectorIndex: only attention Q4_K mmap, NO interleaved_q4k.bin.
+    // Client-side VectorIndex: only attention Q4_K mmap, NO interleaved_kquant.bin.
     // (The FFN lives on the server; loading it client-side would defeat the demo.)
     let mut remote_index = VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-    remote_index.load_attn_q4k(&vindex_path)?;
+    remote_index.load_attn_kquant(&vindex_path)?;
 
     let t_remote = Instant::now();
     let remote_result = predict_kquant_with_ffn(

@@ -45,8 +45,8 @@ fn main() {
 
     // Load optional data files
     let _ = index.load_down_features(&vindex_dir);
-    let _ = index.load_attn_q4k(&vindex_dir);
-    let _ = index.load_interleaved_q4k(&vindex_dir);
+    let _ = index.load_attn_kquant(&vindex_dir);
+    let _ = index.load_interleaved_kquant(&vindex_dir);
     let _ = index.load_interleaved_q4(&vindex_dir);
     let _ = index.load_lm_head(&vindex_dir);
 

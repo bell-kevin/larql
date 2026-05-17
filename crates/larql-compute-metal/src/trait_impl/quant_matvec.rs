@@ -276,8 +276,16 @@ impl QuantMatVec for MetalBackend {
         Some(crate::buffers::read_buffer_f32(&buf_out, num_rows))
     }
 
-    fn has_q4(&self) -> bool {
-        true
+    fn supports_quant(&self, format: larql_compute::QuantFormat) -> bool {
+        use larql_compute::QuantFormat;
+        matches!(
+            format,
+            QuantFormat::Q4_0
+                | QuantFormat::Q4_K
+                | QuantFormat::Q4_KF
+                | QuantFormat::Q6_K
+                | QuantFormat::Q8_0
+        )
     }
 }
 

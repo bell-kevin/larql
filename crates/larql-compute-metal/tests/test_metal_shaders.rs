@@ -598,7 +598,7 @@ fn buffer_cache_reuses_same_pointer() {
 fn metal_backend_implements_trait() {
     let metal = get_metal();
 
-    assert!(metal.has_q4());
+    assert!(metal.supports_quant(::larql_compute::QuantFormat::Q4_K));
     assert!(metal.name().contains("metal"));
 
     let a = synth(2, 64, 42);

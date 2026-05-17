@@ -581,8 +581,8 @@ fn run_layer_diff(
     // ── Load vindex (shared mmap; two weight copies for the two runs) ────────
     let mut cb = larql_vindex::SilentLoadCallbacks;
     let mut q4_index = larql_vindex::VectorIndex::load_vindex(path, &mut cb)?;
-    q4_index.load_attn_q4k(path)?;
-    q4_index.load_interleaved_q4k(path)?;
+    q4_index.load_attn_kquant(path)?;
+    q4_index.load_interleaved_kquant(path)?;
     let _ = q4_index.load_lm_head_q4(path);
     let tokenizer = larql_vindex::load_vindex_tokenizer(path)?;
     let mut w_metal = larql_vindex::load_model_weights_q4k(path, &mut cb)?;

@@ -150,8 +150,8 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let mut weights = larql_vindex::load_model_weights_q4k(&vindex_path, &mut cb)?;
             let tokenizer = larql_vindex::load_vindex_tokenizer(&vindex_path)?;
             let mut index = larql_vindex::VectorIndex::load_vindex(&vindex_path, &mut cb)?;
-            index.load_attn_q4k(&vindex_path)?;
-            index.load_interleaved_q4k(&vindex_path)?;
+            index.load_attn_kquant(&vindex_path)?;
+            index.load_interleaved_kquant(&vindex_path)?;
             let token_ids =
                 larql_inference::encode_prompt(&tokenizer, &*weights.arch, args.prompt.as_str())
                     .map_err(|e| format!("tokenize: {e}"))?;

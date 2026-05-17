@@ -209,8 +209,8 @@ pub(super) fn run_oracle_roundtrip(
     let start = Instant::now();
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
-    index.load_attn_q4k(&args.index)?;
-    index.load_interleaved_q4k(&args.index)?;
+    index.load_attn_kquant(&args.index)?;
+    index.load_interleaved_kquant(&args.index)?;
     let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
     let tokenizer = load_vindex_tokenizer(&args.index)?;
     if weights.arch.is_hybrid_moe() {
@@ -330,8 +330,8 @@ pub(super) fn run_oracle_lowrank(
     let start = Instant::now();
     let mut cb = SilentLoadCallbacks;
     let mut index = VectorIndex::load_vindex(&args.index, &mut cb)?;
-    index.load_attn_q4k(&args.index)?;
-    index.load_interleaved_q4k(&args.index)?;
+    index.load_attn_kquant(&args.index)?;
+    index.load_interleaved_kquant(&args.index)?;
     let mut weights = load_model_weights_q4k(&args.index, &mut cb)?;
     let tokenizer = load_vindex_tokenizer(&args.index)?;
     if weights.arch.is_hybrid_moe() {

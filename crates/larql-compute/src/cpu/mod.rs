@@ -117,8 +117,12 @@ impl QuantMatVec for CpuBackend {
         Some((out_a, out_b))
     }
 
-    fn has_q4(&self) -> bool {
-        true
+    fn supports_quant(&self, format: crate::QuantFormat) -> bool {
+        use crate::QuantFormat;
+        matches!(
+            format,
+            QuantFormat::Q4_0 | QuantFormat::Q4_K | QuantFormat::Q4_KF | QuantFormat::Q6_K
+        )
     }
 }
 
@@ -283,8 +287,18 @@ mod cpu_backend_tests {
     }
 
     #[test]
-    fn cpu_backend_has_q4_reports_true() {
-        assert!(CpuBackend.has_q4());
+    fn cpu_backend_supports_q4_k_family_and_q6_k() {
+        use crate::QuantFormat;
+        assert!(CpuBackend.supports_quant(QuantFormat::Q4_0));
+        assert!(CpuBackend.supports_quant(QuantFormat::Q4_K));
+        assert!(CpuBackend.supports_quant(QuantFormat::Q4_KF));
+        assert!(CpuBackend.supports_quant(QuantFormat::Q6_K));
+        // CPU doesn't have a Q8_0 fast path; advertise honestly.
+        assert!(!CpuBackend.supports_quant(QuantFormat::Q8_0));
+        // Float formats are not "quant" in this trait's sense.
+        assert!(!CpuBackend.supports_quant(QuantFormat::BF16));
+        assert!(!CpuBackend.supports_quant(QuantFormat::F16));
+        assert!(!CpuBackend.supports_quant(QuantFormat::F32));
     }
 
     // ── ComputeBackend identity ─────────────────────────────────────────

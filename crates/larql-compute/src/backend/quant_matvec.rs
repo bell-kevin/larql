@@ -292,8 +292,15 @@ pub trait QuantMatVec {
         None
     }
 
-    /// Whether this backend implements any Q4 fused operation.
-    fn has_q4(&self) -> bool {
+    /// Whether this backend implements quantised matvec on `format`.
+    ///
+    /// "Implements" means at minimum a single-matrix matvec path for the
+    /// format (e.g. `q4k_matvec`, `q6k_matvec`). Backends advertise per
+    /// format so the dispatcher can route Q4_K to one backend and Q6_K to
+    /// another without a separate predicate per format. Default impl:
+    /// `false` for every format — backends must opt in.
+    fn supports_quant(&self, format: QuantFormat) -> bool {
+        let _ = format;
         false
     }
 }

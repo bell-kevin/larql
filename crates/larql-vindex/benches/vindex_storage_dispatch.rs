@@ -86,7 +86,7 @@ fn build_fixture(
 
     // Construct an inert `VectorIndex` then install the synthetic
     // FFN bytes through the `MmapStorage` setter — same path the
-    // production loader uses (`ffn_store/interleaved_q4k.rs::load_interleaved_q4k`)
+    // production loader uses (`ffn_store/interleaved_kquant.rs::load_interleaved_kquant`)
     // minus the on-disk read.
     let mut index = larql_vindex::index::VectorIndex::new(
         vec![None; num_layers],
@@ -94,7 +94,7 @@ fn build_fixture(
         num_layers,
         hidden,
     );
-    Arc::make_mut(&mut index.storage).set_interleaved_q4k(Arc::new(mmap), Some(manifest));
+    Arc::make_mut(&mut index.storage).set_interleaved_kquant(Arc::new(mmap), Some(manifest));
 
     // Take a snapshot of `index.storage` for the concrete-shape
     // benchmark group (the trait-dispatch group rewraps it as

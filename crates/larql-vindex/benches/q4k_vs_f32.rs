@@ -218,7 +218,7 @@ fn bench_q4k_vs_f32(c: &mut Criterion) {
     // ── Q4_K setup: load via VectorIndex so attn_kquant_layer_data works ──
     let mut lcb = larql_vindex::SilentLoadCallbacks;
     let mut q4k_index = larql_vindex::VectorIndex::load_vindex(&q4k_dir, &mut lcb).unwrap();
-    q4k_index.load_attn_q4k(&q4k_dir).unwrap();
+    q4k_index.load_attn_kquant(&q4k_dir).unwrap();
     let padded = q_elems.div_ceil(256) * 256;
 
     let mut group = c.benchmark_group("q4k_vs_f32_per_layer_q");

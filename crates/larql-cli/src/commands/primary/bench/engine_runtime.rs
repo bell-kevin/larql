@@ -119,12 +119,13 @@ pub(super) fn run_engine_q4k(
         // Use the Metal-aware factory. `larql_inference::default_backend()`
         // (= `larql_compute::default_backend()`) lost its Metal detection
         // after the `larql-compute-metal` extraction and always returns
-        // CpuBackend now. Engines that look at `backend.has_q4()` to
-        // decide whether to route through `fused_decode_step` / Metal's
-        // fused `decode_token` would get a CpuBackend with `has_q4()
-        // == true` and then `backend.decode_token()` returns None (CPU
-        // doesn't implement the fused kernel), silently falling back to
-        // the slow CPU path.
+        // CpuBackend now. Engines that look at
+        // `backend.supports_quant(Q4_K)` to decide whether to route
+        // through `fused_decode_step` / Metal's fused `decode_token`
+        // would get a CpuBackend that advertises Q4_K support and then
+        // `backend.decode_token()` returns None (CPU doesn't implement
+        // the fused decode kernel), silently falling back to the slow
+        // CPU path.
         larql_inference::default_compute_backend()
     } else {
         larql_inference::cpu_backend()

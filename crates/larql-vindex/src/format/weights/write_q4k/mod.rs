@@ -7,7 +7,7 @@
 //! emitted artefact:
 //!
 //! - [`attn`] — `attn_weights_q4k.bin` (+ manifest)
-//! - [`ffn`] — `interleaved_q4k.bin` (+ opt `down_features_q4k.bin`)
+//! - [`ffn`] — `interleaved_kquant.bin` (+ opt `down_features_q4k.bin`)
 //! - [`moe_layers`] — `layers/layer_{L:02}.weights` (hybrid MoE)
 //! - [`norms`] — `norms.bin` (norms + MoE router/scales)
 //! - [`ple`] — `ple_weights.bin` (Gemma 4 E2B PLE, f16)
@@ -180,13 +180,13 @@ pub struct Q4kWriteOptions {
     /// averages across the intermediate dimension; empirically close.
     pub down_q4k: bool,
 
-    /// Emit `down_features_q4k.bin` alongside `interleaved_q4k.bin`.
+    /// Emit `down_features_q4k.bin` alongside `interleaved_kquant.bin`.
     /// When set, the down weights are also stored in feature-major
     /// `[intermediate, hidden]` orientation (Q4_K/Q6_K matching
     /// `down_q4k`), so per-feature decode can skip the
     /// `kquant_ffn_layer` whole-layer dequant + transpose cache. Adds
     /// roughly the same disk footprint as the down portion of
-    /// `interleaved_q4k.bin` (~14 MB / layer at Gemma 4B dims).
+    /// `interleaved_kquant.bin` (~14 MB / layer at Gemma 4B dims).
     /// Recommended for CPU sparse walk and grid/MoE workloads where
     /// the ~840 MB heap cache ceiling is the binding constraint.
     /// Default `false` so existing extracts don't grow on disk.
@@ -201,7 +201,7 @@ pub struct Q4kWriteOptions {
 ///     — On layers where V reuses K (Gemma 4 31B global layers), the K
 ///       bytes are written into the V slot so 4-per-layer indexing stays
 ///       valid and downstream kernels reading V get K.
-///   interleaved_q4k.bin
+///   interleaved_kquant.bin
 ///     — [gate Q4_K | up Q4_K | down Q6_K] per layer, regular stride.
 ///     — With `down_q4k=true`: [gate | up | down] all Q4_K.
 ///   lm_head_q4.bin

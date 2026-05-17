@@ -478,10 +478,10 @@ fn run_with_moe_shards(
     let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load vindex: {e}"))?;
     index
-        .load_attn_q4k(vindex_path)
+        .load_attn_kquant(vindex_path)
         .map_err(|e| format!("failed to load attn Q4K: {e}"))?;
     index
-        .load_interleaved_q4k(vindex_path)
+        .load_interleaved_kquant(vindex_path)
         .map_err(|e| format!("failed to load interleaved Q4K: {e}"))?;
     let _ = index.load_lm_head_q4(vindex_path);
 
@@ -605,10 +605,10 @@ fn run_with_remote_ffn(
     let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load vindex: {e}"))?;
     index
-        .load_attn_q4k(vindex_path)
+        .load_attn_kquant(vindex_path)
         .map_err(|e| format!("failed to load attn Q4K: {e}"))?;
     index
-        .load_interleaved_q4k(vindex_path)
+        .load_interleaved_kquant(vindex_path)
         .map_err(|e| format!("failed to load interleaved Q4K: {e}"))?;
     let _ = index.load_lm_head_q4(vindex_path);
 
@@ -933,7 +933,8 @@ mod experts {
     /// Whether the active compute backend can serve Q4 work-sets via Metal.
     /// Wraps the impure `default_backend()` call so [`pick_strategy`] stays pure.
     fn metal_ready_for_q4(want_metal: bool) -> bool {
-        want_metal && larql_compute::default_backend().has_q4()
+        want_metal
+            && larql_compute::default_backend().supports_quant(::larql_compute::QuantFormat::Q4_K)
     }
 
     /// Pure strategy selector: given the vindex quant format and whether
@@ -965,8 +966,8 @@ mod experts {
             Strategy::MetalQ4K | Strategy::CpuQ4K => {
                 let weights = larql_vindex::load_model_weights_q4k(vindex_path, &mut cb)?;
                 let mut idx = VectorIndex::load_vindex(vindex_path, &mut cb)?;
-                idx.load_attn_q4k(vindex_path)?;
-                idx.load_interleaved_q4k(vindex_path)?;
+                idx.load_attn_kquant(vindex_path)?;
+                idx.load_interleaved_kquant(vindex_path)?;
                 let _ = idx.load_lm_head_q4(vindex_path);
                 (weights, Some(idx))
             }

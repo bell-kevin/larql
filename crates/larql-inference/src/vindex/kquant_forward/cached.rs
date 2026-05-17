@@ -336,7 +336,7 @@ fn vec_to_2d_row(v: Vec<f32>) -> Array2<f32> {
 /// the backend's internal K/V cache, return last-row hidden.
 ///
 /// Returns `None` if the backend doesn't have Q4 support
-/// (`!backend.has_q4()`), the vindex lacks Q4K/Q4_0 interleaved FFN
+/// (`!backend.supports_quant(::larql_compute::QuantFormat::Q4_K)`), the vindex lacks Q4K/Q4_0 interleaved FFN
 /// bytes, or the architecture isn't compatible with the fused pipeline.
 /// CPU callers get `None` — they use [`predict_kquant_prefill`] instead.
 ///
@@ -353,7 +353,7 @@ pub fn fused_prefill(
     use crate::layer_graph::pipeline_layer::{build_pipeline_layers, DEFAULT_GPU_KV_CACHE_MAX_SEQ};
     use larql_vindex::GateIndex;
 
-    if !backend.has_q4() {
+    if !backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
         return None;
     }
 
@@ -1061,7 +1061,7 @@ mod tests {
     //
     // The public fused fast path: dispatches to `backend.prefill_q4` /
     // `backend.decode_token`. **Not Metal-specific** — `CpuBackend` returns
-    // `has_q4() == true` (it ships a C Q4 kernel) and may implement either
+    // `supports_quant(Q4_K) == true` (it ships a C Q4 kernel) and may implement either
     // method. The functions short-circuit when the vindex lacks the
     // interleaved FFN bytes the fused pipeline needs (the case for the
     // synthetic test vindex below), regardless of which backend is used.
@@ -1336,7 +1336,7 @@ mod branch_tests {
         let mut anon = memmap2::MmapMut::map_anon(attn_payload.len()).expect("anon");
         anon.copy_from_slice(&attn_payload);
         let mmap = Arc::new(anon.make_read_only().unwrap());
-        Arc::make_mut(&mut index.storage).set_attn_q4k(mmap, Some(attn_manifest));
+        Arc::make_mut(&mut index.storage).set_attn_kquant(mmap, Some(attn_manifest));
         assert!(
             !layer_supports_direct_matvec(&index, 0),
             "layer with Q4_KF format must not support the direct matvec path"

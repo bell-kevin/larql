@@ -62,7 +62,7 @@ pub const DOWN_WEIGHTS_BIN: &str = "down_weights.bin";
 /// in feature-major `[intermediate, hidden]` orientation, Q4_K-encoded.
 /// Per-feature decode becomes a single row dequant — no cache, no
 /// transpose, no ~840 MB heap ceiling on Gemma 4B. The disk cost is
-/// roughly the same as the down portion of `interleaved_q4k.bin` (~14
+/// roughly the same as the down portion of `interleaved_kquant.bin` (~14
 /// MB / layer at Gemma 4B dims). Opt-in via `Q4kWriteOptions::feature_major_down`.
 pub const DOWN_FEATURES_Q4K_BIN: &str = "down_features_q4k.bin";
 /// Per-layer (offset, length, format) entries for `down_features_q4k.bin`.
@@ -71,8 +71,8 @@ pub const DOWN_FEATURES_Q4K_MANIFEST_JSON: &str = "down_features_q4k_manifest.js
 // ── Interleaved FFN (gate|up|down packed per layer) ────────────────────
 pub const INTERLEAVED_BIN: &str = "interleaved.bin";
 pub const INTERLEAVED_Q4_BIN: &str = "interleaved_q4.bin";
-pub const INTERLEAVED_Q4K_BIN: &str = "interleaved_q4k.bin";
-pub const INTERLEAVED_Q4K_MANIFEST_JSON: &str = "interleaved_q4k_manifest.json";
+pub const INTERLEAVED_Q4K_BIN: &str = "interleaved_kquant.bin";
+pub const INTERLEAVED_Q4K_MANIFEST_JSON: &str = "interleaved_kquant_manifest.json";
 
 // ── Attention weights ──────────────────────────────────────────────────
 pub const ATTN_WEIGHTS_BIN: &str = "attn_weights.bin";

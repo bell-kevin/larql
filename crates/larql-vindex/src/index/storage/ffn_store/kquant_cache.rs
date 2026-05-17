@@ -396,7 +396,7 @@ mod tests {
 
     #[test]
     fn q4k_ffn_layer_returns_none_with_no_q4k_data() {
-        // No interleaved_q4k mmap, no cached entry → None.
+        // No interleaved_kquant mmap, no cached entry → None.
         let v = fresh(1, 8);
         assert!(v.kquant_ffn_layer(0, 0).is_none());
     }

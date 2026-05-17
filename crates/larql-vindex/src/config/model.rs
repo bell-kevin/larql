@@ -311,6 +311,136 @@ mod tests {
     }
 
     #[test]
+    fn moe_arch_populates_moe_field_via_from_arch() {
+        // Mixtral exercises the `if arch.is_moe()` Some-branch in
+        // from_arch — the Granite/Llama tests above only hit the
+        // None-branch.
+        let arch = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "mixtral",
+            "hidden_size": 4096,
+            "num_hidden_layers": 32,
+            "intermediate_size": 14336,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "num_local_experts": 8,
+            "num_experts_per_tok": 2,
+        }));
+        let vc = VindexModelConfig::from_arch(&*arch);
+        let moe = vc.moe.expect("MoE arch must populate moe field");
+        assert_eq!(moe.num_experts, 8);
+        assert_eq!(moe.top_k, 2);
+    }
+
+    #[test]
+    fn gemma4_a4b_hybrid_moe_populates_intermediate_size_and_hybrid() {
+        // Gemma 4 A4B is hybrid MoE with a distinct
+        // moe_intermediate_size. Hits the from_arch branches:
+        //   - `Some(arch.moe_intermediate_size())` (the > 0 path)
+        //   - `hybrid: arch.is_hybrid_moe()` returning true
+        //   - `router_type: arch.moe_router_type().into()` for the
+        //     non-default gemma4 router
+        let arch = larql_models::detect_from_json(&serde_json::json!({
+            "model_type": "gemma4_text",
+            "hidden_size": 2048,
+            "num_hidden_layers": 30,
+            "intermediate_size": 8192,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 768,
+            "enable_moe_block": true,
+        }));
+        let vc = VindexModelConfig::from_arch(&*arch);
+        {
+            let moe = vc.moe.as_ref().expect("Gemma 4 A4B must be MoE");
+            assert_eq!(moe.num_experts, 128);
+            assert_eq!(moe.top_k, 8);
+            assert_eq!(moe.moe_intermediate_size, Some(768));
+            assert!(moe.hybrid, "Gemma 4 A4B is hybrid MoE");
+        }
+
+        // Serialise and check hybrid + moe_intermediate_size land in JSON.
+        let json = serde_json::to_string(&vc).unwrap();
+        assert!(json.contains("\"hybrid\":true"), "{json}");
+        assert!(json.contains("\"moe_intermediate_size\":768"), "{json}");
+
+        let back: VindexModelConfig = serde_json::from_str(&json).unwrap();
+        let back_moe = back.moe.unwrap();
+        assert!(back_moe.hybrid);
+        assert_eq!(back_moe.moe_intermediate_size, Some(768));
+    }
+
+    #[test]
+    fn moe_config_with_shared_expert_round_trips() {
+        // shared_expert=true exercises the non-default branch of the
+        // bool field; existing tests only hit shared_expert=false.
+        let moe = MoeConfig {
+            num_experts: 64,
+            top_k: 6,
+            shared_expert: true,
+            router_type: "top_k_softmax".into(),
+            moe_intermediate_size: None,
+            hybrid: false,
+        };
+        let json = serde_json::to_string(&moe).unwrap();
+        assert!(json.contains("\"shared_expert\":true"), "{json}");
+        let back: MoeConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.shared_expert);
+    }
+
+    #[test]
+    fn norm_eps_field_round_trips_independent_of_granite_scalars() {
+        // norm_eps lives under skip_serializing_if; cover the Some-branch
+        // standalone (no Granite multipliers).
+        let mut cfg = minimal_model_config();
+        cfg.norm_eps = Some(1e-6);
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"norm_eps\""), "{json}");
+        let back: VindexModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.norm_eps, Some(1e-6));
+    }
+
+    #[test]
+    fn gemma4_per_layer_attn_geometry_round_trips() {
+        // Gemma 4 sets the optional per-layer attention fields
+        // (global_head_dim, sliding_window_pattern, partial_rotary_factor,
+        // layer_types). These fields exist in VindexModelConfig but
+        // the granite/llama tests don't exercise them — populate them
+        // directly via the struct so the serde derive macros and the
+        // skip_serializing_if branches all get coverage.
+        let mut cfg = minimal_model_config();
+        cfg.global_head_dim = Some(512);
+        cfg.num_global_kv_heads = Some(2);
+        cfg.partial_rotary_factor = Some(0.25);
+        cfg.sliding_window_pattern = Some(6);
+        cfg.layer_types = Some(vec!["sliding_attention".into(), "full_attention".into()]);
+        cfg.num_kv_shared_layers = Some(2);
+        cfg.per_layer_embed_dim = Some(256);
+        cfg.rope_local_base = Some(10_000.0);
+        cfg.query_pre_attn_scalar = Some(1.0);
+        cfg.final_logit_softcapping = Some(30.0);
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("global_head_dim"));
+        assert!(json.contains("sliding_window_pattern"));
+        assert!(json.contains("layer_types"));
+
+        let back: VindexModelConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.global_head_dim, Some(512));
+        assert_eq!(back.num_global_kv_heads, Some(2));
+        assert_eq!(back.partial_rotary_factor, Some(0.25));
+        assert_eq!(back.sliding_window_pattern, Some(6));
+        assert_eq!(back.layer_types.as_ref().map(|v| v.len()), Some(2));
+        assert_eq!(back.num_kv_shared_layers, Some(2));
+        assert_eq!(back.per_layer_embed_dim, Some(256));
+        assert_eq!(back.rope_local_base, Some(10_000.0));
+        assert_eq!(back.query_pre_attn_scalar, Some(1.0));
+        assert_eq!(back.final_logit_softcapping, Some(30.0));
+    }
+
+    #[test]
     fn granite_scalars_absent_for_non_granite_arch() {
         // Llama and Mistral don't carry these multipliers; verify the
         // serialised JSON omits the fields entirely so existing vindexes

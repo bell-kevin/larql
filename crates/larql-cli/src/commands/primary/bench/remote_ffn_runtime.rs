@@ -77,8 +77,8 @@ pub(super) fn run_remote_ffn_bench(
         .map_err(|e| format!("failed to load tokenizer: {e}"))?;
     let mut index = larql_vindex::VectorIndex::load_vindex(vindex_path, &mut cb)
         .map_err(|e| format!("failed to load vindex: {e}"))?;
-    index.load_attn_q4k(vindex_path)?;
-    index.load_interleaved_q4k(vindex_path)?;
+    index.load_attn_kquant(vindex_path)?;
+    index.load_interleaved_kquant(vindex_path)?;
     let _ = index.load_lm_head_q4(vindex_path);
 
     eprintln!("Connecting to remote FFN at {ffn_url}…");

@@ -1,4 +1,4 @@
-//! Q4K dequant walk — dequantises gate/up/down from `interleaved_q4k.bin`
+//! Q4K dequant walk — dequantises gate/up/down from `interleaved_kquant.bin`
 //! for the given layer, then runs the standard dense GEGLU forward.
 //!
 //! Used by the INFER pipeline on Q4K vindexes without a GPU backend.

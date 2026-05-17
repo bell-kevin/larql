@@ -1,5 +1,5 @@
 //! Shared manifest entry shape used by `write_q4k` to emit
-//! `attn_weights_q4k_manifest.json`, `interleaved_q4k_manifest.json`,
+//! `attn_weights_q4k_manifest.json`, `interleaved_kquant_manifest.json`,
 //! and `down_features_q4k_manifest.json`. Pulled out so the loaders in
 //! `index/storage/ffn_store.rs` can deserialise into a typed struct
 //! instead of poking `serde_json::Value` with string keys — silently

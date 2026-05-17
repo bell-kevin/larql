@@ -185,4 +185,88 @@ mod tests {
     // Both paths require backend Q4 support, so CpuBackend short-circuits
     // through the moe_q4k guard above before reaching the standard
     // `prefill_q4_prompt` path.
+
+    /// `prefill_for_streaming` standard branch (non-MoE weights) — falls
+    /// through `has_per_layer_ffn=false` → calls `prefill_q4_prompt`,
+    /// which propagates the backend's `None` as `PrefillFailed`.
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn prefill_for_streaming_standard_branch_errors_when_backend_returns_none() {
+        let weights = make_test_weights();
+        // Standard arch (no per-layer FFN) takes the branch-3 path; CpuBackend's
+        // default `prefill_q4` returns None → wraps in PrefillFailed.
+        let layers: Vec<FullPipelineLayer<'_>> = Vec::new();
+        let token_ids = vec![0u32, 1];
+        let x = vec![0.0f32; 2 * weights.hidden_size];
+        let result = prefill_for_streaming(
+            &weights,
+            &larql_compute::CpuBackend,
+            &layers,
+            weights.hidden_size,
+            weights.intermediate_size,
+            &token_ids,
+            &x,
+            false,
+            0.0,
+        );
+        let err = match result {
+            Ok(_) => panic!("CpuBackend default prefill_q4 must yield Err"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, GenerateError::PrefillFailed { .. }));
+    }
+
+    /// `prefill_for_streaming` standard branch happy path — `MockGpuBackend`
+    /// returns `Some(vec![0; seq_len * hidden])` from `prefill_q4`, the
+    /// wrapper unwraps it as `Ok`. Drives the success body of
+    /// `prefill_q4_prompt`.
+    #[cfg(not(all(feature = "metal", target_os = "macos")))]
+    #[test]
+    fn prefill_for_streaming_standard_branch_succeeds_with_mock_gpu_backend() {
+        use crate::test_utils::MockGpuBackend;
+        let weights = make_test_weights();
+        let backend = MockGpuBackend::new();
+        let layers: Vec<FullPipelineLayer<'_>> = Vec::new();
+        let token_ids = vec![0u32, 1, 2];
+        let seq = token_ids.len();
+        let x = vec![0.0f32; seq * weights.hidden_size];
+        let out = prefill_for_streaming(
+            &weights,
+            &backend,
+            &layers,
+            weights.hidden_size,
+            weights.intermediate_size,
+            &token_ids,
+            &x,
+            false,
+            0.0,
+        )
+        .expect("MockGpuBackend prefill_q4 returns Some");
+        assert_eq!(out.len(), seq * weights.hidden_size);
+    }
+
+    /// `prefill_q4k_moe` happy path — `MockGpuBackend` advertises
+    /// `DecodeQ4KMoe` and returns `Some(vec![0; hidden])` per token.
+    #[test]
+    fn prefill_q4k_moe_succeeds_with_mock_gpu_backend() {
+        use crate::test_utils::MockGpuBackend;
+        let weights = make_test_weights();
+        let backend = MockGpuBackend::new();
+        let layers: Vec<FullPipelineLayer<'_>> = Vec::new();
+        let token_ids = vec![0u32, 1, 2];
+        let seq = token_ids.len();
+        let x = vec![0.0f32; seq * weights.hidden_size];
+        let out = prefill_q4k_moe(
+            &weights,
+            &backend,
+            &layers,
+            weights.hidden_size,
+            weights.intermediate_size,
+            &token_ids,
+            &x,
+        )
+        .expect("MockGpuBackend supports DecodeQ4KMoe");
+        // Output is the last-position hidden padded out to seq × hidden.
+        assert_eq!(out.len(), seq * weights.hidden_size);
+    }
 }

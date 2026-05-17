@@ -37,8 +37,8 @@ pub struct MmapStorage {
     // through the trait or the inherent setters/views.
 
     // ── FFN ──────────────────────────────────────────────────────────
-    pub(crate) interleaved_q4k: Option<Bytes>,
-    pub(crate) interleaved_q4k_manifest: Option<Vec<(usize, usize, String)>>,
+    pub(crate) interleaved_kquant: Option<Bytes>,
+    pub(crate) interleaved_kquant_manifest: Option<Vec<(usize, usize, String)>>,
     pub(crate) interleaved_q4: Option<Bytes>,
     pub(crate) down_features_q4k: Option<Bytes>,
     pub(crate) down_features_q4k_manifest: Option<Vec<DownFeaturesQ4kEntry>>,
@@ -49,8 +49,8 @@ pub struct MmapStorage {
     pub(crate) interleaved_f32: Option<Bytes>,
 
     // ── Attention ────────────────────────────────────────────────────
-    pub(crate) attn_q4k: Option<Bytes>,
-    pub(crate) attn_q4k_manifest: Option<Vec<(usize, usize, String)>>,
+    pub(crate) attn_kquant: Option<Bytes>,
+    pub(crate) attn_kquant_manifest: Option<Vec<(usize, usize, String)>>,
     pub(crate) attn_q4: Option<Bytes>,
     pub(crate) attn_q4_manifest: Option<Vec<(usize, usize)>>,
     pub(crate) attn_q8: Option<Bytes>,
@@ -99,13 +99,13 @@ impl MmapStorage {
     /// Set the FFN interleaved Q4_K mmap + manifest. Each
     /// (offset, length, format_tag) triple in the manifest is one
     /// component (gate / up / down).
-    pub fn set_interleaved_q4k(
+    pub fn set_interleaved_kquant(
         &mut self,
         mmap: Arc<memmap2::Mmap>,
         manifest: Option<Vec<(usize, usize, String)>>,
     ) {
-        self.interleaved_q4k = Some(arc_mmap_to_bytes(&mmap));
-        self.interleaved_q4k_manifest = manifest;
+        self.interleaved_kquant = Some(arc_mmap_to_bytes(&mmap));
+        self.interleaved_kquant_manifest = manifest;
         self.register_mmap(&mmap);
     }
 
@@ -145,13 +145,13 @@ impl MmapStorage {
     }
 
     /// Set the attention Q4_K mmap + manifest.
-    pub fn set_attn_q4k(
+    pub fn set_attn_kquant(
         &mut self,
         mmap: Arc<memmap2::Mmap>,
         manifest: Option<Vec<(usize, usize, String)>>,
     ) {
-        self.attn_q4k = Some(arc_mmap_to_bytes(&mmap));
-        self.attn_q4k_manifest = manifest;
+        self.attn_kquant = Some(arc_mmap_to_bytes(&mmap));
+        self.attn_kquant_manifest = manifest;
         self.register_mmap(&mmap);
     }
 
@@ -257,7 +257,7 @@ impl MmapStorage {
     // ── Boolean capability checks (consumed by `is_some()` migrations) ─
 
     pub fn has_interleaved_kquant(&self) -> bool {
-        self.interleaved_q4k.is_some()
+        self.interleaved_kquant.is_some()
     }
     pub fn has_interleaved_q4(&self) -> bool {
         self.interleaved_q4.is_some()
@@ -266,7 +266,7 @@ impl MmapStorage {
         self.down_features_q4k.is_some()
     }
     pub fn has_attn_kquant(&self) -> bool {
-        self.attn_q4k.is_some()
+        self.attn_kquant.is_some()
     }
     pub fn has_attn_q4(&self) -> bool {
         self.attn_q4.is_some()
@@ -305,7 +305,7 @@ impl MmapStorage {
     /// refcount bump. Use when the consumer needs the bytes for the
     /// duration of `&self` only (e.g., madvise, kernel dispatch).
     pub fn interleaved_kquant_whole_buffer_view(&self) -> Option<&Bytes> {
-        self.interleaved_q4k.as_ref()
+        self.interleaved_kquant.as_ref()
     }
     pub fn interleaved_q4_whole_buffer_view(&self) -> Option<&Bytes> {
         self.interleaved_q4.as_ref()
@@ -338,16 +338,16 @@ impl MmapStorage {
     /// substores just to get a storage handle.
     pub fn empty(hidden_size: usize) -> Self {
         Self {
-            interleaved_q4k: None,
-            interleaved_q4k_manifest: None,
+            interleaved_kquant: None,
+            interleaved_kquant_manifest: None,
             interleaved_q4: None,
             down_features_q4k: None,
             down_features_q4k_manifest: None,
             up_features: None,
             down_features: None,
             interleaved_f32: None,
-            attn_q4k: None,
-            attn_q4k_manifest: None,
+            attn_kquant: None,
+            attn_kquant_manifest: None,
             attn_q4: None,
             attn_q4_manifest: None,
             attn_q8: None,
@@ -428,8 +428,8 @@ impl VindexStorage for MmapStorage {
         &self,
         layer: usize,
     ) -> Option<[(BytesView<'_>, &str); FFN_COMPONENTS_PER_LAYER]> {
-        let bytes = self.interleaved_q4k.as_ref()?;
-        let manifest = self.interleaved_q4k_manifest.as_ref()?;
+        let bytes = self.interleaved_kquant.as_ref()?;
+        let manifest = self.interleaved_kquant_manifest.as_ref()?;
         let base = layer * FFN_COMPONENTS_PER_LAYER;
         if base + FFN_COMPONENTS_PER_LAYER > manifest.len() {
             return None;
@@ -447,7 +447,7 @@ impl VindexStorage for MmapStorage {
     }
 
     fn interleaved_kquant_whole_buffer(&self) -> Option<Bytes> {
-        self.interleaved_q4k.clone()
+        self.interleaved_kquant.clone()
     }
 
     fn interleaved_q4_whole_buffer(&self) -> Option<Bytes> {
@@ -477,8 +477,8 @@ impl VindexStorage for MmapStorage {
         &self,
         layer: usize,
     ) -> Option<[(BytesView<'_>, &str); ATTN_TENSORS_PER_LAYER]> {
-        let bytes = self.attn_q4k.as_ref()?;
-        let manifest = self.attn_q4k_manifest.as_ref()?;
+        let bytes = self.attn_kquant.as_ref()?;
+        let manifest = self.attn_kquant_manifest.as_ref()?;
         let base = layer * ATTN_TENSORS_PER_LAYER;
         if base + ATTN_TENSORS_PER_LAYER > manifest.len() {
             return None;
@@ -609,8 +609,8 @@ mod tests {
         let mut s = MmapStorage::empty(8);
         // 3 layers × 3 components × 16 bytes = 144 bytes.
         let payload: Vec<u8> = (0u8..144).collect();
-        s.interleaved_q4k = Some(Bytes::from(payload.clone()));
-        s.interleaved_q4k_manifest = Some(
+        s.interleaved_kquant = Some(Bytes::from(payload.clone()));
+        s.interleaved_kquant_manifest = Some(
             (0..3 * FFN_COMPONENTS_PER_LAYER)
                 .map(|i| (i * 16, 16, "Q4_K".to_string()))
                 .collect(),
@@ -635,9 +635,9 @@ mod tests {
     fn ffn_q4k_layer_data_rejects_out_of_bounds_manifest() {
         let mut s = MmapStorage::empty(8);
         let payload: Vec<u8> = vec![0u8; 32];
-        s.interleaved_q4k = Some(Bytes::from(payload));
+        s.interleaved_kquant = Some(Bytes::from(payload));
         // gate fits, up fits, down points past the end.
-        s.interleaved_q4k_manifest = Some(vec![
+        s.interleaved_kquant_manifest = Some(vec![
             (0, 8, "Q4_K".to_string()),
             (8, 8, "Q4_K".to_string()),
             (16, 32, "Q4_K".to_string()), // 16 + 32 = 48 > 32
@@ -732,7 +732,7 @@ mod tests {
     fn set_interleaved_q4k_with_manifest_then_layer_data() {
         let payload: Vec<u8> = (0u8..96).collect();
         let mut s = MmapStorage::empty(8);
-        s.set_interleaved_q4k(
+        s.set_interleaved_kquant(
             arc_mmap_from(&payload),
             Some(vec![
                 (0, 16, "Q4_K".to_string()),
@@ -787,7 +787,7 @@ mod tests {
         let payload = vec![0u8; 256];
         let mut s = MmapStorage::empty(8);
 
-        s.set_attn_q4k(
+        s.set_attn_kquant(
             arc_mmap_from(&payload),
             Some(vec![
                 (0, 16, "Q4_K".to_string()),
@@ -900,7 +900,7 @@ mod tests {
         use crate::index::storage::vindex_storage::VindexStorage;
         let payload: Vec<u8> = (0u8..=255).collect();
         let mut s = MmapStorage::empty(8);
-        s.set_interleaved_q4k(
+        s.set_interleaved_kquant(
             arc_mmap_from(&payload),
             Some(vec![
                 (0, 16, "Q4_K".into()),
@@ -926,7 +926,7 @@ mod tests {
                 num_features: 4,
             }],
         );
-        s.set_attn_q4k(
+        s.set_attn_kquant(
             arc_mmap_from(&payload),
             Some(vec![
                 (0, 16, "Q4_K".into()),
@@ -1060,7 +1060,7 @@ mod tests {
         assert!(s.gate_q4_layer_data(0).is_none());
     }
 
-    /// `set_interleaved_q4k` is zero-copy from `Arc<Mmap>` — the
+    /// `set_interleaved_kquant` is zero-copy from `Arc<Mmap>` — the
     /// `Bytes` view points at the same memory the original mmap
     /// occupies, no copy.
     #[test]
@@ -1070,7 +1070,7 @@ mod tests {
         let mmap_ref_ptr = mmap_arc.as_ref().as_ptr();
 
         let mut s = MmapStorage::empty(8);
-        s.set_interleaved_q4k(mmap_arc, None);
+        s.set_interleaved_kquant(mmap_arc, None);
         let view = s.interleaved_kquant_whole_buffer_view().expect("buf");
         assert_eq!(view.as_ref().as_ptr(), mmap_ref_ptr);
     }
@@ -1127,8 +1127,8 @@ mod tests {
     fn release_pages_does_not_destroy_storage() {
         let payload = vec![0u8; 64];
         let mut s = MmapStorage::empty(4);
-        s.set_interleaved_q4k(arc_mmap_from(&payload), None);
-        s.set_attn_q4k(arc_mmap_from(&payload), None);
+        s.set_interleaved_kquant(arc_mmap_from(&payload), None);
+        s.set_attn_kquant(arc_mmap_from(&payload), None);
         s.set_lm_head_f32(arc_mmap_from(&payload));
         s.set_gate_vectors(arc_mmap_from(&payload), StorageDtype::F16, vec![]);
         s.set_gate_q4(arc_mmap_from(&payload), vec![]);

@@ -34,15 +34,15 @@ pub fn load_model_weights_with_opts(
 
     // `load_model_weights` only knows how to reconstruct the full float
     // `ModelWeights` struct. A Q4_K vindex stores weights in
-    // `attn_weights_q4k.bin` + `interleaved_q4k.bin` + per-tensor manifests
-    // and must be accessed via `VectorIndex::load_attn_q4k` +
-    // `VectorIndex::load_interleaved_q4k` (which return raw quantised
+    // `attn_weights_q4k.bin` + `interleaved_kquant.bin` + per-tensor manifests
+    // and must be accessed via `VectorIndex::load_attn_kquant` +
+    // `VectorIndex::load_interleaved_kquant` (which return raw quantised
     // bytes that compute dequantises on the fly). Surface a clear error
     // instead of producing a confusing "attn_weights.bin not found".
     if config.quant != crate::QuantFormat::None {
         return Err(VindexError::Parse(format!(
             "vindex is quantised ({}). `load_model_weights` only handles float weights. \
-             Call `VectorIndex::load_attn_q4k` + `load_interleaved_q4k` on the loaded \
+             Call `VectorIndex::load_attn_kquant` + `load_interleaved_kquant` on the loaded \
              VectorIndex instead.",
             config.quant,
         )));
@@ -151,7 +151,7 @@ pub fn load_model_weights_with_opts(
     // Gate vectors from gate_vectors.bin — only when running in non-Q4 mode.
     //
     // In Q4 vindexes (quant=q4k) the forward pass reads FFN weights straight
-    // from the Q4-packed `interleaved_q4k.bin` mmap via
+    // from the Q4-packed `interleaved_kquant.bin` mmap via
     // `VectorIndex::interleaved_kquant_layer_data`, so expanding `gate_vectors.bin`
     // into an f32 HashMap just to have an unused copy wastes ~27 GB of heap at
     // 31B scale and prevents the model from loading on a 96 GB machine.

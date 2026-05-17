@@ -46,7 +46,7 @@ pub struct VindexConfig {
     /// Quantisation format of the model weights written alongside this
     /// vindex. `None` means float storage controlled by `dtype`;
     /// `Q4K` means Q4_K/Q6_K blocks in `attn_weights_q4k.bin` +
-    /// `interleaved_q4k.bin`. Loaders dispatch on this field so they
+    /// `interleaved_kquant.bin`. Loaders dispatch on this field so they
     /// don't have to sniff filenames.
     #[serde(default)]
     pub quant: QuantFormat,
@@ -76,7 +76,7 @@ pub struct VindexConfig {
     /// live in `layers/layer_{L:02}.weights` — one file per layer, format
     /// declared in each file's header. Works for both dense
     /// (num_entries=1) and MoE (num_entries=num_experts). Absent → legacy
-    /// flat-file layout (`interleaved_q4k.bin` / `experts_packed.bin`).
+    /// flat-file layout (`interleaved_kquant.bin` / `experts_packed.bin`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ffn_layout: Option<FfnLayout>,
 }
@@ -389,7 +389,10 @@ mod fp4_schema_tests {
         let back: VindexSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back.base_model_sha.as_deref(), Some("1adbacd6b6dee75c"));
         assert_eq!(back.extractor_sha.as_deref(), Some("9f3a2c"));
-        assert_eq!(back.base_safetensors_sha256.as_ref().map(|m| m.len()), Some(2));
+        assert_eq!(
+            back.base_safetensors_sha256.as_ref().map(|m| m.len()),
+            Some(2)
+        );
     }
 
     #[test]

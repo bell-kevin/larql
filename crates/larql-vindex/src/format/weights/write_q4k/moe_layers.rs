@@ -6,7 +6,7 @@
 //! `num_entries=num_experts`. Replaces the legacy ~43 GB BF16
 //! `experts_packed.bin` monolithic blob.
 //!
-//! For dense models: this is a no-op — `interleaved_q4k.bin` (stage 2)
+//! For dense models: this is a no-op — `interleaved_kquant.bin` (stage 2)
 //! remains the primary FFN store. Per-layer format for dense is a
 //! future migration (`--ffn-layout` flag).
 

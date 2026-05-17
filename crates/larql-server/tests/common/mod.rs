@@ -379,7 +379,7 @@ pub fn model_with_real_weights_and_labels(
 /// Build a `LoadedModel` backed by a real synthetic **Q4K-quantised**
 /// vindex on disk. Same shape as [`model_with_real_weights`] but the
 /// on-disk vindex carries `attn_weights_q4k.bin` +
-/// `interleaved_q4k.bin` so `generate_with_sampling`'s
+/// `interleaved_kquant.bin` so `generate_with_sampling`'s
 /// `insert_q4k_layer_tensors` actually finds the K-quant data it
 /// expects (instead of panicking with "attn Q4K slices missing for
 /// layer 0"). Use this for tests that exercise the OpenAI generation
@@ -398,11 +398,11 @@ pub fn model_with_q4k_weights(
     // them, `insert_q4k_layer_tensors` (called from the generation
     // path) panics with "attn Q4K slices missing for layer N".
     index
-        .load_attn_q4k(&fixture.dir)
+        .load_attn_kquant(&fixture.dir)
         .expect("load attn_weights_q4k.bin into VectorIndex");
     index
-        .load_interleaved_q4k(&fixture.dir)
-        .expect("load interleaved_q4k.bin into VectorIndex");
+        .load_interleaved_kquant(&fixture.dir)
+        .expect("load interleaved_kquant.bin into VectorIndex");
     let config = larql_vindex::load_vindex_config(&fixture.dir).expect("load Q4K vindex config");
 
     let tok_bytes = std::fs::read(fixture.dir.join("tokenizer.json")).expect("read tokenizer.json");

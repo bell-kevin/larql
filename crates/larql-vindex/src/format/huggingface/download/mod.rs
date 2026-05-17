@@ -102,7 +102,8 @@ pub fn resolve_hf_vindex(hf_path: &str) -> Result<PathBuf, VindexError> {
     };
 
     // Use hf-hub to download
-    let api = hf_hub::api::sync::Api::new()
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     // `larql publish` defaults to model repos, but older vindexes and
@@ -166,7 +167,8 @@ pub fn download_hf_weights(hf_path: &str) -> Result<(), VindexError> {
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     // Same model-first-then-dataset probe order as `resolve_hf_vindex`.
@@ -355,7 +357,8 @@ where
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     // Probe each repo kind in publish-default order. The first kind that
@@ -440,7 +443,8 @@ where
         (path.to_string(), None)
     };
 
-    let api = hf_hub::api::sync::Api::new()
+    let api = hf_hub::api::sync::ApiBuilder::from_env()
+        .build()
         .map_err(|e| VindexError::Parse(format!("HuggingFace API init failed: {e}")))?;
 
     let repo = if let Some(ref rev) = revision {
@@ -989,6 +993,302 @@ mod tests {
         // No blob written — straight cache miss.
         let result = cached_snapshot_file(RepoKind::Dataset, "owner/repo", None, "f.bin");
         assert!(result.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn cached_snapshot_file_works_for_model_prefix() {
+        // Exercise the `models--` cache prefix path — existing tests
+        // all use `datasets--`. Same logic, different prefix.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock("HEAD", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("ETag", "\"model-etag\"")
+            .with_header("Content-Length", "4")
+            .create();
+
+        let hub_root: PathBuf = std::env::var("HF_HOME")
+            .map(|p| PathBuf::from(p).join("hub"))
+            .unwrap();
+        std::fs::create_dir_all(&hub_root).unwrap();
+        make_hub_blob(
+            &hub_root,
+            "models--",
+            "owner/repo",
+            "model-etag",
+            b"abcd",
+            Some("main"),
+            "config.json",
+        );
+
+        let (path, size) =
+            cached_snapshot_file(RepoKind::Model, "owner/repo", None, "config.json").unwrap();
+        assert_eq!(size, 4);
+        assert!(path.ends_with("config.json"));
+    }
+
+    #[test]
+    #[serial]
+    fn cached_snapshot_file_falls_back_through_revision_after_unrelated_snapshot_dir() {
+        // Build a cache where the entries-loop sees a snapshot dir
+        // that DOESN'T contain the filename, then the explicit
+        // `snapshots.join(rev)` fallback (lines ~258-261) succeeds.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock("HEAD", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("ETag", "\"rev-fallback\"")
+            .with_header("Content-Length", "3")
+            .create();
+
+        let hub_root: PathBuf = std::env::var("HF_HOME")
+            .map(|p| PathBuf::from(p).join("hub"))
+            .unwrap();
+        std::fs::create_dir_all(&hub_root).unwrap();
+        let repo_dir = hub_root.join("datasets--owner--repo");
+        let blobs = repo_dir.join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("rev-fallback"), b"abc").unwrap();
+        // Snapshot dir for `noise` (different filename) — entries loop
+        // visits this but the join misses.
+        let noise_snap = repo_dir.join("snapshots").join("noise");
+        std::fs::create_dir_all(&noise_snap).unwrap();
+        std::fs::write(noise_snap.join("other.bin"), b"abc").unwrap();
+        // Snapshot dir for the revision we'll request, with the file.
+        let pinned_snap = repo_dir.join("snapshots").join("v7");
+        std::fs::create_dir_all(&pinned_snap).unwrap();
+        std::fs::write(pinned_snap.join("target.bin"), b"abc").unwrap();
+
+        let (path, _) =
+            cached_snapshot_file(RepoKind::Dataset, "owner/repo", Some("v7"), "target.bin")
+                .unwrap();
+        assert!(path.to_string_lossy().contains("v7"));
+    }
+
+    #[test]
+    #[serial]
+    fn cached_snapshot_file_returns_none_when_blob_is_directory_not_file() {
+        // Exercise the `!meta.is_file()` defensive branch — the blob
+        // path resolves to a directory entry instead of a file.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _m = server
+            .mock("HEAD", mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("ETag", "\"dir-as-blob\"")
+            .with_header("Content-Length", "5")
+            .create();
+
+        let hub_root: PathBuf = std::env::var("HF_HOME")
+            .map(|p| PathBuf::from(p).join("hub"))
+            .unwrap();
+        let blobs = hub_root.join("datasets--owner--repo").join("blobs");
+        std::fs::create_dir_all(&blobs).unwrap();
+        // Create the blob path as a DIRECTORY, not a regular file.
+        std::fs::create_dir_all(blobs.join("dir-as-blob")).unwrap();
+
+        let result = cached_snapshot_file(RepoKind::Dataset, "owner/repo", None, "f.bin");
+        assert!(result.is_none(), "blob-is-directory must miss");
+    }
+
+    // ── RepoKind variant tag direct tests ────────────────────────────────
+    //
+    // Production code only constructs RepoKind::Model (HF_PULL_REPO_KINDS
+    // dropped the dataset fallback). The Dataset variant is still
+    // referenced by the helper-level tests and remains in the enum for
+    // explicit callers. Cover the match arms directly.
+
+    #[test]
+    fn to_hub_type_maps_each_kind_to_hf_hub_repo_type() {
+        // Dataset and Model variants both have their own match arm in
+        // to_hub_type — Production only hits Model; this test pins
+        // both branches.
+        match RepoKind::Dataset.to_hub_type() {
+            hf_hub::RepoType::Dataset => {}
+            other => panic!("Dataset must map to RepoType::Dataset, got {other:?}"),
+        }
+        match RepoKind::Model.to_hub_type() {
+            hf_hub::RepoType::Model => {}
+            other => panic!("Model must map to RepoType::Model, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn url_segment_matches_repo_kind_prefix() {
+        assert_eq!(RepoKind::Dataset.url_segment(), "datasets/");
+        assert_eq!(RepoKind::Model.url_segment(), "");
+    }
+
+    #[test]
+    fn cache_prefix_matches_repo_kind() {
+        assert_eq!(RepoKind::Dataset.cache_prefix(), "datasets--");
+        assert_eq!(RepoKind::Model.cache_prefix(), "models--");
+    }
+
+    /// Build a mock that satisfies hf-hub's metadata() probe. The
+    /// requirements are: an ETag (or X-Linked-Etag) header, an
+    /// X-Repo-Commit header (commit hash), and a Content-Range header
+    /// of the form "bytes 0-0/<size>". hf-hub's metadata path issues a
+    /// GET with `Range: bytes=0-0`, then a follow-up GET for the full
+    /// body; both must succeed for `repo.get()` to return a path.
+    ///
+    /// `expect` lets the test cap how many times the mock can fire —
+    /// hf-hub's download path may retry or make follow-up requests we
+    /// don't strictly model.
+    fn mock_hf_file_resolve(
+        server: &mut mockito::ServerGuard,
+        path_regex: &str,
+        etag: &str,
+        body: &[u8],
+    ) -> Vec<mockito::Mock> {
+        let len = body.len();
+        let cr = format!("bytes 0-0/{len}");
+        let meta = server
+            .mock("GET", mockito::Matcher::Regex(path_regex.into()))
+            .with_status(200)
+            .with_header("ETag", &format!("\"{etag}\""))
+            .with_header("X-Repo-Commit", "deadbeefcafebabe")
+            .with_header("Content-Range", &cr)
+            .with_header("Accept-Ranges", "bytes")
+            .with_header("Content-Length", &len.to_string())
+            .with_body(body)
+            .expect_at_least(1)
+            .create();
+        vec![meta]
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_success_via_broad_mocks() {
+        // Happy path: index.json downloads, returns the snapshot dir.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let body = br#"{"version":2,"model":"owner/repo","family":"x"}"#;
+        let idx = mock_hf_file_resolve(&mut server, r"index\.json", "idx", body);
+
+        let dir = resolve_hf_vindex("hf://owner/repo").expect("success path");
+        assert!(dir.exists(), "vindex dir must exist on disk");
+        assert!(idx[0].matched(), "index.json mock must have been hit");
+    }
+
+    #[test]
+    #[serial]
+    fn download_hf_weights_success_via_broad_mocks() {
+        // index.json fetches successfully, so the function enters the
+        // weight-file loop and returns Ok. No fallback mocks here —
+        // mockito's default response for unmatched requests is
+        // sufficient; adding GET-Any fallback mocks intercepts our
+        // specific index.json mock in mockito's matching order.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let body = br#"{"version":2}"#;
+        let idx = mock_hf_file_resolve(&mut server, r"index\.json", "wt", body);
+
+        download_hf_weights("hf://owner/repo").expect("success path");
+        assert!(idx[0].matched(), "index.json mock must have been hit");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_with_progress_success_via_broad_mocks() {
+        // Exercise the with_progress success path. Same as
+        // resolve_hf_vindex but routes through the cache-probe closure.
+        // No fallback mocks — see comment on
+        // `download_hf_weights_success_via_broad_mocks`.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let body = br#"{"version":2}"#;
+        let idx = mock_hf_file_resolve(&mut server, r"index\.json", "wp", body);
+
+        let dir = resolve_hf_vindex_with_progress("hf://owner/repo", |_| NoOpProgress)
+            .expect("success path");
+        assert!(dir.exists());
+        assert!(idx[0].matched(), "index.json mock must have been hit");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_vindex_with_progress_uses_cache_when_blob_present() {
+        // When the cached_snapshot_file fast-path finds the blob on
+        // disk, the function bypasses download_with_progress and goes
+        // through the cache-hit branch (progress.init/update/finish
+        // called with the [cached] tag). Build the cache + a matching
+        // HEAD response so the cache short-circuit fires.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let body = br#"{"version":2}"#;
+        let _head = server
+            .mock("HEAD", mockito::Matcher::Regex(r"index\.json".into()))
+            .with_status(200)
+            .with_header("ETag", "\"cached-idx\"")
+            .with_header("Content-Length", &body.len().to_string())
+            .expect_at_least(1)
+            .create();
+        // Build the on-disk cache layout the function expects.
+        let hub_root: PathBuf = std::env::var("HF_HOME")
+            .map(|p| PathBuf::from(p).join("hub"))
+            .unwrap();
+        std::fs::create_dir_all(&hub_root).unwrap();
+        make_hub_blob(
+            &hub_root,
+            "models--",
+            "owner/repo",
+            "cached-idx",
+            body,
+            Some("main"),
+            INDEX_JSON,
+        );
+        // Other files (the rest of the metadata loop) return 404.
+        let _fallback_get = server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(404)
+            .create();
+        let _fallback_head = server
+            .mock("HEAD", mockito::Matcher::Any)
+            .with_status(404)
+            .create();
+
+        let dir = resolve_hf_vindex_with_progress("hf://owner/repo", |_| NoOpProgress)
+            .expect("cache hit path must return Ok");
+        assert!(dir.ends_with("main"), "expected snapshot dir under main");
+    }
+
+    #[test]
+    #[serial]
+    fn resolve_hf_model_with_progress_errors_when_info_returns_empty_siblings() {
+        // Cover the `wanted.is_empty()` error branch — info() succeeds
+        // but lists no files. hf-hub's info() endpoint is
+        // /api/models/{repo}/revision/{rev} or similar; mock a 200
+        // response anywhere on /api/models/... so the call lands but
+        // returns no siblings.
+        let mut server = mockito::Server::new();
+        let _g = HfTestEnv::new(&server.url());
+        let _info = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"/api/models/owner/repo".into()),
+            )
+            .with_status(200)
+            .with_header("Content-Type", "application/json")
+            .with_body(r#"{"siblings":[],"sha":"abc"}"#)
+            .create();
+
+        let result = resolve_hf_model_with_progress("hf://owner/repo", |_| NoOpProgress);
+        match result {
+            Err(e) => {
+                // Either the empty-siblings error fires or info parsing
+                // fails first — both exercise the function's plumbing.
+                let s = e.to_string();
+                assert!(
+                    s.contains("no usable model files") || s.contains("HF info failed"),
+                    "expected siblings/info error, got: {s}"
+                );
+            }
+            Ok(_) => panic!("must error on empty siblings or info failure"),
+        }
     }
 
     #[test]

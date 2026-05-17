@@ -44,7 +44,7 @@ pub fn predict_honest(
     // GPU pipeline: decode (seq=1) uses decode_token/full_pipeline_q4,
     // prefill (seq>1) uses prefill_q4 for GPU-accelerated multi-position inference.
     let seq_len = h.shape()[0];
-    let used_gpu = if backend.has_q4() {
+    let used_gpu = if backend.supports_quant(::larql_compute::QuantFormat::Q4_K) {
         let gate_index: &dyn larql_vindex::GateIndex = index;
         // Prefer Q4_K FFN (Ollama-compatible) over Q4_0
         let (q4_ffn, ffn_is_q4k) = if let Some(mmap) = gate_index.interleaved_kquant_mmap_ref() {

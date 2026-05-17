@@ -387,4 +387,78 @@ mod tests {
             "store should grow after decode_step_quant"
         );
     }
+
+    // ── Walk-path overflow branches (markov_residual/walk.rs) ────────────
+    //
+    // The two tests above use `window=None` so the cold tier never
+    // populates — leaving the walk.rs cold-K/V precompute (lines 66-76)
+    // and cold-residual decode branch (lines 162-186) uncovered. The
+    // tests below drive them with a small window + multiple decode steps.
+
+    #[test]
+    fn prefill_quant_walk_with_window_populates_cold_kv() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualEngine::new(Some(2));
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill_quant with overflow");
+        // window=2 + 4 prompt tokens → cold tier populated → walk.rs
+        // lines 67-75 fire.
+        assert!(engine.window_tokens() <= 2);
+        assert!(engine.cold_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_quant_walk_first_overflow_creates_cold_residuals() {
+        // walk.rs lines 305-307: `None => updated_rs.cold_residuals =
+        // Some(overflow)`. Fires when prefill didn't overflow (cold = None)
+        // but the first decode does (window cap exceeded mid-decode).
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        // window=2, prefill=1 token → no overflow on prefill (cold=None).
+        let mut engine = MarkovResidualEngine::new(Some(2));
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32], &*backend)
+            .expect("prefill_quant");
+        // Decode until hot exceeds window → first-time cold population.
+        engine
+            .decode_step_quant(&mut weights, &ffn, &index, 1, &*backend)
+            .expect("decode 1");
+        engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode 2 — triggers first-overflow None branch");
+        // After overflow, cold tier is populated.
+        assert!(engine.cold_bytes() > 0);
+    }
+
+    #[test]
+    fn decode_step_quant_walk_after_overflow_hits_cold_residuals_branch() {
+        use larql_inference::ffn::NullFfn;
+        let mut weights = make_test_weights();
+        let index = larql_inference::test_utils::make_test_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = MarkovResidualEngine::new(Some(2));
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2, 3], &*backend)
+            .expect("prefill_quant");
+        // First decode: exercises walk.rs cold_kv branch (lines 132-161).
+        engine
+            .decode_step_quant(&mut weights, &ffn, &index, 4, &*backend)
+            .expect("first decode_step_quant");
+        // Second decode: cold_kv was cleared by overflow at the first
+        // decode (walk.rs line 309), so this hits the cold_residuals
+        // recompute branch (lines 162-187).
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 5, &*backend)
+            .expect("second decode_step_quant");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
 }

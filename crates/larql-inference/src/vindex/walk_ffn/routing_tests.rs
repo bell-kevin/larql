@@ -236,7 +236,7 @@ fn predicate_priority_ordering() {
     assert_eq!(pick_path(&m, false, true), "fp4_storage:sparse");
 
     // 4. Q4K native wins over Q4/interleaved/full_mmap. Same vindex
-    //    that previously routed to `interleaved_q4k:dequant` (the
+    //    that previously routed to `interleaved_kquant:dequant` (the
     //    100×-slower path) — this is the fix for the
     //    LARQL_INSTRUMENT_MARKOV diagnosis where Gemma 3 4B Q4K's
     //    FFN spent 97% of decode time in dense f32 matmul.

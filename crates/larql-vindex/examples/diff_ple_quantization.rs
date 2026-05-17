@@ -37,9 +37,11 @@ fn main() {
     let mut attn_cb = larql_vindex::SilentLoadCallbacks;
     let mut index =
         larql_vindex::VectorIndex::load_vindex(&vindex_dir, &mut attn_cb).expect("vindex load");
-    index.load_attn_q4k(&vindex_dir).expect("load_attn_q4k");
     index
-        .load_interleaved_q4k(&vindex_dir)
+        .load_attn_kquant(&vindex_dir)
+        .expect("load_attn_kquant");
+    index
+        .load_interleaved_kquant(&vindex_dir)
         .expect("load_interleaved");
     for layer in [0usize, 10] {
         let hidden = q4k.hidden_size;

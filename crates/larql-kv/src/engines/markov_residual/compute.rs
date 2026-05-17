@@ -306,7 +306,7 @@ pub fn recompute_kv(
     // backend supports Q4K matvec and the vindex has Q4K attn data.
     let q4k_path = index
         .and_then(|idx| idx.attn_kquant_layer_data(layer))
-        .filter(|_| backend.has_q4());
+        .filter(|_| backend.supports_quant(::larql_compute::QuantFormat::Q4_K));
 
     let (mut k, mut v) = if let Some(attn_data) = q4k_path {
         // attn_data: [(Q, fmt), (K, fmt), (V, fmt), (O, fmt)]
@@ -548,5 +548,113 @@ mod tests {
         let ten = kv_memory_bytes_for_seq(&weights, 10);
         assert!(one > 0);
         assert_eq!(ten, one * 10, "kv memory must scale linearly with seq len");
+    }
+
+    // ── parse_quant_format pure helper (lines 384-391) ───────────────────
+
+    #[test]
+    fn parse_quant_format_recognises_q4k_q4kf_q6k() {
+        assert!(matches!(
+            parse_quant_format("Q4_K"),
+            Some(QuantFormat::Q4_K)
+        ));
+        assert!(matches!(
+            parse_quant_format("Q4_KF"),
+            Some(QuantFormat::Q4_KF)
+        ));
+        assert!(matches!(
+            parse_quant_format("Q6_K"),
+            Some(QuantFormat::Q6_K)
+        ));
+    }
+
+    #[test]
+    fn parse_quant_format_unknown_returns_none() {
+        assert!(parse_quant_format("Q8_0").is_none());
+        assert!(parse_quant_format("F16").is_none());
+        assert!(parse_quant_format("").is_none());
+        assert!(parse_quant_format("Q4").is_none());
+        assert!(parse_quant_format("nonsense").is_none());
+    }
+
+    // ── Profiler branches (lines 131, 137, 159, 164, 171, 178, 190, 195) ──
+    //
+    // Each timing branch fires only when `profiler.is_some()`. The existing
+    // `with_profiling_enables_profiling_branch` test exercises one path;
+    // these add coverage for the cold/hot/attn/ffn timing branches plus the
+    // overflow-into-existing-cold-residuals merge path.
+
+    #[test]
+    fn profiled_decode_step_exercises_all_timing_branches() {
+        use crate::profiler::EngineProfiler;
+        let weights = make_test_weights();
+        let prefill = rs_prefill(&weights, &[0u32, 1, 2, 3], Some(2), &CpuBackend);
+        // Has cold_kv populated → exercises lines 130-147 (cold_kv branch
+        // with profiler timing recompute_hot).
+        assert!(prefill.store.cold_kv.is_some());
+        let mut profiler = EngineProfiler::default();
+        let result =
+            rs_decode_step_profiled(&weights, 4, prefill.store, &CpuBackend, &mut profiler);
+        assert!(result.is_some());
+        // Profiler must record positive durations across all stages.
+        assert!(profiler.recompute_hot.count > 0);
+        assert!(profiler.attention.count > 0);
+        assert!(profiler.ffn.count > 0);
+        assert!(profiler.decode_total.count > 0);
+    }
+
+    #[test]
+    fn profiled_decode_step_with_cold_residuals_only_path() {
+        use crate::profiler::EngineProfiler;
+        let weights = make_test_weights();
+        // Two decodes from windowed prefill: first overflows + clears
+        // cold_kv (compute.rs line 260); second hits the cold_residuals
+        // branch (lines 149-160) under profiling.
+        let prefill = rs_prefill(&weights, &[0u32, 1, 2, 3], Some(2), &CpuBackend);
+        let (_, rs2) = rs_decode_step(&weights, 4, prefill.store, &CpuBackend).unwrap();
+        assert!(
+            rs2.cold_kv.is_none(),
+            "cold_kv should be cleared after overflow"
+        );
+        let mut profiler = EngineProfiler::default();
+        let result = rs_decode_step_profiled(&weights, 5, rs2, &CpuBackend, &mut profiler);
+        assert!(result.is_some());
+        // cold_residuals branch exercises recompute_cold counter (line 171).
+        assert!(profiler.recompute_cold.count > 0);
+    }
+
+    #[test]
+    fn decode_step_with_empty_cold_residuals_falls_through() {
+        // Line 159: `(h_hot.clone(), hot_abs_start)` when cold tier exists
+        // but s_cold == 0 (rare; happens if the engine ever clips out the
+        // last cold row). Build the state by hand.
+        use larql_inference::attention::SharedKV;
+        use ndarray::Array2;
+        let weights = make_test_weights();
+        // Construct a store with cold_residuals = Some(vec![empty]) per
+        // layer and cold_kv = None. The decode loop must take the "empty
+        // cold" else branch (line 159).
+        let num_layers = weights.num_layers;
+        let hidden = weights.hidden_size;
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        let stored: Vec<Array2<f32>> = (0..num_layers)
+            .map(|_| Array2::<f32>::zeros((1, hidden)))
+            .collect();
+        let cold_residuals: Vec<Array2<f32>> = (0..num_layers)
+            .map(|_| Array2::<f32>::zeros((0, hidden)))
+            .collect();
+        let _ = (kv_dim, SharedKV::default()); // silence unused warnings if any
+        let store = RsStore {
+            stored,
+            cold_residuals: Some(cold_residuals),
+            cold_kv: None,
+            cold_abs_start: 0,
+            next_position: 1,
+            max_window: None,
+        };
+        let result = rs_decode_step(&weights, 0, store, &CpuBackend);
+        assert!(result.is_some());
+        let (h, _) = result.unwrap();
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
     }
 }

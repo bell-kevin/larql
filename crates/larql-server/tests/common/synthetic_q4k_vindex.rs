@@ -6,7 +6,7 @@
 //! `routes/walk_ffn/q8k.rs` panic against an f32 vindex with
 //! `attn Q4K slices missing for layer 0` from
 //! `vindex/kquant_forward/cached.rs` — those code paths require Q4K
-//! storage (`attn_weights_q4k.bin` + `interleaved_q4k.bin` + the
+//! storage (`attn_weights_q4k.bin` + `interleaved_kquant.bin` + the
 //! Q4K-mode `index.json`). This module builds exactly that.
 //!
 //! Two stages:

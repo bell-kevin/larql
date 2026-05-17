@@ -19,12 +19,12 @@
 //!      a. `attn_weights_q4k.bin` (preferred) — strict load.
 //!      b. `attn_weights_q8.bin` — strict load when (a) absent.
 //!      If neither exists, return an error: GPU prefill needs them.
-//!   4. **FFN weights** — `interleaved_q4k.bin` (preferred) or
+//!   4. **FFN weights** — `interleaved_kquant.bin` (preferred) or
 //!      `interleaved_q4.bin` — at least one required, strict load.
 //!
 //! ## Why "strict" matters
 //!
-//! On a stale vindex with a 148-byte Q4_K stride, `load_attn_q4k` now
+//! On a stale vindex with a 148-byte Q4_K stride, `load_attn_kquant` now
 //! returns a clear "rebuild" error (see
 //! [`crate::larql_vindex::quant::registry::QuantFormatInfo::expected_bytes`]).
 //! The previous "try everything silently" pattern would catch the
@@ -71,7 +71,7 @@ pub fn open_inference_vindex(path: &Path) -> Result<VectorIndex, InferenceError>
 
     // ── attention: strict, prefer Q4_K when present.
     if path.join(ATTN_Q4K_BIN).is_file() {
-        index.load_attn_q4k(path)?;
+        index.load_attn_kquant(path)?;
     } else if path.join(ATTN_Q8_BIN).is_file() {
         index.load_attn_q8(path)?;
     } else {
@@ -83,7 +83,7 @@ pub fn open_inference_vindex(path: &Path) -> Result<VectorIndex, InferenceError>
 
     // ── FFN: strict, prefer Q4_K when present.
     if path.join(INTERLEAVED_Q4K_BIN).is_file() {
-        index.load_interleaved_q4k(path)?;
+        index.load_interleaved_kquant(path)?;
     } else if path.join(INTERLEAVED_Q4_BIN).is_file() {
         index.load_interleaved_q4(path)?;
     } else {
@@ -154,7 +154,7 @@ mod tests {
         // names; a divergence here is the warning sign.
         assert_eq!(super::ATTN_Q4K_BIN, "attn_weights_q4k.bin");
         assert_eq!(super::ATTN_Q8_BIN, "attn_weights_q8.bin");
-        assert_eq!(super::INTERLEAVED_Q4K_BIN, "interleaved_q4k.bin");
+        assert_eq!(super::INTERLEAVED_Q4K_BIN, "interleaved_kquant.bin");
         assert_eq!(super::INTERLEAVED_Q4_BIN, "interleaved_q4.bin");
         assert_eq!(super::LM_HEAD_BIN, "lm_head.bin");
         assert_eq!(super::LM_HEAD_Q4_BIN, "lm_head_q4.bin");
@@ -196,7 +196,7 @@ mod tests {
     /// Happy path — write a synthetic Q4_K vindex and load it through
     /// `open_inference_vindex`. Exercises the success branches of the
     /// loader's attention + FFN resolution order (attn_weights_q4k →
-    /// interleaved_q4k → tied-embedding lm_head best-effort).
+    /// interleaved_kquant → tied-embedding lm_head best-effort).
     #[test]
     fn open_inference_vindex_loads_synthetic_q4k_fixture() {
         use crate::test_utils::write_synthetic_q4k_model_dir;
@@ -207,11 +207,11 @@ mod tests {
         // Q4K attention + FFN bytes both loaded.
         assert!(
             index.attn_kquant_layer_data(0).is_some(),
-            "attn_q4k must be loaded for layer 0"
+            "attn_kquant must be loaded for layer 0"
         );
         assert!(
             index.has_interleaved_kquant(),
-            "interleaved_q4k must be loaded"
+            "interleaved_kquant must be loaded"
         );
     }
 
@@ -226,7 +226,7 @@ mod tests {
         use crate::test_utils::write_synthetic_q4k_model_dir;
         write_synthetic_q4k_model_dir(tmp.path()).expect("write q4k fixture");
         let _ = std::fs::remove_file(tmp.path().join(INTERLEAVED_Q4K_BIN));
-        let _ = std::fs::remove_file(tmp.path().join("interleaved_q4k_manifest.json"));
+        let _ = std::fs::remove_file(tmp.path().join("interleaved_kquant_manifest.json"));
         let result = open_inference_vindex(tmp.path());
         let msg = match result {
             Ok(_) => panic!("loader must reject vindex without FFN weights"),

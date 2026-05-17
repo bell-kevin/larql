@@ -24,8 +24,8 @@ pub fn kquant_ffn_forward_layer(
         .interleaved_kquant_layer_data(layer)
         .unwrap_or_else(|| {
             panic!(
-                "interleaved_q4k layer data missing for layer {layer} - \
-             server must call `load_interleaved_q4k` before serving walk-ffn"
+                "interleaved_kquant layer data missing for layer {layer} - \
+             server must call `load_interleaved_kquant` before serving walk-ffn"
             )
         });
 
@@ -97,8 +97,8 @@ pub fn kquant_ffn_forward_layer_q8k(
         .interleaved_kquant_layer_data(layer)
         .unwrap_or_else(|| {
             panic!(
-                "interleaved_q4k layer data missing for layer {layer} - \
-             server must call `load_interleaved_q4k` before serving walk-ffn-q8k"
+                "interleaved_kquant layer data missing for layer {layer} - \
+             server must call `load_interleaved_kquant` before serving walk-ffn-q8k"
             )
         });
 

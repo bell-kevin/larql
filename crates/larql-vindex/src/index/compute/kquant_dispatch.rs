@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn q4k_matmul_transb_returns_none_when_no_q4k_data() {
-        // No interleaved_q4k mmap → interleaved_kquant_layer_data returns
+        // No interleaved_kquant mmap → interleaved_kquant_layer_data returns
         // None → matmul bails out.
         let index = VectorIndex::empty(1, 256);
         let x = vec![0.0_f32; 256];

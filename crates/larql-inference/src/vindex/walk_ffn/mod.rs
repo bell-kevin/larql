@@ -344,7 +344,11 @@ impl<'a> FfnBackend for WalkFfn<'a> {
             }
 
             // 5. Q4_0 interleaved + GPU Q4 (Metal).
-            if self.index.has_interleaved_q4() && self.backend.is_some_and(|be| be.has_q4()) {
+            if self.index.has_interleaved_q4()
+                && self
+                    .backend
+                    .is_some_and(|be| be.supports_quant(::larql_compute::QuantFormat::Q4_K))
+            {
                 if let Some(r) = self.walk_ffn_q4_interleaved(layer, x) {
                     break 'routing r;
                 }

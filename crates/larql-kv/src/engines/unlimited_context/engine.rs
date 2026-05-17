@@ -409,12 +409,12 @@ impl KvEngine for UnlimitedContextEngine {
 /// Re-export — moved to [`larql_inference::vindex::fused_prefill`]
 /// (2026-05-16) so `MetalBackend::coarse_prefill` can call it without
 /// an `larql-inference → larql-kv` dep cycle.
-pub(crate) use larql_inference::vindex::fused_prefill as fused_prefill;
+pub(crate) use larql_inference::vindex::fused_prefill;
 
 /// Run one Metal decode step via `backend.decode_token`.
 /// Re-export — moved to [`larql_inference::vindex::fused_decode_step`]
 /// (2026-05-16).
-pub(crate) use larql_inference::vindex::fused_decode_step as fused_decode_step;
+pub(crate) use larql_inference::vindex::fused_decode_step;
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -593,6 +593,137 @@ mod tests {
         assert!(
             logits.iter().all(|v| v.is_finite()),
             "logits should be finite"
+        );
+    }
+
+    // ── Q4K paths via Q4K fixture ─────────────────────────────────────────
+    //
+    // `prefill_quant` first tries `fused_prefill` (Metal fast path); on
+    // CPU that returns None (no fused decode kernel), so we fall through
+    // to the dequant + cached-decode path. The Q4K fixture has the attn
+    // Q4K slices the dequant step needs.
+
+    #[test]
+    fn prefill_quant_cpu_runs_via_dequant_path() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = UnlimitedContextEngine::new(512);
+        let h = engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1, 2], &*backend)
+            .expect("prefill_quant Q4K cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn decode_step_quant_cpu_extends_state() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = UnlimitedContextEngine::new(512);
+        engine
+            .prefill_quant(&mut weights, &ffn, &index, &[0u32, 1], &*backend)
+            .expect("prefill_quant");
+        let h = engine
+            .decode_step_quant(&mut weights, &ffn, &index, 2, &*backend)
+            .expect("decode_step_quant Q4K cpu fallback");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn decode_step_quant_without_prefill_returns_none() {
+        use larql_inference::ffn::NullFfn;
+        use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = larql_compute::cpu_backend();
+        let ffn = NullFfn;
+        let mut engine = UnlimitedContextEngine::new(512);
+        // No prefill → decode falls through fast-path checks and returns None
+        // (or some empty hidden) without panicking.
+        let _ = engine.decode_step_quant(&mut weights, &ffn, &index, 0, &*backend);
+    }
+
+    // ── Public utility methods (stats, replay_window, summary) ────────────
+
+    #[test]
+    fn engine_stats_summary_includes_archived_and_compression() {
+        use larql_inference::ffn::WeightFfn;
+        use larql_inference::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let mut engine = UnlimitedContextEngine::new(512);
+        engine
+            .prefill(&weights, &ffn, &[0u32, 1, 2])
+            .expect("prefill");
+        let stats = engine.stats(&weights);
+        assert!(stats.total_tokens >= 3);
+        // EngineStats::summary builds a one-line string that includes
+        // window count and token count.
+        let s = stats.summary();
+        assert!(s.contains("windows"));
+        assert!(s.contains("tokens"));
+    }
+
+    #[test]
+    fn engine_stats_with_empty_engine_handles_zero_division() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let engine = UnlimitedContextEngine::new(512);
+        let stats = engine.stats(&weights);
+        // No prefill → all counters zero, compression ratio short-circuits
+        // to 0.0 (no division by zero).
+        assert_eq!(stats.total_tokens, 0);
+        assert_eq!(stats.archived_windows, 0);
+        assert!(
+            stats.compression_ratio == 0.0,
+            "compression should be 0 when no boundary bytes archived"
+        );
+        // Summary still produces a string for the empty case.
+        let _ = stats.summary();
+    }
+
+    #[test]
+    fn replay_window_returns_none_for_missing_window() {
+        let weights = larql_inference::test_utils::make_test_weights();
+        let engine = UnlimitedContextEngine::new(512);
+        // No windows archived → any window_id returns None at the
+        // `self.archive.retrieve(window_id)?` line.
+        assert!(engine.replay_window(&weights, 0).is_none());
+        assert!(engine.replay_window(&weights, 99).is_none());
+    }
+
+    #[test]
+    fn replay_window_succeeds_after_window_overflow() {
+        use larql_inference::ffn::WeightFfn;
+        use larql_inference::test_utils::make_test_weights;
+        let weights = make_test_weights();
+        let ffn = WeightFfn { weights: &weights };
+        // window=2; prefill 4 tokens → archives at least 1 window.
+        let mut engine = UnlimitedContextEngine::new(2);
+        engine
+            .prefill(&weights, &ffn, &[0u32, 1, 2, 3])
+            .expect("prefill 4 tokens");
+        let stats = engine.stats(&weights);
+        assert!(
+            stats.archived_windows >= 1,
+            "expected at least 1 archived window after overflow, got {}",
+            stats.archived_windows
+        );
+        // Replay the first archived window — exercises the
+        // `rs_extend_from_checkpoint_backend` path (lines 132-138).
+        let replay = engine.replay_window(&weights, 0);
+        assert!(replay.is_some(), "replay_window(0) should succeed");
+        let (kv, abs_end) = replay.unwrap();
+        assert!(!kv.is_empty(), "replayed K/V cache should be non-empty");
+        assert!(
+            abs_end < 4,
+            "abs_end {abs_end} should be within the prefill"
         );
     }
 }

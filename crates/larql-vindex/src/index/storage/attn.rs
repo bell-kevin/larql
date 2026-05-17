@@ -82,7 +82,7 @@ impl VectorIndex {
     }
 
     /// Load Q4_K/Q6_K attention weights for Ollama-compatible GPU pipeline.
-    pub fn load_attn_q4k(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
+    pub fn load_attn_kquant(&mut self, dir: &std::path::Path) -> Result<(), VindexError> {
         let path = dir.join(ATTN_WEIGHTS_Q4K_BIN);
         if !path.exists() {
             return Err(VindexError::Parse("attn_weights_q4k.bin not found".into()));
@@ -154,7 +154,7 @@ impl VectorIndex {
         } else {
             None
         };
-        Arc::make_mut(&mut self.storage).set_attn_q4k(mmap, manifest);
+        Arc::make_mut(&mut self.storage).set_attn_kquant(mmap, manifest);
         Ok(())
     }
 
@@ -238,7 +238,7 @@ mod tests {
 
     /// Build a minimal vindex directory with the given attn_weights_q4k.bin
     /// payload + manifest. Returns a `tempfile::TempDir` whose path can be
-    /// passed straight to `load_attn_q4k`.
+    /// passed straight to `load_attn_kquant`.
     fn make_vindex_with_attn_q4k(payload: &[u8], manifest: serde_json::Value) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join(ATTN_WEIGHTS_Q4K_BIN), payload).unwrap();
@@ -251,7 +251,7 @@ mod tests {
     }
 
     fn empty_vindex() -> VectorIndex {
-        // Layer count and hidden size don't matter for the load_attn_q4k
+        // Layer count and hidden size don't matter for the load_attn_kquant
         // path — both are read from the manifest, not from the index.
         VectorIndex::empty(1, 2560)
     }
@@ -274,7 +274,7 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path())
+        idx.load_attn_kquant(tmp.path())
             .expect("clean stride must load");
     }
 
@@ -302,7 +302,7 @@ mod tests {
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
         let err = idx
-            .load_attn_q4k(tmp.path())
+            .load_attn_kquant(tmp.path())
             .expect_err("legacy 148-byte stride must be rejected");
         let msg = format!("{err:?}");
         assert!(
@@ -332,7 +332,7 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path())
+        idx.load_attn_kquant(tmp.path())
             .expect_err("non-canonical stride must be rejected");
     }
 
@@ -364,7 +364,7 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path())
+        idx.load_attn_kquant(tmp.path())
             .expect("matched Q4_K + Q6_K strides must load");
     }
 
@@ -386,7 +386,7 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path())
+        idx.load_attn_kquant(tmp.path())
             .expect_err("Q6_K tensor with Q4_K length must be rejected");
     }
 
@@ -432,15 +432,15 @@ mod tests {
         ]);
         let tmp = make_vindex_with_attn_q4k(&payload, manifest);
         let mut idx = empty_vindex();
-        idx.load_attn_q4k(tmp.path()).expect("clean load");
+        idx.load_attn_kquant(tmp.path()).expect("clean load");
 
         // …then corrupt the manifest so the V entry's slice would walk
         // off the end of the mmap. The bounds check should turn this
         // into `None` rather than a panic. Direct mutation of the
         // storage's pub(crate) manifest field is a test-only pattern
-        // (production goes through `set_attn_q4k`).
+        // (production goes through `set_attn_kquant`).
         let storage = std::sync::Arc::make_mut(&mut idx.storage);
-        let m = storage.attn_q4k_manifest.as_mut().expect("manifest");
+        let m = storage.attn_kquant_manifest.as_mut().expect("manifest");
         m[2] = (len, 1, "Q4_K".to_string()); // offset = len → end = len + 1 > mmap.len()
         assert!(idx.attn_kquant_layer_data(0).is_none());
     }

@@ -8,7 +8,7 @@
 //! - `up.rs`               — `up_features.bin` (feature-major f32)
 //! - `interleaved.rs`      — `interleaved.bin` (f32 [gate|up|down])
 //! - `interleaved_q4.rs`   — `interleaved_q4.bin` (Q4_0)
-//! - `interleaved_q4k.rs`  — `interleaved_q4k.bin` + manifests +
+//! - `interleaved_kquant.rs`  — `interleaved_kquant.bin` + manifests +
 //!                           `down_features_q4k.bin` (Q4_K/Q6_K)
 //! - `gate_q4.rs`          — Q4_0 gate-vector mmap (KNN side-channel)
 //! - `fp4.rs`              — FP4 / FP8 FFN storage (exp 26)
