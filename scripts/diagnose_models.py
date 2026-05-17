@@ -110,6 +110,22 @@ MATRIX: list[TestCase] = [
              "residual_multiplier=0.22. Same dense arch as 8B/30B with different scalars.",
     ),
     TestCase(
+        name="Granite-4.1-8B",
+        model_id="ibm-granite/granite-4.1-8b",
+        family="granite (4.1 dense, larger head_dim)",
+        note="GraniteForCausalLM v4.1, hidden=4096 / 40L / 32Q / 8KV, vocab=100352, "
+             "attention_multiplier=1/128 (vs 1/64 on 3B), logits_scaling=16 (vs 10), "
+             "embedding_multiplier=12, residual_multiplier=0.22. ~17 GB bf16.",
+    ),
+    TestCase(
+        name="Granite-4.1-30B",
+        model_id="ibm-granite/granite-4.1-30b",
+        family="granite (4.1 dense, μP init)",
+        note="GraniteForCausalLM v4.1, hidden=4096 / 64L / 32Q / 8KV, vocab=100352, "
+             "attention_multiplier=1/128, logits_scaling=16, residual_multiplier=0.175 "
+             "(vs 0.22 — μP-init scaling), rope_theta=50M (vs 10M on 3B/8B). ~60 GB bf16.",
+    ),
+    TestCase(
         name="Gemma-2-2B",
         model_id="google/gemma-2-2b",
         family="gemma2 (softcap, post-norms)",

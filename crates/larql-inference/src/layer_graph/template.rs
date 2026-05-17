@@ -548,4 +548,41 @@ mod tests {
             assert!(out.residual.iter().all(|v| v.is_finite()), "layer {layer}");
         }
     }
+
+    /// With an interleaved-f32 vindex populated, the guided walk path
+    /// reaches the inner per-feature loop (lines 240-269): `up_layer_matrix`
+    /// + `down_layer_matrix` + `gate_scores_batch` all return Some, so the
+    /// `gate_scores` accumulation runs across the supplied universe features
+    /// for every position.
+    #[test]
+    fn guided_walk_with_interleaved_f32_runs_inner_accumulation_loop() {
+        use crate::test_utils::InterleavedF32TestFixtures;
+        let fx = InterleavedF32TestFixtures::build();
+        // Supply a non-empty feature universe so the inner loop iterates.
+        let mut features = std::collections::HashMap::new();
+        for layer in 0..fx.weights.num_layers {
+            // intermediate_size is small in the synthetic fixture, pick a few.
+            features.insert(layer, vec![0usize, 3, 7]);
+        }
+        let universe = TemplateUniverse {
+            name: "interleaved-test".into(),
+            features,
+        };
+        let g = GuidedWalkLayerGraph {
+            weights: &fx.weights,
+            universe: &universe,
+            index: &fx.index,
+        };
+        let h = input(2, fx.weights.hidden_size);
+        for layer in 0..fx.weights.num_layers {
+            let out = g
+                .forward_layer(&fx.weights, &h, layer)
+                .expect("layer must run");
+            assert_eq!(out.residual.shape(), &[2, fx.weights.hidden_size]);
+            assert!(
+                out.residual.iter().all(|v| v.is_finite()),
+                "layer {layer} guided walk residual must be finite"
+            );
+        }
+    }
 }

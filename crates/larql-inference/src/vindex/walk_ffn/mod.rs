@@ -740,12 +740,24 @@ mod dispatch_tests {
 
     /// Forward against the Q4K test fixture routes through the native
     /// kquant path (priority 4 in the routing ladder, line 340-343),
-    /// which fires when the vindex has interleaved_kquant data.
+    /// which fires when the vindex has interleaved_kquant data AND the
+    /// `num_features` Q4_K fallback returns a non-zero width.
     #[test]
     fn walk_ffn_forward_routes_through_native_kquant_path() {
         use crate::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
         let weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
+        // Pre-flight: the Q4K manifest's gate component bytes should give
+        // a positive intermediate width via the `num_features` fallback.
+        // If this fails the test would silently route through
+        // `zero_features_dense` and the native kquant path stays uncov.
+        for layer in 0..weights.num_layers {
+            assert!(
+                index.num_features(layer) > 0,
+                "layer {layer}: num_features must be > 0 for Q4K routing — \
+                 the kquant_ffn_intermediate_width fallback returned 0"
+            );
+        }
         let ffn = WalkFfn::new_unlimited(&weights, &index);
         let x = input(1, weights.hidden_size);
         let out = ffn.forward(0, &x);

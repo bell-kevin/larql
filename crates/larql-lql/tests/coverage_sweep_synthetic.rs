@@ -21,7 +21,12 @@ fn fresh_session() -> (Session, tempfile::TempDir, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     write_synthetic_model_dir(dir.path()).expect("fixture write");
     let mut session = Session::new();
-    let use_stmt = format!(r#"USE "{}";"#, dir.path().display());
+    // The LQL lexer decodes `\` as an escape inside string literals
+    // (`\U`/`\R`/etc. silently drop the backslash). Windows tempdirs
+    // contain backslashes, so we double them up here before embedding
+    // the path in the SQL string.
+    let path_for_sql = dir.path().display().to_string().replace('\\', "\\\\");
+    let use_stmt = format!(r#"USE "{path_for_sql}";"#);
     let parsed = parser::parse(&use_stmt).expect("USE parse");
     session.execute(&parsed).expect("USE execute");
     let path_str = dir.path().display().to_string();

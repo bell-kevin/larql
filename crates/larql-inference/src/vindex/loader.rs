@@ -192,4 +192,52 @@ mod tests {
             "error must explain what's missing — got: {msg}"
         );
     }
+
+    /// Happy path — write a synthetic Q4_K vindex and load it through
+    /// `open_inference_vindex`. Exercises the success branches of the
+    /// loader's attention + FFN resolution order (attn_weights_q4k →
+    /// interleaved_q4k → tied-embedding lm_head best-effort).
+    #[test]
+    fn open_inference_vindex_loads_synthetic_q4k_fixture() {
+        use crate::test_utils::write_synthetic_q4k_model_dir;
+        let tmp = tempfile::tempdir().unwrap();
+        write_synthetic_q4k_model_dir(tmp.path())
+            .expect("write synthetic Q4K vindex");
+        let index = open_inference_vindex(tmp.path())
+            .expect("loader should accept synthetic Q4K fixture");
+        // Q4K attention + FFN bytes both loaded.
+        assert!(
+            index.attn_kquant_layer_data(0).is_some(),
+            "attn_q4k must be loaded for layer 0"
+        );
+        assert!(
+            index.has_interleaved_kquant(),
+            "interleaved_q4k must be loaded"
+        );
+    }
+
+    /// Synthetic Q4K vindex round-trip via the broader
+    /// `InferenceWeights::load(Quantised)` shape: the fixture writes the
+    /// full disk layout, the loader reads it, and the resulting
+    /// `InferenceWeights` reports `is_quantised()`.
+    #[test]
+    fn synthetic_q4k_fixture_round_trips_through_inference_weights() {
+        use crate::forward::InferenceWeights;
+        use crate::test_utils::write_synthetic_q4k_model_dir;
+        use larql_vindex::{load_vindex_config, SilentLoadCallbacks};
+        let tmp = tempfile::tempdir().unwrap();
+        write_synthetic_q4k_model_dir(tmp.path())
+            .expect("write synthetic Q4K vindex");
+        let config =
+            load_vindex_config(tmp.path()).expect("load_vindex_config");
+        assert_eq!(config.quant, larql_vindex::QuantFormat::Q4K);
+
+        let mut cb = SilentLoadCallbacks;
+        let iw = InferenceWeights::load(tmp.path(), &config, &mut cb)
+            .expect("InferenceWeights::load Quantised branch");
+        assert!(iw.is_quantised(), "Q4K fixture must report is_quantised()");
+        let w = iw.as_weights();
+        assert!(w.num_layers > 0);
+        assert!(w.hidden_size > 0);
+    }
 }

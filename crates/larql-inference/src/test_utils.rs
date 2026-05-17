@@ -130,6 +130,68 @@ pub fn make_test_vindex(weights: &ModelWeights) -> larql_vindex::VectorIndex {
     larql_vindex::VectorIndex::new(gate_vectors, down_meta, weights.num_layers, hidden)
 }
 
+/// Extend an existing `VectorIndex` with an `interleaved.bin`-shaped
+/// f32 FFN payload.
+///
+/// Layout per layer: `[gate(I × H) | up(I × H) | down(H × I)]` packed
+/// as little-endian f32. Same format the `build_interleaved` example
+/// produces, so the `interleaved_gate` / `interleaved_up` /
+/// `interleaved_down` / `up_layer_matrix` / `down_layer_matrix`
+/// accessors all observe the data.
+///
+/// Reuses `weights.tensors` for the matrices so the f32 walk paths
+/// agree bit-for-bit with the dense forward pass under the same
+/// weights.
+pub fn attach_interleaved_f32_to_test_vindex(
+    weights: &ModelWeights,
+    index: &mut larql_vindex::VectorIndex,
+) {
+    let arch = &*weights.arch;
+    let mut payload: Vec<u8> = Vec::new();
+    for layer in 0..weights.num_layers {
+        for key in [
+            arch.ffn_gate_key(layer),
+            arch.ffn_up_key(layer),
+            arch.ffn_down_key(layer),
+        ] {
+            let tensor = weights
+                .tensors
+                .get(&key)
+                .unwrap_or_else(|| panic!("missing tensor {key} in test weights"));
+            let slice = tensor.as_slice().expect("contiguous row-major");
+            payload.extend(slice.iter().flat_map(|v| v.to_le_bytes()));
+        }
+    }
+    let mmap = arc_mmap_from_bytes(&payload);
+    let storage = std::sync::Arc::make_mut(&mut index.storage);
+    storage.set_interleaved_f32(mmap);
+}
+
+/// Bundled f32-interleaved fixture: same as [`TestFixtures`] but with
+/// the test vindex extended via [`attach_interleaved_f32_to_test_vindex`].
+/// Use for tests that need `up_layer_matrix` / `down_layer_matrix` /
+/// `interleaved_*` accessors to return `Some` (e.g.
+/// `GuidedWalkLayerGraph`, the priority-6 routing branch in `WalkFfn`).
+pub struct InterleavedF32TestFixtures {
+    pub weights: ModelWeights,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub index: larql_vindex::VectorIndex,
+}
+
+impl InterleavedF32TestFixtures {
+    pub fn build() -> Self {
+        let weights = make_test_weights();
+        let tokenizer = make_test_tokenizer(weights.vocab_size);
+        let mut index = make_test_vindex(&weights);
+        attach_interleaved_f32_to_test_vindex(&weights, &mut index);
+        Self {
+            weights,
+            tokenizer,
+            index,
+        }
+    }
+}
+
 /// Build a `tokenizers::Tokenizer` with a vocabulary of `vocab_size` tokens.
 /// Token N decodes to `"[N]"`, so token IDs from `make_test_weights()` all
 /// decode to valid (if meaningless) strings.
@@ -303,6 +365,125 @@ pub fn write_synthetic_model_dir(dir: &std::path::Path) -> Result<(), String> {
     write_model_weights(&weights, dir, &mut cb).map_err(|e| format!("write_model_weights: {e}"))?;
 
     // ── Embeddings (vocab × hidden f32, little-endian) ────────────────
+    let embed_slice = weights.embed.as_slice().ok_or("embed not contiguous")?;
+    let mut embed_bytes = Vec::with_capacity(embed_slice.len() * 4);
+    for &v in embed_slice {
+        embed_bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(dir.join("embeddings.bin"), &embed_bytes)
+        .map_err(|e| format!("write embeddings.bin: {e}"))?;
+
+    Ok(())
+}
+
+/// Serialise the synthetic `make_test_q4k_weights()` model + matching
+/// Q4_K vindex to an on-disk directory that the strict
+/// `open_inference_vindex` loader will accept.
+///
+/// Companion to [`write_synthetic_model_dir`]. Use this when a test
+/// needs to exercise the Q4_K loader resolution order (attn_weights_q4k
+/// → interleaved_q4k → lm_head_q4) without a real Gemma snapshot on
+/// disk.
+///
+/// Layout written:
+/// ```text
+/// dir/
+///   index.json                       -- VindexConfig with quant=Q4K
+///   tokenizer.json                   -- WordLevel "[0]".."[VOCAB-1]"
+///   gate_vectors.bin                 -- empty per-layer (vindex contract)
+///   down_meta.bin                    -- empty per-layer
+///   attn_weights_q4k.bin             -- Q/K/V/O quantised per layer
+///   attn_weights_q4k_manifest.json
+///   interleaved_q4k.bin              -- [gate|up|down] per layer
+///   interleaved_q4k_manifest.json
+///   lm_head_q4.bin                   -- tied embed quantised
+///   norms.bin                        -- f32 norms (unchanged from non-Q4 path)
+/// ```
+pub fn write_synthetic_q4k_model_dir(dir: &std::path::Path) -> Result<(), String> {
+    use larql_vindex::{
+        write_model_weights_q4k, ExtractLevel, MoeConfig, SilentBuildCallbacks, StorageDtype,
+        VindexConfig, VindexModelConfig,
+    };
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("create_dir_all: {e}"))?;
+
+    let weights = make_test_q4k_weights();
+
+    // ── tokenizer.json ────────────────────────────────────────────────
+    std::fs::write(
+        dir.join("tokenizer.json"),
+        synthetic_tokenizer_json(weights.vocab_size),
+    )
+    .map_err(|e| format!("write tokenizer.json: {e}"))?;
+
+    // ── model_config + index.json ─────────────────────────────────────
+    let model_config = VindexModelConfig {
+        model_type: "gemma3_text".into(),
+        head_dim: weights.head_dim,
+        num_q_heads: weights.num_q_heads,
+        num_kv_heads: weights.num_kv_heads,
+        rope_base: weights.rope_base,
+        sliding_window: None,
+        moe: None::<MoeConfig>,
+        global_head_dim: None,
+        num_global_kv_heads: None,
+        partial_rotary_factor: None,
+        sliding_window_pattern: None,
+        layer_types: None,
+        attention_k_eq_v: false,
+        num_kv_shared_layers: None,
+        per_layer_embed_dim: None,
+        rope_local_base: None,
+        query_pre_attn_scalar: None,
+        final_logit_softcapping: None,
+        attention_multiplier: None,
+        residual_multiplier: None,
+        logits_scaling: None,
+        norm_eps: None,
+    };
+
+    let mut config = VindexConfig {
+        version: 2,
+        model: "synthetic/gemma3_q4k".into(),
+        family: "gemma3".into(),
+        source: None,
+        checksums: None,
+        num_layers: weights.num_layers,
+        hidden_size: weights.hidden_size,
+        intermediate_size: weights.intermediate_size,
+        vocab_size: weights.vocab_size,
+        embed_scale: 1.0,
+        extract_level: ExtractLevel::All,
+        dtype: StorageDtype::F32,
+        quant: larql_vindex::QuantFormat::Q4K,
+        layer_bands: None,
+        layers: Vec::new(),
+        down_top_k: 5,
+        has_model_weights: true,
+        model_config: Some(model_config),
+        fp4: None,
+        ffn_layout: None,
+    };
+
+    // Use an empty in-memory index for `save_vindex` (writes the
+    // mandatory gate_vectors.bin + down_meta.bin + index.json scaffolding).
+    let empty_index = larql_vindex::VectorIndex::new(
+        vec![None; weights.num_layers],
+        vec![None; weights.num_layers],
+        weights.num_layers,
+        weights.hidden_size,
+    );
+    empty_index
+        .save_vindex(dir, &mut config)
+        .map_err(|e| format!("save_vindex: {e}"))?;
+
+    // ── Q4K weights (attn_weights_q4k + interleaved_q4k + lm_head_q4 + norms) ──
+    let mut cb = SilentBuildCallbacks;
+    write_model_weights_q4k(&weights, dir, &mut cb)
+        .map_err(|e| format!("write_model_weights_q4k: {e}"))?;
+
+    // ── Embeddings (required by `load_model_weights_q4k` — the Q4K
+    //    writer doesn't emit them on its own). ─────────────────────
     let embed_slice = weights.embed.as_slice().ok_or("embed not contiguous")?;
     let mut embed_bytes = Vec::with_capacity(embed_slice.len() * 4);
     for &v in embed_slice {
@@ -760,6 +941,113 @@ pub fn make_test_q4k_weights() -> ModelWeights {
         if let Some(k) = arch.post_feedforward_layernorm_key(layer) {
             vectors.insert(k, vec![0.5; Q4K_TEST_HIDDEN]);
         }
+    }
+
+    ModelWeights {
+        tensors,
+        vectors,
+        raw_bytes: HashMap::new(),
+        packed_mmaps: HashMap::new(),
+        skipped_tensors: Vec::new(),
+        packed_byte_ranges: HashMap::new(),
+        embed,
+        lm_head,
+        position_embed: None,
+        arch,
+        num_layers: Q4K_TEST_NUM_LAYERS,
+        hidden_size: Q4K_TEST_HIDDEN,
+        intermediate_size: Q4K_TEST_INTER,
+        vocab_size: Q4K_TEST_VOCAB,
+        head_dim,
+        num_q_heads: num_q,
+        num_kv_heads: num_kv,
+        rope_base: 10_000.0,
+    }
+}
+
+/// SiLU sibling of [`make_test_q4k_weights`].
+///
+/// Uses the TinyModel architecture so the FFN activation is `Silu` and
+/// the FFN type is `Gated`. Dimensions match the Q4_K constraints
+/// (`Q4K_TEST_HIDDEN` is a multiple of 256) so the same `make_test_q4k_vindex`
+/// can wrap the result. Needed by tests that exercise the SiLU branch in
+/// quantised forward paths (e.g. `walk_ffn_kquant_dequant`'s `silu_gate_up`
+/// arm) without depending on a Gemma3 fixture.
+pub fn make_test_q4k_weights_silu() -> ModelWeights {
+    let num_q = 4usize;
+    let num_kv = 2usize;
+    let head_dim = Q4K_TEST_HIDDEN / num_q;
+
+    let arch_json = serde_json::json!({
+        "model_type": "tinymodel",
+        "hidden_size": Q4K_TEST_HIDDEN,
+        "num_hidden_layers": Q4K_TEST_NUM_LAYERS,
+        "intermediate_size": Q4K_TEST_INTER,
+        "head_dim": head_dim,
+        "num_attention_heads": num_q,
+        "num_key_value_heads": num_kv,
+        "vocab_size": Q4K_TEST_VOCAB,
+    });
+    let arch = detect_from_json(&arch_json);
+
+    let mut tensors: HashMap<String, WeightArray> = HashMap::new();
+    let mut vectors: HashMap<String, Vec<f32>> = HashMap::new();
+
+    let mut seed = 0xdeadc0de_u64;
+    let mut next_seed = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed
+    };
+
+    let embed = rand_mat_seeded(Q4K_TEST_VOCAB, Q4K_TEST_HIDDEN, 0.05, next_seed());
+    let lm_head = embed.clone();
+    tensors.insert(arch.embed_key().to_string(), embed.clone());
+
+    vectors.insert(
+        arch.final_norm_key().to_string(),
+        vec![1.0; Q4K_TEST_HIDDEN],
+    );
+
+    let q_dim = num_q * head_dim;
+    let kv_dim = num_kv * head_dim;
+
+    for layer in 0..Q4K_TEST_NUM_LAYERS {
+        tensors.insert(
+            arch.attn_q_key(layer),
+            rand_mat_seeded(q_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_k_key(layer),
+            rand_mat_seeded(kv_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_v_key(layer),
+            rand_mat_seeded(kv_dim, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.attn_o_key(layer),
+            rand_mat_seeded(Q4K_TEST_HIDDEN, q_dim, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_gate_key(layer),
+            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_up_key(layer),
+            rand_mat_seeded(Q4K_TEST_INTER, Q4K_TEST_HIDDEN, 0.05, next_seed()),
+        );
+        tensors.insert(
+            arch.ffn_down_key(layer),
+            rand_mat_seeded(Q4K_TEST_HIDDEN, Q4K_TEST_INTER, 0.05, next_seed()),
+        );
+
+        vectors.insert(arch.input_layernorm_key(layer), vec![1.0; Q4K_TEST_HIDDEN]);
+        vectors.insert(
+            arch.post_attention_layernorm_key(layer),
+            vec![1.0; Q4K_TEST_HIDDEN],
+        );
     }
 
     ModelWeights {

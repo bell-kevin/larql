@@ -10,6 +10,15 @@
 //! 2026-05-16: the dual import (legacy from `larql-kv`, helpers from
 //! `larql-inference`) forced cargo to compile `larql-inference` twice
 //! when the parity tests lived inside the lib crate's `#[cfg(test)]`.
+//!
+//! BLAS on Windows has non-deterministic reduction order across
+//! successive matmul calls (parallel accumulation), so bit-for-bit
+//! parity between two dispatch paths doesn't hold there. Linux/macOS
+//! BLAS is deterministic and the property holds; gate the whole file
+//! on `not(windows)` rather than weaken to a fuzzy tolerance that
+//! wouldn't catch real bugs.
+
+#![cfg(not(windows))]
 
 use larql_compute::CpuBackend;
 use larql_inference::ffn::WeightFfn;
@@ -106,13 +115,6 @@ fn decode_step_via_dispatch_matches_legacy_kv_decode_step_run() {
     );
 }
 
-// BLAS on Windows has non-deterministic reduction order across
-// successive matmul calls, so bit-for-bit parity drifts after a
-// few decode steps. Linux/macOS BLAS is deterministic and the
-// property holds there; we keep the strict check there and skip
-// on Windows rather than weaken to a fuzzy tolerance that wouldn't
-// catch real bugs.
-#[cfg(not(windows))]
 #[test]
 fn multi_step_decode_via_dispatch_matches_legacy() {
     let weights = make_test_weights();

@@ -21,7 +21,9 @@ fn fresh_synthetic_session() -> (Session, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
     write_synthetic_model_dir(dir.path()).expect("fixture write");
     let mut session = Session::new();
-    let use_stmt = format!(r#"USE "{}";"#, dir.path().display());
+    // Escape backslashes for the LQL lexer (Windows tempdir paths).
+    let path_for_sql = dir.path().display().to_string().replace('\\', "\\\\");
+    let use_stmt = format!(r#"USE "{path_for_sql}";"#);
     let parsed = parser::parse(&use_stmt).expect("USE parse");
     session.execute(&parsed).expect("USE execute");
     (session, dir)
