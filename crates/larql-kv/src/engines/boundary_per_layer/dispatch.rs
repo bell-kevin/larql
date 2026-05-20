@@ -1,19 +1,25 @@
 //! W1-GPU dispatch path for `BoundaryPerLayerEngine`.
 //!
-//! Mirrors `markov_residual_codec`'s dispatch path inside its
-//! `engine.rs`. The two free functions ([`try_prefill_via_dispatch`]
-//! and [`decode_step_via_dispatch`]) route through the backend's
-//! `coarse_prefill_with_state` / `coarse_decode_step_with_state`
-//! surface — on Metal this runs the prompt through the fused
-//! per-layer kernel and dumps per-layer `h_in` for the engine to
-//! pull into its residual store.
+//! Mirrors `markov_residual`'s dispatch path. The two free functions
+//! ([`try_prefill_via_dispatch`] and [`decode_step_via_dispatch`])
+//! route through the backend's `coarse_prefill_with_state` /
+//! `coarse_decode_step_with_state_masked` surface — on Metal this
+//! runs the prompt through the fused per-layer kernel and dumps
+//! per-layer `h_in` for the engine to pull into its residual store.
 //!
 //! Returns `None` (engine should fall back to the dense walk in
 //! `super::walk`) when the backend / vindex doesn't support the
-//! cached + direct-matvec decode path. v0.1: Full mask (no W10
-//! cascade) — adding HOnly/None mask support is a follow-up.
+//! cached + direct-matvec decode path.
+//!
+//! **W10 mask cascade** — `boundary_per_layer` never shadows hot
+//! K/V (it's recomputed at extend-cold-kv time on overflow), so
+//! `LARQL_W10_HONLY=1` is always at least HOnly-safe. When
+//! `window_size = None` the residual `stored` is also unused (no
+//! cold-tier eviction can fire), so the engine additionally drops
+//! it and requests the None mask. Bench (Gemma 3 4B Q4K, M3 Max,
+//! 2026-05-21) closes the 13% gap to `standard`'s ~100 tok/s
+//! ceiling.
 
-use larql_inference::attention::SharedKV;
 use larql_inference::model::ModelWeights;
 use larql_inference::{EngineBackend, KvHandle, PerLayerDecodeState};
 use ndarray::Array2;
@@ -22,6 +28,8 @@ use crate::engines::boundary_per_layer::cold_tier::{extend_cold_kv_with_overflow
 use crate::engines::boundary_per_layer::policy::BoundaryLayerPolicy;
 use crate::engines::boundary_per_layer::store::{PerLayerEncodedColdLayer, RsStorePerLayer};
 use crate::engines::markov_residual::recompute_kv;
+
+use crate::engines::w10_enabled as w10_env_on;
 
 /// Run prefill through the W1-GPU dispatch path. Returns
 /// `(last_hidden, new_store, kv_handle)` on success; `None` when the
@@ -48,11 +56,27 @@ pub(super) fn try_prefill_via_dispatch(
         return None;
     }
     let prompt_len = token_ids.len();
-    let stored: Vec<Array2<f32>> = state
-        .h_in_per_layer
-        .into_iter()
-        .map(|h| h.into_array())
-        .collect();
+
+    // W10 Phase C: when LARQL_W10_HONLY=1 + window=None, no
+    // cold-tier eviction can fire and `rs.stored` is dead weight.
+    // Drop it; decode steps will request the None mask, eliminating
+    // both K/V and h_in readback. (HOnly without dropping stored is
+    // always safe — boundary_per_layer has no hot K/V shadow — but
+    // dropping stored is what enables the None-mask path.)
+    let drop_stored_shadow = w10_env_on() && window_size.is_none();
+    let stored: Vec<Array2<f32>> = if drop_stored_shadow {
+        let hidden_size = weights.hidden_size;
+        (0..num_layers)
+            .map(|_| Array2::<f32>::zeros((0, hidden_size)))
+            .collect()
+    } else {
+        state
+            .h_in_per_layer
+            .into_iter()
+            .map(|h| h.into_array())
+            .collect()
+    };
+
     let mut rs = RsStorePerLayer {
         stored,
         cold_encoded: None,
@@ -62,27 +86,33 @@ pub(super) fn try_prefill_via_dispatch(
         max_window: window_size,
         policy_codecs: policy.entries.clone(),
     };
-    // Prefill-time clip if window < prompt.
-    let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
-    for layer in 0..num_layers {
-        overflow_per_layer.push(rs.clip_layer_overflow(layer));
-    }
-    if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
-        let mut encoded_layers: Vec<PerLayerEncodedColdLayer> = Vec::with_capacity(num_layers);
-        let mut cold_kv: Vec<SharedKV> = Vec::with_capacity(num_layers);
-        for (layer, overflow) in overflow_per_layer.iter().enumerate() {
-            let codec = policy.codec_for(layer);
-            let decoded_overflow = roundtrip(overflow, codec);
-            let (k, v) = recompute_kv(weights, &decoded_overflow, layer, 0, backend, None)
-                .expect("cold K/V pre-computation failed");
-            cold_kv.push((k, v));
-            let mut enc = PerLayerEncodedColdLayer::empty(codec, weights.hidden_size);
-            enc.append(overflow);
-            encoded_layers.push(enc);
+
+    // Prefill-time clip only when we have a non-empty stored. With
+    // drop_stored_shadow the stored is empty and clip is a no-op,
+    // but we'd panic on indexing `stored[layer]` so just skip.
+    if !drop_stored_shadow {
+        let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
+        for layer in 0..num_layers {
+            overflow_per_layer.push(rs.clip_layer_overflow(layer));
         }
-        rs.cold_encoded = Some(encoded_layers);
-        rs.cold_kv = Some(cold_kv);
-        rs.cold_abs_start = 0;
+        if overflow_per_layer.first().map_or(0, |c| c.shape()[0]) > 0 {
+            let mut encoded_layers: Vec<PerLayerEncodedColdLayer> = Vec::with_capacity(num_layers);
+            let mut cold_kv: Vec<larql_inference::attention::SharedKV> =
+                Vec::with_capacity(num_layers);
+            for (layer, overflow) in overflow_per_layer.iter().enumerate() {
+                let codec = policy.codec_for(layer);
+                let decoded_overflow = roundtrip(overflow, codec);
+                let (k, v) = recompute_kv(weights, &decoded_overflow, layer, 0, backend, None)
+                    .expect("cold K/V pre-computation failed");
+                cold_kv.push((k, v));
+                let mut enc = PerLayerEncodedColdLayer::empty(codec, weights.hidden_size);
+                enc.append(overflow);
+                encoded_layers.push(enc);
+            }
+            rs.cold_encoded = Some(encoded_layers);
+            rs.cold_kv = Some(cold_kv);
+            rs.cold_abs_start = 0;
+        }
     }
     Some((hidden, rs, handle))
 }
@@ -103,27 +133,57 @@ pub(super) fn decode_step_via_dispatch(
     let num_layers = weights.num_layers;
     let mut state = PerLayerDecodeState::with_capacity(num_layers);
     let abs_position = rs.next_position;
-    let hidden = backend.coarse_decode_step_with_state(
+
+    // W10 mask cascade. boundary_per_layer never shadows hot K/V,
+    // so K/V readback is always wasted overhead → drop_hot_kv is
+    // unconditionally true when env_on. stored is droppable only
+    // when env_on + windowless (the prefill arranged that).
+    let env_on = w10_env_on();
+    let drop_stored = rs
+        .stored
+        .first()
+        .map(|a| a.shape()[0] == 0)
+        .unwrap_or(false)
+        && env_on;
+    let mask = if drop_stored {
+        larql_compute::StateDumpMask::None
+    } else if env_on {
+        larql_compute::StateDumpMask::HOnly
+    } else {
+        larql_compute::StateDumpMask::Full
+    };
+
+    let hidden = backend.coarse_decode_step_with_state_masked(
         weights,
         token_id,
         Some(index),
         handle,
         abs_position,
         Some(&mut state),
+        mask,
     )?;
-    if !state.is_complete_for(num_layers) {
+    if !state.is_complete_under(num_layers, mask) {
         return None;
     }
-    // Append h_in to each layer's stored slab (amortised O(m) via push_row).
-    for (layer, h) in state.h_in_per_layer.into_iter().enumerate() {
-        let h_arr = h.into_array();
-        rs.stored[layer]
-            .push_row(h_arr.row(0))
-            .expect("push_row shape mismatch");
+
+    // Append h_in to each layer's stored slab (amortised O(m) via
+    // push_row). Under None mask, h_in is empty — skip the loop;
+    // stored stays the empty Vec from prefill.
+    if !matches!(mask, larql_compute::StateDumpMask::None) {
+        for (layer, h) in state.h_in_per_layer.into_iter().enumerate() {
+            let h_arr = h.into_array();
+            rs.stored[layer]
+                .push_row(h_arr.row(0))
+                .expect("push_row shape mismatch");
+        }
     }
     rs.next_position = abs_position + 1;
 
-    // Cold-tier eviction + cold_kv extension.
+    // Cold-tier eviction + cold_kv extension. Under None mask there's
+    // no stored to evict from; skip.
+    if matches!(mask, larql_compute::StateDumpMask::None) {
+        return Some((hidden, rs));
+    }
     let mut overflow_per_layer: Vec<Array2<f32>> = Vec::with_capacity(num_layers);
     for layer in 0..num_layers {
         overflow_per_layer.push(rs.clip_layer_overflow(layer));

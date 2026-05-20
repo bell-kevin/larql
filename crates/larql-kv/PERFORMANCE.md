@@ -5,6 +5,51 @@ preceded the crate extraction (2026-04-23 onward), with the source bench
 identified for each row. The extraction itself was a code move — no
 performance changes expected, none observed in the cross-check.
 
+## 2026-05-21 — W10 mask cascade flipped to default-on
+
+W10 mask cascade (`HOnly` / `None` masks; see §"W10" below) is now
+active by default. Set `LARQL_W10_DISABLE=1` to opt out (debug
+instrument). The legacy `LARQL_W10_HONLY=1` env var is still
+accepted but is now a no-op. Bit-identical to Full under each
+engine's exact_logits contract (proven by
+`examples/w10_parity_gate.rs`).
+
+Per-engine impact, 50-token decode on Gemma 3 4B Q4K, M3 Max:
+
+| Engine | Pre-flip (Full) | Post-flip (W10 default) | Δ |
+|---|---:|---:|---:|
+| `standard` (control) | 99.8 | 97.6 | within noise |
+| `markov-rs` | 87.1 | **98.0** | +12.5% |
+| `markov-rs-codec` | 86.6 | **98.1** | +13.3% |
+| `boundary-per-layer` (windowless) | 86.9 | **98.7** | +13.6% |
+| `unlimited-context:window=256` | 86.1 | 94.2 | +9.4% (HOnly only) |
+| `turbo-quant:bits=4` | 82.7 | 85.0 | unchanged (canonical K/V) |
+
+The three derivative-K/V engines now sit at standard's
+fused-kernel ceiling (within 1%). `unlimited-context` is at HOnly
+ceiling — its `close_window` flow still needs `KvDispatch::read_kv_row_at`
+to pull the last K/V row back from the cache, leaving a ~3 ms/step
+residual. `turbo-quant` doesn't take the cascade — its codec is
+destructive, so K/V can't be derived from residuals (queued as a
+new-engine design — see ROADMAP).
+
+Also fixed this turn:
+
+- `boundary-per-layer` now wired into W10 (was the only opted-in
+  engine sitting on Full mask). New `dispatch::w10_env_on()`
+  routing.
+- `turbo_quant`'s CPU + legacy decode paths flipped from
+  `compress_matrix(&updated_kv, …)` (O(N) per step) to head-by-head
+  append-only encode (O(head_dim · heads_per_row) per step).
+  The dispatch path was already fixed (2026-05-19); the CPU /
+  legacy paths inherited the bug but are off the production hot
+  path on Metal. CPU bench delta TBD.
+- `BoundaryPerLayerEngine::new_with_default_calibration` —
+  convenience constructor for the v0.1 cold-start case (uniform
+  bf16 policy gets the spec's trivial calibration record
+  automatically). Equivalent to what `EngineKind::build` does
+  internally.
+
 ## 2026-05-21 — engine modular split (post-refactor bench)
 
 All 7 engine `engine.rs` files were split into orchestrator +

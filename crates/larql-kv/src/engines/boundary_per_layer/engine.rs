@@ -78,6 +78,29 @@ impl BoundaryPerLayerEngine {
         )
     }
 
+    /// Convenience constructor for the v0.1 cold-start case: any
+    /// uniform-bf16 policy inherits `MarkovResidualCodecEngine`'s
+    /// trivial bf16 calibration record (KL ≤ 0.01 nats — the
+    /// spec's §4.7 "uncalibrated but trivially safe" record).
+    ///
+    /// Use this when you don't have a calibration store handy (e.g.
+    /// a freshly-downloaded model). For non-bf16 policies the
+    /// engine still requires an explicit calibration via [`new`] —
+    /// non-trivial codecs need a measured KL bound to be safe.
+    /// Equivalent to what `EngineKind::BoundaryPerLayer.build()`
+    /// does internally.
+    pub fn new_with_default_calibration(
+        window_size: Option<usize>,
+        num_model_layers: usize,
+    ) -> Result<Self, EngineConstructionError> {
+        let policy = BoundaryLayerPolicy::bf16_uniform("default", num_model_layers);
+        let cal = crate::engines::boundary_per_layer::calibration::InMemoryCalibrationStore::new();
+        cal.put(BoundaryCalibrationRecord::bf16_uniform_default(
+            policy.fingerprint(),
+        ))?;
+        Self::new(window_size, policy, num_model_layers, &cal)
+    }
+
     pub fn with_backend(
         window_size: Option<usize>,
         policy: BoundaryLayerPolicy,

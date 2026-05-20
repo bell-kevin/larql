@@ -70,11 +70,9 @@ impl MarkovResidualEngine {
                 )
             })
             .collect();
-        // W10 Phase B/C: drop shadows when LARQL_W10_HONLY=1.
-        let drop_hot_kv_shadow = std::env::var("LARQL_W10_HONLY")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // W10 Phase B/C: drop shadows. On by default since 2026-05-21
+        // (set LARQL_W10_DISABLE=1 to opt out — debug instrument).
+        let drop_hot_kv_shadow = crate::engines::w10_enabled();
         let drop_stored_shadow = drop_hot_kv_shadow && self.window_size.is_none();
         let stored = if drop_stored_shadow {
             let hidden_size = weights.hidden_size;
@@ -143,11 +141,9 @@ impl MarkovResidualEngine {
         let num_layers = weights.num_layers;
         let mut state = PerLayerDecodeState::with_capacity(num_layers);
         let handle = self.kv_handle.as_mut()?;
-        // W10 mask cascade.
-        let env_on = std::env::var("LARQL_W10_HONLY")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // W10 mask cascade. On by default; opt out via
+        // LARQL_W10_DISABLE=1.
+        let env_on = crate::engines::w10_enabled();
         let drop_hot_kv = self
             .store
             .as_ref()

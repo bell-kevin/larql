@@ -7,10 +7,24 @@
 //!   4. Bit-pack indices
 //!   5. Decode: unpack → centroids → inverse WHT → rescale
 //!
-//! The `TurboQuantEngine` wraps this codec around the CPU K/V cache:
-//! prefill captures K/V per layer and compresses them; each decode step
-//! decompresses the full prior K/V for attention, appends the new token's
-//! K/V, then re-compresses and stores the updated cache.
+//! The `TurboQuantEngine` wraps this codec around the K/V cache.
+//! Two decode-time paths:
+//!
+//! - **W1-GPU dispatch path** (Metal + Q4K vindex; see
+//!   `super::dispatch`): per-step state-dump gives us just the new
+//!   K/V row, which is encoded head-by-head and **appended** onto
+//!   the existing compressed buffer. O(1) compress + O(N)
+//!   decompress per step → O(N) total compress + O(N²) decompress.
+//! - **CPU walk path** (`decode_step_quant_cpu` + legacy
+//!   `decode_step`): currently decompresses + recompresses the full
+//!   K/V cache per step → O(N²) total compress and decompress. Same
+//!   append-only pattern as dispatch can apply here; queued as
+//!   follow-up (the production hot path on Metal already uses
+//!   append-only).
+//!
+//! Codec contract is the same in both paths: WHT + Lloyd-Max
+//! 3/4-bit per scalar, bit-pack indices, ~cos 0.991 vs full-precision
+//! K/V.
 
 use larql_compute::ComputeBackend;
 use larql_inference::{cpu_engine_backend, EngineBackend};
@@ -364,16 +378,36 @@ impl KvEngine for TurboQuantEngine {
                 Some(self.backend.as_ref()),
             )?;
 
-            // Re-compress the updated cache.
+            // Append-only codec path: encode just the new row head-by-
+            // head and push onto the existing compressed buffer.
             let arch = &*weights.arch;
             let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
-            self.layers[layer] = CompressedLayer {
-                compressed_k: compress_matrix(&updated_kv.0, &self.tq, detect_head_dim(kv_dim)),
-                compressed_v: compress_matrix(&updated_kv.1, &self.tq, detect_head_dim(kv_dim)),
-                num_vecs: updated_kv.0.shape()[0],
-                kv_dim,
-                head_dim: detect_head_dim(kv_dim),
-            };
+            let head_dim = detect_head_dim(kv_dim);
+            let layer_slot = &mut self.layers[layer];
+            let new_rows = updated_kv.0.shape()[0];
+            let k_last = updated_kv.0.row(new_rows - 1).to_owned();
+            let v_last = updated_kv.1.row(new_rows - 1).to_owned();
+            let mut scratch_f32: Vec<f32> = Vec::new();
+            let mut scratch_u8: Vec<u8> = Vec::new();
+            for chunk in k_last.as_slice().expect("k row contig").chunks(head_dim) {
+                self.tq.encode_vector_into(
+                    chunk,
+                    &mut layer_slot.compressed_k,
+                    &mut scratch_f32,
+                    &mut scratch_u8,
+                );
+            }
+            for chunk in v_last.as_slice().expect("v row contig").chunks(head_dim) {
+                self.tq.encode_vector_into(
+                    chunk,
+                    &mut layer_slot.compressed_v,
+                    &mut scratch_f32,
+                    &mut scratch_u8,
+                );
+            }
+            layer_slot.num_vecs = new_rows;
+            layer_slot.kv_dim = kv_dim;
+            layer_slot.head_dim = head_dim;
 
             let bffn = BackendFfn {
                 weights,
@@ -629,13 +663,38 @@ impl TurboQuantEngine {
             let arch = &*weights.arch;
             let kv_dim = arch.num_kv_heads_for_layer(layer) * arch.head_dim_for_layer(layer);
             let head_dim = detect_head_dim(kv_dim);
-            self.layers[layer] = CompressedLayer {
-                compressed_k: compress_matrix(&updated_kv.0, &self.tq, head_dim),
-                compressed_v: compress_matrix(&updated_kv.1, &self.tq, head_dim),
-                num_vecs: updated_kv.0.shape()[0],
-                kv_dim,
-                head_dim,
-            };
+            // Append-only codec path (mirrors `dispatch.rs`'s 2026-05-19
+            // fix). The attention call returns the full updated K/V
+            // (prior + new); only the LAST row is new, the rest already
+            // live in `self.layers[layer].compressed_{k,v}`. Encode just
+            // the new row head-by-head and push onto the existing
+            // compressed buffer. Per-step compress drops from O(N) to
+            // O(head_dim · heads_per_row).
+            let layer_slot = &mut self.layers[layer];
+            let new_rows = updated_kv.0.shape()[0];
+            let k_last = updated_kv.0.row(new_rows - 1).to_owned();
+            let v_last = updated_kv.1.row(new_rows - 1).to_owned();
+            let mut scratch_f32: Vec<f32> = Vec::new();
+            let mut scratch_u8: Vec<u8> = Vec::new();
+            for chunk in k_last.as_slice().expect("k row contig").chunks(head_dim) {
+                self.tq.encode_vector_into(
+                    chunk,
+                    &mut layer_slot.compressed_k,
+                    &mut scratch_f32,
+                    &mut scratch_u8,
+                );
+            }
+            for chunk in v_last.as_slice().expect("v row contig").chunks(head_dim) {
+                self.tq.encode_vector_into(
+                    chunk,
+                    &mut layer_slot.compressed_v,
+                    &mut scratch_f32,
+                    &mut scratch_u8,
+                );
+            }
+            layer_slot.num_vecs = new_rows;
+            layer_slot.kv_dim = kv_dim;
+            layer_slot.head_dim = head_dim;
             if let Some(t) = t_enc {
                 codec_encode_us += t.elapsed().as_secs_f64() * 1e6;
             }

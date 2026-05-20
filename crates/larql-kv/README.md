@@ -24,10 +24,10 @@ windowed checkpoints, retrieval injection, etc.).
 | [`standard`](src/engines/standard.rs) | Production K/V tensor cache; `window=None` unbounded, `Some(N)` sliding | full K/V, backend-managed | **~100** | n/a (reference) | exact — the reference | [standard-engine.md](../larql-inference/docs/specs/standard-engine.md) |
 | [`boundary_kv`](src/engines/boundary_kv) | `standard` + `larql-boundary` chunk frames for cross-session resume | same as standard | ~100 | n/a | exact | [boundary-kv-engine.md](../larql-inference/docs/specs/boundary-kv-engine.md) |
 | [`no_cache`](src/engines/no_cache.rs) | No K/V; full re-forward per step (O(N²)) | token list only | — | n/a | exact (correctness fallback) | [no-cache-engine.md](../larql-inference/docs/specs/no-cache-engine.md) |
-| [`markov_residual`](src/engines/markov_residual) | Residual-stream replacement, K/V derived from stored residuals (W2 cache) | 54.4 MB → **0 MB** | 87.9 | **106.8** (None, +21%) | exact (KL = 0.0) under contract | [markov-residual-engine.md](../larql-inference/docs/specs/markov-residual-engine.md) |
-| [`markov_residual_codec`](src/engines/markov_residual_codec) | `markov_residual` + bf16-encoded cold-tier residuals (2× cold saving) | 54.4 MB → **0 MB** | 88.3 | **98.5** (None, +12%) | bounded-KL vs markov_residual | [markov-residual-codec-engine.md](../larql-inference/docs/specs/markov-residual-codec-engine.md) |
-| [`boundary_per_layer`](src/engines/boundary_per_layer) | Per-layer codec policy on cold tier; calibration-driven; W1-GPU dispatch wired | 19.6 MB (window=512) | **91.8** | (not yet on W10 path) | per-layer KL bound | [boundary-per-layer-engine.md](../larql-inference/docs/specs/boundary-per-layer-engine.md) |
-| [`unlimited_context`](src/engines/unlimited_context) | Per-window K/V checkpoint + token archive; supports replay | 9.6 MB (window=256) → **0 MB** | 88.2 | **92.8** (HOnly, +5%) | exact within window | [unlimited-context-engine.md](../larql-inference/docs/specs/unlimited-context-engine.md) |
+| [`markov_residual`](src/engines/markov_residual) | Residual-stream replacement, K/V derived from stored residuals (W2 cache) | 54.4 MB → **0 MB** | 88.2 | **99.5** (None, +13%) | exact (KL = 0.0) under contract | [markov-residual-engine.md](../larql-inference/docs/specs/markov-residual-engine.md) |
+| [`markov_residual_codec`](src/engines/markov_residual_codec) | `markov_residual` + bf16-encoded cold-tier residuals (2× cold saving) | 54.4 MB → **0 MB** | 87.2 | **99.8** (None, +14%) | bounded-KL vs markov_residual | [markov-residual-codec-engine.md](../larql-inference/docs/specs/markov-residual-codec-engine.md) |
+| [`boundary_per_layer`](src/engines/boundary_per_layer) | Per-layer codec policy on cold tier; calibration-driven; W1-GPU + W10 wired | 19.6 MB → **0 MB** | 86.9 | **99.3** (None, +14%) | per-layer KL bound | [boundary-per-layer-engine.md](../larql-inference/docs/specs/boundary-per-layer-engine.md) |
+| [`unlimited_context`](src/engines/unlimited_context) | Per-window K/V checkpoint + token archive; supports replay | 15.7 MB → **0 MB** | 86.1 | **95.0** (HOnly, +10%) | exact within window | [unlimited-context-engine.md](../larql-inference/docs/specs/unlimited-context-engine.md) |
 | [`turbo_quant`](src/engines/turbo_quant) | WHT + Lloyd-Max 3/4-bit K/V codec, in-place compression | 0.7 MB | **37.7** (10-tok) | n/a (canonical K/V) | cos ≈ 0.991 | [turbo-quant-engine.md](../larql-inference/docs/specs/turbo-quant-engine.md) |
 | [`apollo`](src/engines/apollo) | Constellation map + boundary-residual injection (retrieval) | scales w/ store | requires store | n/a | task-level | [apollo-engine.md](../larql-inference/docs/specs/apollo-engine.md) |
 
@@ -42,11 +42,11 @@ the `state_capture` / `state_materialise` / `state_append` timer
 cascade, and the bench protocol. ROADMAP "Closed (recent)" has the
 milestone history.
 
-### W10 — state-bridge mask cascade (opt-in)
+### W10 — state-bridge mask cascade (default-on since 2026-05-21)
 
 Engines that treat K/V as **derivative** state (see
-[`docs/state-policy.md`](docs/state-policy.md)) opt in to a mask
-cascade via `LARQL_W10_HONLY=1`:
+[`docs/state-policy.md`](docs/state-policy.md)) automatically take a
+mask cascade:
 
 - **`HOnly`** — skip the GPU→CPU K/V staging blit + readback on
   Metal. Triggered when the engine drops its `hot_kv` shadow.
@@ -54,10 +54,20 @@ cascade via `LARQL_W10_HONLY=1`:
   when the engine *additionally* drops its residual store (only safe
   with `window=None` — no cold-tier eviction can fire).
 
-Default behavior is unchanged (mask = `Full`); the flag opts into the
-faster path on a per-engine basis. Backends without an optimised
-masked path fall through to `Full` via the trait's default impl, so
-the flag is safe to set globally.
+The cascade is bit-identical to `Full` under the engine's
+exact_logits contract (proven by `examples/w10_parity_gate.rs`); it
+closes ~13% of the gap to `standard`'s fused-kernel ceiling and zeros
+out the engine-side memory shadow. Backends without an optimised
+masked path fall through to `Full` via the trait's default impl —
+correct everywhere, perf-positive only on Metal.
+
+Opt out with `LARQL_W10_DISABLE=1` (debug instrument; useful for
+bisecting backend-side masked-kernel regressions). The legacy
+`LARQL_W10_HONLY=1` env var is still accepted but is now a no-op.
+
+`turbo_quant` doesn't take the cascade — its codec is destructive,
+so K/V can't be derived from residuals. It stays on `Full` mask
+regardless of the env var.
 
 ### Standard vs MarkovResidual
 

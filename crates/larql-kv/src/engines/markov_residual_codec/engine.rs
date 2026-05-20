@@ -808,7 +808,7 @@ mod tests {
 
     #[test]
     fn prefill_via_dispatch_with_q4k_vindex_populates_store_and_handle() {
-        if std::env::var("LARQL_W10_HONLY").as_deref() == Ok("1") {
+        if crate::engines::w10_enabled() {
             // W10 opt-in drops the shadow; this test pins Full-mode
             // population. Add a separate test for the None-mask path.
             return;

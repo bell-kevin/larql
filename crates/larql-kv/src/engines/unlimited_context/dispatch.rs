@@ -50,12 +50,10 @@ impl UnlimitedContextEngine {
         }
         let prompt_len = token_ids.len();
         let window_cap = self.window_size.max(prompt_len);
-        // W10 Phase B: drop the engine-side current_window_kv shadow
-        // when LARQL_W10_HONLY=1. Metal's kv cache is the truth.
-        let drop_window_kv_shadow = std::env::var("LARQL_W10_HONLY")
-            .ok()
-            .map(|v| v == "1")
-            .unwrap_or(false);
+        // W10 Phase B: drop the engine-side current_window_kv shadow.
+        // On by default since 2026-05-21; opt out via
+        // LARQL_W10_DISABLE=1. Metal's kv cache is the truth.
+        let drop_window_kv_shadow = crate::engines::w10_enabled();
         if drop_window_kv_shadow {
             drop((state.k_new_per_layer, state.v_new_per_layer));
             self.current_window_kv = None;
@@ -104,11 +102,7 @@ impl UnlimitedContextEngine {
         let handle = self.kv_handle.as_mut()?;
         // W10 Phase B: HOnly when the window shadow was dropped at
         // prefill. close_window() reads back via KvDispatch.
-        let want_h_only = self.current_window_kv.is_none()
-            && std::env::var("LARQL_W10_HONLY")
-                .ok()
-                .map(|v| v == "1")
-                .unwrap_or(false);
+        let want_h_only = self.current_window_kv.is_none() && crate::engines::w10_enabled();
         let mask = if want_h_only {
             larql_compute::StateDumpMask::HOnly
         } else {

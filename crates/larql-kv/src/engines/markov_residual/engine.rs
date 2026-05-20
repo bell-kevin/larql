@@ -1120,7 +1120,7 @@ mod tests {
 
     #[test]
     fn prefill_via_dispatch_with_q4k_vindex_populates_store_and_handle() {
-        if std::env::var("LARQL_W10_HONLY").as_deref() == Ok("1") {
+        if crate::engines::w10_enabled() {
             // W10 opt-in deliberately drops these shadows; test verifies the
             // default (Full mask) population, so skip when the env-gated
             // optimisation is active.
@@ -1176,7 +1176,7 @@ mod tests {
 
     #[test]
     fn dispatch_decode_with_profiling_records_w10_stages() {
-        if std::env::var("LARQL_W10_HONLY").as_deref() == Ok("1") {
+        if crate::engines::w10_enabled() {
             // The mask cascade changes which timer slots fire (None mask
             // skips state_materialise/append); this test pins Full-mask
             // behaviour. Add a separate test for HOnly/None coverage.
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn dispatch_prefill_with_window_evicts_to_cold_tier() {
-        if std::env::var("LARQL_W10_HONLY").as_deref() == Ok("1") {
+        if crate::engines::w10_enabled() {
             // Window-driven cold-tier eviction depends on the Full-mode
             // shadow being populated; HOnly retains it (window != None
             // here so the HOnly branch keeps rs.stored).
