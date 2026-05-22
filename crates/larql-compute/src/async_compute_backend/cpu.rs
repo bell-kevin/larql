@@ -219,10 +219,10 @@ mod tests {
         let tokens = vec![0u32, 1, 2];
         let h_in = crate::forward::embed_tokens_pub(&weights, &tokens);
 
-        let (h_sync, _handle_sync) = backend
+        let (h_sync, handle_sync) = backend
             .attention_prefill(&weights, &h_in, 0, None, None)
             .expect("sync prefill");
-        let (h_async_handle, _handle_async) =
+        let (h_async_handle, handle_async) =
             backend.attention_prefill_async(&weights, &h_in, 0, None, None);
         let h_async = h_async_handle.read();
 
@@ -236,21 +236,16 @@ mod tests {
             "attention_prefill_async hidden vs sync attention_prefill",
         );
 
-        // K/V parity is intermittently violated on Windows: OpenBLAS
-        // emits `BLAS : Bad memory unallocation!` and occasionally
-        // returns a partially-stale buffer where one row's worth of
-        // f32 K values diverges by ~0.6 (much larger than the
-        // documented BLAS-reduction-order drift). The hidden-state
-        // check above already covers the math; gating K/V on
-        // `not(windows)` keeps the property where the BLAS layer is
-        // sane and doesn't flake CI elsewhere.
-        #[cfg(not(windows))]
-        {
-            let (k_sync, v_sync) = backend.read_kv_to_host(&_handle_sync).unwrap();
-            let (k_async, v_async) = backend.read_kv_to_host(&_handle_async).unwrap();
-            assert_array_close(&k_sync, &k_async, "prefill K");
-            assert_array_close(&v_sync, &v_async, "prefill V");
-        }
+        // K/V parity holds on every platform once the Windows CI
+        // job sets `OPENBLAS_NUM_THREADS=1` + `OMP_NUM_THREADS=1` +
+        // `RUST_TEST_THREADS=1` (root-cause fix for the
+        // `BLAS : Bad memory unallocation!` flake — see
+        // `.github/workflows/larql-inference.yml`). The earlier
+        // `#[cfg(not(windows))]` gate is gone with the CI fix.
+        let (k_sync, v_sync) = backend.read_kv_to_host(&handle_sync).unwrap();
+        let (k_async, v_async) = backend.read_kv_to_host(&handle_async).unwrap();
+        assert_array_close(&k_sync, &k_async, "prefill K");
+        assert_array_close(&v_sync, &v_async, "prefill V");
     }
 
     #[test]
