@@ -82,9 +82,8 @@ jobs:
       # falls back to whatever `protoc` is on PATH — install one here.
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: choco install protoc -y --no-progress
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5

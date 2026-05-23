@@ -151,11 +151,6 @@ mod tests {
     use super::*;
     use crate::ffn::FfnBackend;
     use crate::forward::trace_forward_with_ffn;
-    // `forward_raw_logits` / `hidden_to_raw_logits` are only used by
-    // `trace_final_residual_matches_raw_forward_logits`, which is gated
-    // off on Windows. Keep the imports under the same gate so `clippy
-    // -D warnings` doesn't trip on unused imports.
-    #[cfg(not(windows))]
     use crate::forward::{forward_raw_logits, hidden_to_raw_logits};
     use crate::test_utils::make_test_weights;
     use larql_models::ModelWeights;
@@ -282,13 +277,11 @@ mod tests {
     }
 
     // `trace()` and `forward_raw_logits()` compute the same forward pass
-    // but through slightly different BLAS dispatch paths. Linux + macOS
-    // produce bit-stable enough output that the residual matches within
-    // 1e-4; Windows OpenBLAS uses parallel reduction whose summation
-    // order isn't reproducible across these two paths, so the residual
-    // diverges by ~1e-1 well past the tolerance. Same pattern, same gate
-    // as `generate_cached_hooked_with_noop_matches_baseline`.
-    #[cfg(not(windows))]
+    // through slightly different dispatch paths. The previous Windows
+    // gate worked around OpenBLAS's non-reproducible parallel-reduction
+    // order; #127 dropped OpenBLAS on Windows in favour of ndarray's
+    // pure-Rust matmul, so the residual matches within 1e-4 on every
+    // platform now.
     #[test]
     fn trace_final_residual_matches_raw_forward_logits() {
         let w = weights();

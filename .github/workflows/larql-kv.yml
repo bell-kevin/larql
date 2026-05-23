@@ -82,11 +82,16 @@ jobs:
 
       # protoc on PATH satisfies the `cfg(not(windows))` skip in
       # `larql-router-protocol`. See its build.rs for the rationale.
+      # protoc on PATH satisfies the `cfg(not(windows))` skip in
+      # `larql-router-protocol`'s build.rs. Use chocolatey rather than
+      # `arduino/setup-protoc@v3` — the action hits a GitHub API path
+      # that intermittently fails with `Bad credentials` even when
+      # `repo-token` is passed (Node-20 deprecation surface also).
+      # Chocolatey is preinstalled on the windows-latest runner.
       - name: Install protoc (Windows)
         if: runner.os == 'Windows'
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: choco install protoc -y --no-progress
 
       - name: Cache cargo registry + build artefacts
         uses: actions/cache@v5
