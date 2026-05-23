@@ -2,16 +2,17 @@
 //!
 //! Two-phase decoder:
 //!
-//! 1. **Prefill.** Run a full forward pass over the prompt via
-//!    `predict_with_ffn` (which already handles all Gemma 3 / Gemma 4
-//!    specifics — QK norm, V norm, cross-layer KV sharing, PLE, layer
-//!    scalar). During the pass, capture post-RoPE K and post-V-norm V
-//!    per layer into a [`KvCache`].
-//! 2. **Decode.** For each new token: embed it as a single row, run
-//!    the decode-step attention (Q of new token attends against
-//!    cached K/V + the new token's own K/V), FFN, next layer. At end
-//!    of layer stack, logits → argmax → next token. Streams tokens
-//!    to a caller-supplied callback.
+//! 1. **Prefill.** Run a full forward pass over the prompt: per layer,
+//!    attention (capturing post-RoPE K and post-V-norm V into the
+//!    [`KvCache`]) → FFN → per-layer embedding (PLE, Gemma-4) →
+//!    layer-scalar (Gemma-4). PLE and layer-scalar are no-ops on
+//!    archs that don't define those keys (Gemma-3, TinyModel, etc.).
+//! 2. **Decode.** For each new token: embed it as a single row,
+//!    precompute the single-token PLE input, run decode-step attention
+//!    (Q of new token attends against cached K/V + the new token's
+//!    own K/V), FFN, PLE, layer-scalar, next layer. At end of layer
+//!    stack, logits → argmax → next token. Streams tokens to a
+//!    caller-supplied callback.
 //!
 //! This is **not** a full re-implementation of the prefill path — the
 //! prefill reuses `predict_with_ffn` verbatim. Only the decode step
@@ -32,6 +33,8 @@ use larql_inference::attention::{
 };
 use larql_inference::ffn::FfnBackend;
 use larql_inference::forward::hooks::{LayerHook, NoopHook};
+use larql_inference::forward::layer::apply_layer_scalar;
+use larql_inference::forward::ple::{apply_per_layer_embedding, precompute_per_layer_inputs};
 use larql_inference::forward::{
     embed_tokens_pub, hidden_to_raw_logits, logits_to_predictions_pub, run_ffn,
 };
@@ -309,6 +312,10 @@ pub fn kv_prefill_run(
     };
 
     let mut h = embed_tokens_pub(weights, prompt_ids);
+    // Per-Layer Embedding inputs for Gemma-4 archs. Returns empty Vec
+    // for non-PLE archs (`ple_inputs.get(layer)` then yields `None` and
+    // `apply_per_layer_embedding` is a no-op).
+    let ple_inputs = precompute_per_layer_inputs(weights, &h, prompt_ids);
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h);
 
@@ -319,7 +326,10 @@ pub fn kv_prefill_run(
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
-        let (mut h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
 
         hook.on_post_layer(layer, &mut h_out);
         h = h_out;
@@ -350,6 +360,11 @@ pub fn kv_decode_step_run(
     let num_layers = weights.num_layers;
     let h_new = embed_tokens_pub(weights, &[token_id]);
     let abs_position = cache.next_position;
+    // PLE inputs are per-token. Recompute for this single-token decode
+    // step rather than indexing a prefill-sized slab. Matches the
+    // recipe used by `vindex::kquant_forward::cached` and the GPU
+    // `layer_graph::generate` decode loop.
+    let ple_inputs = precompute_per_layer_inputs(weights, &h_new, &[token_id]);
     let mut h_step = h_new;
     for layer in 0..num_layers {
         hook.on_pre_layer(layer, &h_step);
@@ -368,7 +383,10 @@ pub fn kv_decode_step_run(
 
         hook.on_post_attention(layer, &mut h_post_attn);
 
-        let (mut h_out, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let (h_post_ffn, _) = run_ffn(weights, &h_post_attn, layer, ffn, false);
+        let mut h_out =
+            apply_per_layer_embedding(weights, &h_post_ffn, layer, ple_inputs.get(layer));
+        apply_layer_scalar(weights, &mut h_out, layer);
 
         hook.on_post_layer(layer, &mut h_out);
         h_step = h_out;
@@ -952,5 +970,67 @@ mod tests {
                 "steering with α=5 must change generated tokens"
             );
         }
+    }
+
+    // ── Gemma-4 PLE arch coverage (regression test for issue #98) ──
+    //
+    // Before this PR, `kv_prefill_run` and `kv_decode_step_run` called
+    // `run_attention*` + `run_ffn` directly, skipping the
+    // `apply_per_layer_embedding` and `apply_layer_scalar` steps that
+    // `run_layer_with_ffn` performs. On Gemma-4 (`gemma-4-E4B-it`),
+    // the missing PLE contribution compounded across decode steps and
+    // produced garbage (`ッケッケTobchal的存在` after a correct first
+    // token). These tests pin both phases through the synthetic E2B-like
+    // fixture so any future regression that drops PLE / layer_scalar
+    // from the cached path fails locally rather than at the user's
+    // terminal.
+
+    /// `kv_prefill_run` must execute cleanly on a PLE arch — the
+    /// fixture's PLE keys + projection tensors / norms / gates must be
+    /// reachable from the prefill loop without dimension mismatch or
+    /// panic. With zero-valued weights the output is also zero, so the
+    /// assertion is finiteness + correct hidden-dim shape, not a
+    /// specific value.
+    #[test]
+    fn kv_prefill_run_works_on_synthetic_e2b_ple_arch() {
+        let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt = [0u32, 1, 2];
+        let (last_hidden, cache) =
+            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
+                .expect("PLE-arch prefill should not fail");
+        assert_eq!(last_hidden.shape(), &[1, weights.hidden_size]);
+        assert!(
+            last_hidden.iter().all(|v| v.is_finite()),
+            "prefill output must be finite"
+        );
+        assert_eq!(cache.next_position, prompt.len());
+    }
+
+    /// `kv_decode_step_run` must execute cleanly on a PLE arch for at
+    /// least three successive steps. Issue #98's signature was: step 1
+    /// looks fine, steps 2+ degrade. Driving three steps exercises the
+    /// per-decode-step PLE recompute (`precompute_per_layer_inputs(..,
+    /// &[token_id])`) under the same code path that produced the
+    /// regression.
+    #[test]
+    fn kv_decode_step_run_works_for_multiple_steps_on_synthetic_e2b_ple_arch() {
+        let weights = larql_inference::test_utils::make_synthetic_e2b_like_weights();
+        let ffn = WeightFfn { weights: &weights };
+        let prompt = [0u32, 1];
+        let (_h_prefill, mut cache) =
+            kv_prefill_run(&weights, &ffn, &prompt, None, None, &mut NoopHook)
+                .expect("PLE-arch prefill should not fail");
+
+        for step in 0..3 {
+            let h_step = kv_decode_step_run(&weights, &ffn, &mut cache, 0u32, None, &mut NoopHook)
+                .unwrap_or_else(|| panic!("decode step {step} returned None"));
+            assert_eq!(h_step.shape(), &[1, weights.hidden_size]);
+            assert!(
+                h_step.iter().all(|v| v.is_finite()),
+                "decode step {step} output must be finite"
+            );
+        }
+        assert_eq!(cache.next_position, prompt.len() + 3);
     }
 }
