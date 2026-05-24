@@ -76,6 +76,26 @@ pub struct BenchArgs {
     #[arg(long, default_value = "streaming", value_name = "streaming|batch")]
     pub ffn_dispatch: String,
 
+    /// FFN dispatch policy for the engine bench path
+    /// (`--engine <kind>`). Same spec language as
+    /// [`larql_inference::ffn_policy::FfnLayerPolicy::from_spec`].
+    /// Default (when omitted): uniform `dense` — every layer uses
+    /// `WeightFfn`, byte-identical to pre-flag behaviour.
+    ///
+    /// Distinct from `--ffn <URL>` above, which selects the remote-FFN
+    /// bench *scenario* (concurrent shard round-trip benchmarking).
+    /// `--ffn-policy` selects the FFN backend the *engine* dispatches
+    /// through internally. Eventual unification of the two flags
+    /// awaits the `RemoteWalk` build path landing in `ffn_policy`.
+    ///
+    /// Examples:
+    ///
+    ///   --ffn-policy dense
+    ///   --ffn-policy walk:k=100
+    ///   --ffn-policy '{walk:k=100}@layers=14-27;{dense}@otherwise'
+    #[arg(long, value_name = "SPEC")]
+    pub ffn_policy: Option<String>,
+
     /// Bench the remote MoE expert path (Gemma 4 26B A4B etc.).
     /// Shard map: `"START-END=URL,START-END=URL,..."`.
     /// Example: `--moe-shards "0-63=http://a:8081,64-127=http://b:8082"`

@@ -30,7 +30,7 @@ use larql_kv::accuracy_suite::needle::{needle_tests, NeedleTest};
 use larql_kv::accuracy_suite::prompts::{diverse_100, quick_20};
 use larql_kv::accuracy_suite::runner::{
     compute_strategy_split, evaluate_conflict, evaluate_in_context, evaluate_parametric,
-    format_strategy_split, ConflictScore, PromptScore, ScoreOutcome, StrategySplit,
+    format_strategy_split, ConflictScore, EvalLabels, PromptScore, ScoreOutcome, StrategySplit,
 };
 use larql_kv::EngineKind;
 use std::path::PathBuf;
@@ -269,20 +269,30 @@ pub fn run(args: AccuracyArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut all_conflicts: Vec<ConflictScore> = Vec::new();
 
     // Cross-product flattening: outer loop KV engine, inner loop FFN
-    // backend. Strategy name is just the KV engine when --ffn was
-    // omitted (single default entry, backward-compat), else
-    // `kv_engine@ffn_label` so cross-product rows are distinguishable
-    // in the JSON's strategy column. The dedicated `ffn_backend`
-    // column in PromptScore is a separate (not-yet-shipped) schema
-    // refinement — see ROADMAP "P0 — sibling trait extraction" for
-    // the broader trait-extraction plan that lands typed ffn metadata.
-    let tag_strategy = !ffn_specs.is_empty();
+    // backend. Per-row labels (kv_engine, ffn_backend, strategy) bundle
+    // into an `EvalLabels` value passed to each driver. The dedicated
+    // `kv_engine` + `ffn_backend` columns on PromptScore / ConflictScore
+    // close the Item 1 ROADMAP "interim known issue" — downstream
+    // consumers no longer have to string-split the strategy column on
+    // `@` to recover the FFN axis.
+    //
+    // Strategy display: bare `kv_engine` when only one FFN is in play
+    // (single-spec or omitted --ffn — the `@`-suffix would be noise),
+    // else `kv_engine@ffn_label` so multi-ffn rows are distinguishable
+    // by the existing `compute_strategy_split` grouping.
+    let tag_strategy = ffn_dispatch.len() > 1;
     for (kv_spec, kv_kind) in &kv_engine_kinds {
         for (ffn_label, ffn) in &ffn_dispatch {
+            let kv_engine_label = kv_kind.display_name();
             let strategy_name = if tag_strategy {
-                format!("{}@{}", kv_kind.display_name(), ffn_label)
+                format!("{kv_engine_label}@{ffn_label}")
             } else {
-                kv_kind.display_name().to_string()
+                kv_engine_label.to_string()
+            };
+            let labels = EvalLabels {
+                kv_engine: kv_engine_label,
+                ffn_backend: ffn_label.as_str(),
+                strategy: &strategy_name,
             };
             eprintln!("\n── KV engine: {kv_spec} | FFN backend: {ffn_label} ──");
             let ffn: &dyn FfnBackend = *ffn;
@@ -293,7 +303,7 @@ pub fn run(args: AccuracyArgs) -> Result<(), Box<dyn std::error::Error>> {
                 weights,
                 ffn,
                 tokenizer,
-                &strategy_name,
+                labels,
                 &parametric_prompts,
             );
             let p_match = param_scores
@@ -329,7 +339,7 @@ pub fn run(args: AccuracyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     weights,
                     ffn,
                     tokenizer,
-                    &strategy_name,
+                    labels,
                     &needles,
                 );
                 let n_match = needle_scores
@@ -366,7 +376,7 @@ pub fn run(args: AccuracyArgs) -> Result<(), Box<dyn std::error::Error>> {
                     weights,
                     ffn,
                     tokenizer,
-                    &strategy_name,
+                    labels,
                     &conflicts,
                 );
                 let followed = conflict_scores

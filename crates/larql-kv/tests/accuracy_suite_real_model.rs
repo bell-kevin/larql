@@ -26,7 +26,7 @@ use larql_kv::accuracy_suite::needle::needle_tests;
 use larql_kv::accuracy_suite::prompts::{quick_20, KnowledgeSource};
 use larql_kv::accuracy_suite::runner::{
     compute_strategy_split, evaluate_conflict, evaluate_in_context, evaluate_parametric,
-    format_strategy_split,
+    format_strategy_split, EvalLabels,
 };
 use larql_kv::EngineKind;
 
@@ -60,7 +60,7 @@ fn parametric_corpus_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts[..4],
     );
 
@@ -116,7 +116,7 @@ fn in_context_needle_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &needles,
     );
     assert_eq!(scores.len(), 2);
@@ -145,7 +145,7 @@ fn conflict_corpus_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts,
     );
     assert_eq!(scores.len(), prompts.len());
@@ -204,7 +204,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts[..4],
     );
     all_scores.extend(evaluate_in_context(
@@ -212,7 +212,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &needles,
     ));
     let conflict_scores = evaluate_conflict(
@@ -220,7 +220,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &conflicts,
     );
 

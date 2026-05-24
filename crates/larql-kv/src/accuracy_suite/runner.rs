@@ -107,6 +107,47 @@ impl ScoreOutcome {
 /// outcome may not reflect path-specific behavior. The trait
 /// extraction (see ROADMAP) lifts the trait to
 /// `Result<T, EngineError>` and removes this limitation.
+/// Per-row labels identifying which `(kv_engine, ffn_backend)`
+/// produced a score, plus the joined `strategy` display name.
+///
+/// Bundles the three strings together to keep `evaluate_*` and
+/// constructor signatures from accumulating positional string
+/// parameters. Closes the interim limitation noted in Item 1's
+/// ROADMAP entry — downstream consumers no longer have to
+/// string-split the `strategy` column on `@` to recover the FFN
+/// axis. The two typed fields are first-class data.
+#[derive(Debug, Clone, Copy)]
+pub struct EvalLabels<'a> {
+    /// KV engine display name (e.g. `"standard"`, `"apollo"`). Mirrors
+    /// the value of [`larql_inference::EngineInfo::name`] for the
+    /// engine that produced this row.
+    pub kv_engine: &'a str,
+    /// FFN backend label — typically the user's `--ffn` spec
+    /// (`"dense"`, `"walk:k=100"`, `"{walk:k=100}@layers=14-27;{dense}@otherwise"`),
+    /// or `"dense (default)"` when `--ffn` was omitted entirely.
+    pub ffn_backend: &'a str,
+    /// Joined display name used by [`compute_strategy_split`] for
+    /// per-row grouping. Conventionally
+    /// `format!("{kv_engine}@{ffn_backend}")` when running a
+    /// cross-product sweep, else bare `kv_engine` when there's only
+    /// one FFN dimension and the `@`-suffix would be noise.
+    pub strategy: &'a str,
+}
+
+impl<'a> EvalLabels<'a> {
+    /// Quick label for tests + single-FFN call sites where the FFN
+    /// axis isn't being exercised. Defaults `ffn_backend` to
+    /// `"dense"` and `strategy` to the bare KV engine name —
+    /// matching the pre-cross-product display convention.
+    pub fn for_kv_engine(kv_engine: &'a str) -> Self {
+        Self {
+            kv_engine,
+            ffn_backend: "dense",
+            strategy: kv_engine,
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PromptScore {
     /// Prompt text (truncated for needle tests to avoid bloating reports).
@@ -117,7 +158,18 @@ pub struct PromptScore {
     pub category: String,
     /// Where the expected answer lives (weights vs prompt vs override).
     pub knowledge_source: KnowledgeSource,
-    /// Engine name (matches `engine.info().name`).
+    /// KV engine that produced this score (the axis larql-kv handles).
+    /// Mirrors [`EvalLabels::kv_engine`].
+    pub kv_engine: String,
+    /// FFN backend that ran during this score (the axis
+    /// larql-inference's `ffn_policy` module handles). Mirrors
+    /// [`EvalLabels::ffn_backend`]. Closes the Item 1 ROADMAP
+    /// "interim known issue" — downstream consumers read this field
+    /// directly rather than parsing it out of `strategy`.
+    pub ffn_backend: String,
+    /// Joined display name for per-row grouping (used by
+    /// [`compute_strategy_split`]). Derived from `kv_engine` and
+    /// `ffn_backend` at the call site; see [`EvalLabels::strategy`].
     pub strategy: String,
     /// Expected substring (e.g. "Paris", "AURORA").
     pub expected_contains: String,
@@ -145,7 +197,7 @@ impl PromptScore {
         prompt: String,
         category: String,
         knowledge_source: KnowledgeSource,
-        strategy: String,
+        labels: EvalLabels<'_>,
         expected_contains: String,
         predicted_top1: String,
         top1_match: bool,
@@ -155,7 +207,9 @@ impl PromptScore {
             prompt,
             category,
             knowledge_source,
-            strategy,
+            kv_engine: labels.kv_engine.to_string(),
+            ffn_backend: labels.ffn_backend.to_string(),
+            strategy: labels.strategy.to_string(),
             expected_contains,
             outcome: ScoreOutcome::Served,
             predicted_top1: Some(predicted_top1),
@@ -171,7 +225,7 @@ impl PromptScore {
         prompt: String,
         category: String,
         knowledge_source: KnowledgeSource,
-        strategy: String,
+        labels: EvalLabels<'_>,
         expected_contains: String,
         outcome: ScoreOutcome,
     ) -> Self {
@@ -184,7 +238,9 @@ impl PromptScore {
             prompt,
             category,
             knowledge_source,
-            strategy,
+            kv_engine: labels.kv_engine.to_string(),
+            ffn_backend: labels.ffn_backend.to_string(),
+            strategy: labels.strategy.to_string(),
             expected_contains,
             outcome,
             predicted_top1: None,
@@ -369,7 +425,7 @@ pub fn evaluate_parametric<F>(
     weights: &ModelWeights,
     ffn: &dyn FfnBackend,
     tokenizer: &Tokenizer,
-    strategy_name: &str,
+    labels: EvalLabels<'_>,
     prompts: &[TestPrompt],
 ) -> Vec<PromptScore>
 where
@@ -395,7 +451,7 @@ where
                     p.text.to_string(),
                     p.category.to_string(),
                     p.knowledge_source,
-                    strategy_name.to_string(),
+                    labels,
                     p.expected_contains.to_string(),
                     predicted,
                     matched,
@@ -405,7 +461,7 @@ where
                     p.text.to_string(),
                     p.category.to_string(),
                     p.knowledge_source,
-                    strategy_name.to_string(),
+                    labels,
                     p.expected_contains.to_string(),
                     outcome,
                 ),
@@ -424,7 +480,7 @@ pub fn evaluate_in_context<F>(
     weights: &ModelWeights,
     ffn: &dyn FfnBackend,
     tokenizer: &Tokenizer,
-    strategy_name: &str,
+    labels: EvalLabels<'_>,
     needles: &[NeedleTest],
 ) -> Vec<PromptScore>
 where
@@ -457,7 +513,7 @@ where
                         row_prompt,
                         "needle".to_string(),
                         KnowledgeSource::InContext,
-                        strategy_name.to_string(),
+                        labels,
                         n.needle_answer.to_string(),
                         predicted,
                         matched,
@@ -468,7 +524,7 @@ where
                     row_prompt,
                     "needle".to_string(),
                     KnowledgeSource::InContext,
-                    strategy_name.to_string(),
+                    labels,
                     n.needle_answer.to_string(),
                     outcome,
                 ),
@@ -488,6 +544,13 @@ where
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ConflictScore {
     pub prompt: String,
+    /// KV engine that produced this score. Mirrors
+    /// [`EvalLabels::kv_engine`].
+    pub kv_engine: String,
+    /// FFN backend that ran during this score. Mirrors
+    /// [`EvalLabels::ffn_backend`].
+    pub ffn_backend: String,
+    /// Joined display name for per-row grouping.
     pub strategy: String,
     pub override_answer: String,
     pub parametric_answer: String,
@@ -505,9 +568,10 @@ pub struct ConflictScore {
 }
 
 impl ConflictScore {
+    #[allow(clippy::too_many_arguments)]
     pub fn served(
         prompt: String,
-        strategy: String,
+        labels: EvalLabels<'_>,
         override_answer: String,
         parametric_answer: String,
         predicted_top1: String,
@@ -516,7 +580,9 @@ impl ConflictScore {
     ) -> Self {
         Self {
             prompt,
-            strategy,
+            kv_engine: labels.kv_engine.to_string(),
+            ffn_backend: labels.ffn_backend.to_string(),
+            strategy: labels.strategy.to_string(),
             override_answer,
             parametric_answer,
             outcome: ScoreOutcome::Served,
@@ -528,7 +594,7 @@ impl ConflictScore {
 
     pub fn skipped(
         prompt: String,
-        strategy: String,
+        labels: EvalLabels<'_>,
         override_answer: String,
         parametric_answer: String,
         outcome: ScoreOutcome,
@@ -540,7 +606,9 @@ impl ConflictScore {
         );
         Self {
             prompt,
-            strategy,
+            kv_engine: labels.kv_engine.to_string(),
+            ffn_backend: labels.ffn_backend.to_string(),
+            strategy: labels.strategy.to_string(),
             override_answer,
             parametric_answer,
             outcome,
@@ -561,7 +629,7 @@ pub fn evaluate_conflict<F>(
     weights: &ModelWeights,
     ffn: &dyn FfnBackend,
     tokenizer: &Tokenizer,
-    strategy_name: &str,
+    labels: EvalLabels<'_>,
     prompts: &[super::conflict::ConflictPrompt],
 ) -> Vec<ConflictScore>
 where
@@ -585,7 +653,7 @@ where
                     let fallback = !followed && lower.contains(&p.parametric_answer.to_lowercase());
                     ConflictScore::served(
                         p.prompt.to_string(),
-                        strategy_name.to_string(),
+                        labels,
                         p.override_answer.to_string(),
                         p.parametric_answer.to_string(),
                         predicted,
@@ -595,7 +663,7 @@ where
                 }
                 ScoreResult::Skipped(outcome) => ConflictScore::skipped(
                     p.prompt.to_string(),
-                    strategy_name.to_string(),
+                    labels,
                     p.override_answer.to_string(),
                     p.parametric_answer.to_string(),
                     outcome,
@@ -1104,7 +1172,7 @@ mod tests {
                 "p1".into(),
                 "factual".into(),
                 KnowledgeSource::Parametric,
-                "Standard".into(),
+                EvalLabels::for_kv_engine("Standard"),
                 "Paris".into(),
                 "Paris".into(),
                 true,
@@ -1114,7 +1182,7 @@ mod tests {
                 "p2".into(),
                 "factual".into(),
                 KnowledgeSource::Parametric,
-                "Standard".into(),
+                EvalLabels::for_kv_engine("Standard"),
                 "Berlin".into(),
                 "wrong".into(),
                 false,
@@ -1124,7 +1192,7 @@ mod tests {
                 "n1".into(),
                 "needle".into(),
                 KnowledgeSource::InContext,
-                "Standard".into(),
+                EvalLabels::for_kv_engine("Standard"),
                 "AURORA".into(),
                 "AURORA".into(),
                 true,
@@ -1134,7 +1202,7 @@ mod tests {
         let conflicts = vec![
             ConflictScore::served(
                 "c1".into(),
-                "Standard".into(),
+                EvalLabels::for_kv_engine("Standard"),
                 "Lyon".into(),
                 "Paris".into(),
                 "Lyon".into(),
@@ -1143,7 +1211,7 @@ mod tests {
             ),
             ConflictScore::served(
                 "c2".into(),
-                "Standard".into(),
+                EvalLabels::for_kv_engine("Standard"),
                 "Osaka".into(),
                 "Tokyo".into(),
                 "Tokyo".into(),
@@ -1181,7 +1249,7 @@ mod tests {
                 "p1".into(),
                 "factual".into(),
                 KnowledgeSource::Parametric,
-                "Apollo".into(),
+                EvalLabels::for_kv_engine("Apollo"),
                 "Paris".into(),
                 "Paris".into(),
                 true,
@@ -1191,7 +1259,7 @@ mod tests {
                 "p2".into(),
                 "factual".into(),
                 KnowledgeSource::Parametric,
-                "Apollo".into(),
+                EvalLabels::for_kv_engine("Apollo"),
                 "Berlin".into(),
                 "wrong".into(),
                 false,
@@ -1201,7 +1269,7 @@ mod tests {
                 "p3".into(),
                 "factual".into(),
                 KnowledgeSource::Parametric,
-                "Apollo".into(),
+                EvalLabels::for_kv_engine("Apollo"),
                 "Rome".into(),
                 ScoreOutcome::SkippedInternalError,
             ),
@@ -1222,7 +1290,7 @@ mod tests {
             "p1".into(),
             "factual".into(),
             KnowledgeSource::Parametric,
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Paris".into(),
             ScoreOutcome::SkippedInternalError,
         )];
@@ -1345,7 +1413,7 @@ mod tests {
             "prompt".into(),
             "factual".into(),
             KnowledgeSource::Parametric,
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Paris".into(),
             "Paris".into(),
             true,
@@ -1363,7 +1431,7 @@ mod tests {
             "prompt".into(),
             "factual".into(),
             KnowledgeSource::Parametric,
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Paris".into(),
             ScoreOutcome::SkippedRetrievalMiss,
         );
@@ -1381,7 +1449,7 @@ mod tests {
             "prompt".into(),
             "factual".into(),
             KnowledgeSource::Parametric,
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Paris".into(),
             ScoreOutcome::Served,
         );
@@ -1391,7 +1459,7 @@ mod tests {
     fn conflict_score_served_and_skipped_constructors() {
         let served = ConflictScore::served(
             "c1".into(),
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Lyon".into(),
             "Paris".into(),
             "Lyon".into(),
@@ -1403,7 +1471,7 @@ mod tests {
 
         let skipped = ConflictScore::skipped(
             "c2".into(),
-            "Apollo".into(),
+            EvalLabels::for_kv_engine("Apollo"),
             "Osaka".into(),
             "Tokyo".into(),
             ScoreOutcome::SkippedInternalError,
@@ -1420,6 +1488,116 @@ mod tests {
         assert!(!ScoreOutcome::SkippedRetrievalMiss.is_served());
         assert!(!ScoreOutcome::SkippedBackendUnavailable.is_served());
         assert!(!ScoreOutcome::SkippedInternalError.is_served());
+    }
+
+    // ── kv_engine + ffn_backend typed columns ───────────────────────────────
+
+    #[test]
+    fn eval_labels_for_kv_engine_defaults_ffn_to_dense_and_strategy_to_kv_name() {
+        let l = EvalLabels::for_kv_engine("Apollo");
+        assert_eq!(l.kv_engine, "Apollo");
+        assert_eq!(l.ffn_backend, "dense");
+        assert_eq!(l.strategy, "Apollo");
+    }
+
+    #[test]
+    fn prompt_score_served_populates_kv_engine_and_ffn_backend_columns() {
+        // Cross-product label: kv=standard, ffn=walk:k=100, strategy
+        // is the joined display. Verifies the typed columns carry
+        // the axes independently of the strategy string.
+        let labels = EvalLabels {
+            kv_engine: "standard",
+            ffn_backend: "walk:k=100",
+            strategy: "standard@walk:k=100",
+        };
+        let s = PromptScore::served(
+            "p".into(),
+            "factual".into(),
+            KnowledgeSource::Parametric,
+            labels,
+            "Paris".into(),
+            "Paris".into(),
+            true,
+            0.4,
+        );
+        assert_eq!(s.kv_engine, "standard");
+        assert_eq!(s.ffn_backend, "walk:k=100");
+        assert_eq!(s.strategy, "standard@walk:k=100");
+    }
+
+    #[test]
+    fn prompt_score_skipped_populates_kv_engine_and_ffn_backend_columns() {
+        // Same column population on the skipped path — closes the
+        // Item 1 interim limitation about ffn_backend reflecting
+        // user input rather than actual usage.
+        let labels = EvalLabels {
+            kv_engine: "apollo",
+            ffn_backend: "{walk:k=100}@layers=14-27;{dense}@otherwise",
+            strategy: "apollo@{walk:k=100}@layers=14-27;{dense}@otherwise",
+        };
+        let s = PromptScore::skipped(
+            "p".into(),
+            "factual".into(),
+            KnowledgeSource::Parametric,
+            labels,
+            "Paris".into(),
+            ScoreOutcome::SkippedRetrievalMiss,
+        );
+        assert_eq!(s.kv_engine, "apollo");
+        assert_eq!(s.ffn_backend, "{walk:k=100}@layers=14-27;{dense}@otherwise");
+    }
+
+    #[test]
+    fn conflict_score_served_populates_kv_engine_and_ffn_backend_columns() {
+        let labels = EvalLabels {
+            kv_engine: "standard",
+            ffn_backend: "walk:k=100",
+            strategy: "standard@walk:k=100",
+        };
+        let c = ConflictScore::served(
+            "c".into(),
+            labels,
+            "Lyon".into(),
+            "Paris".into(),
+            "Lyon".into(),
+            true,
+            false,
+        );
+        assert_eq!(c.kv_engine, "standard");
+        assert_eq!(c.ffn_backend, "walk:k=100");
+        assert_eq!(c.strategy, "standard@walk:k=100");
+    }
+
+    #[test]
+    fn prompt_score_serde_round_trip_preserves_typed_axis_columns() {
+        // Wire format check: the typed columns survive JSON
+        // round-trip with their explicit names, so downstream
+        // consumers (jq, pandas) can read kv_engine / ffn_backend
+        // directly without string-splitting on the strategy column.
+        let labels = EvalLabels {
+            kv_engine: "standard",
+            ffn_backend: "walk:k=100",
+            strategy: "standard@walk:k=100",
+        };
+        let original = PromptScore::served(
+            "p".into(),
+            "factual".into(),
+            KnowledgeSource::Parametric,
+            labels,
+            "Paris".into(),
+            "Paris".into(),
+            true,
+            0.4,
+        );
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(
+            json.contains(r#""kv_engine":"standard""#),
+            "expected explicit kv_engine field in JSON, got:\n{json}"
+        );
+        assert!(
+            json.contains(r#""ffn_backend":"walk:k=100""#),
+            "expected explicit ffn_backend field in JSON, got:\n{json}"
+        );
     }
 
     #[test]
@@ -1579,7 +1757,7 @@ mod tests {
             &weights,
             &ffn,
             &tokenizer,
-            "NoCache",
+            EvalLabels::for_kv_engine("NoCache"),
             &prompts,
         );
         assert_eq!(scores.len(), 1, "row must be surfaced, not dropped");
@@ -1614,7 +1792,7 @@ mod tests {
                 &weights,
                 &ffn,
                 &tokenizer,
-                "NoCache",
+                EvalLabels::for_kv_engine("NoCache"),
                 &needles,
             )
         }));
@@ -1650,7 +1828,7 @@ mod tests {
             &weights,
             &ffn,
             &tokenizer,
-            "NoCache",
+            EvalLabels::for_kv_engine("NoCache"),
             &prompts,
         );
         assert_eq!(scores.len(), 1, "row must be surfaced, not dropped");
