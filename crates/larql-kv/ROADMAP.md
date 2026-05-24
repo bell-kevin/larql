@@ -125,11 +125,95 @@ Metal calls `larql_inference::vindex::fused_prefill`.
 
 ## Coverage debt
 
-None as of 2026-05-17 evening — every file in `crates/larql-kv/src/`
-passes the 90 % per-file floor; `coverage-policy.json` ships with an
-empty `per_file_line_min_percent` map. Workspace total 95.55 % lines.
-Any future regression below 90 % must be fixed with tests, not by
-re-introducing a debt baseline.
+**Status (2026-05-24):** six files below the 90% per-file floor after
+the Phase-2 dispatch additions and the env-var-gated diagnostic
+paths in `compute.rs` drifted past the 2026-05-17 cleared state. The
+post-Item-2 cross-product work added five new files (`runner/*.rs`)
+all above 90%; the regression is in older engine internals that
+weren't covered when the dispatch paths landed in May.
+
+| File | Coverage | Lift path |
+|---|---:|---|
+| `engines/markov_residual/compute.rs` | 86.85% | env-var-gated paths (`LARQL_MARKOV_WALK_KV_DIAG`, `_FORCE_F32`, `_TOPK`) — needs `serial_test` crate or config-injection refactor |
+| `engines/unlimited_context/dispatch.rs` | 59.09% | needs mock `EngineBackend` infrastructure |
+| `engines/markov_residual/dispatch.rs` | 77.51% | needs mock `EngineBackend` infrastructure |
+| `engines/markov_residual_codec/dispatch.rs` | 80.68% | needs mock `EngineBackend` infrastructure |
+| `engines/turbo_quant/dispatch.rs` | 9.35% | needs mock `EngineBackend` infrastructure |
+| `engines/boundary_per_layer/dispatch.rs` | 7.95% | needs mock `EngineBackend` infrastructure |
+
+Progress 2026-05-24 (session-level): lifted five files above the
+floor (cold_tier 88→100%, executor 85→90.6%, walk 84→95%, engine
+83→90%, store 86→99.6%) and improved compute.rs from 81→86.85%
+without env-var test infrastructure. 37 new tests across the five
+fixed files; clippy clean; zero regressions.
+
+### What's left
+
+**Sub-project A — mock `EngineBackend` infrastructure (5 files).** All
+five remaining dispatch files call
+`backend.coarse_prefill_with_state` and
+`backend.coarse_decode_step_with_state_masked` — the GPU-dispatch
+surface that only `MetalBackend` implements meaningfully today. The
+existing 59–80% coverage on three of them comes from
+`tests/dispatch_parity.rs` (integration tests against real engines);
+the 0-10% files (`boundary_per_layer/dispatch.rs`,
+`turbo_quant/dispatch.rs`) aren't even reached by those.
+
+The lift requires a shared test-only `EngineBackend` impl that
+returns synthetic `PerLayerDecodeState` payloads conformant with the
+trait. Once built, each dispatch file gets ~5 unit tests exercising
+prefill happy-path, prefill no-state-dump fallback, decode happy-path,
+decode `StateDumpMask::HOnly` / `None` cascades. Open question: where
+the mock lives — `larql-inference::test_utils` (next to
+`make_test_weights`) or a new `larql-kv/src/test_utils.rs` that
+imports the trait. The former is more reusable across crates; the
+latter is local to where the mock is consumed.
+
+Estimated scope: ~1 hour for the mock infra + 30 min per dispatch
+file = 3-4 hours total.
+
+**Sub-project B — `compute.rs` env-var path coverage (1 file).** The
+remaining ~7% gap is the diagnostic + force-f32 code paths gated on
+`LARQL_MARKOV_WALK_KV_DIAG`, `LARQL_MARKOV_KV_FORCE_F32`,
+`LARQL_MARKOV_WALK_KV_TOPK`, `LARQL_MARKOV_WALK_KV_SELECT_AT`. These
+read process env vars at decode time — testing them in parallel
+requires `serial_test` (or similar) to serialise `env::set_var` calls
+without racing other tests. Alternative: refactor the helpers to
+take an explicit config struct argument; the env-var read becomes a
+single thin caller and the tests can pass values directly without
+touching the global env.
+
+Estimated scope: 45 min for `serial_test` integration, 1-2 hours for
+the config-injection refactor.
+
+**Acceptance criterion.** `make larql-kv-coverage-policy` passes
+against a *freshly regenerated* `coverage/larql-kv/summary.json`
+(via `make larql-kv-coverage-summary`, not the cached JSON). 2026-05-24
+note: the gate was previously passing against a stale JSON that
+predated the dispatch additions — fresh regeneration surfaced the
+debt. Future commits to engine internals should run
+`make larql-kv-coverage-summary` locally, not just
+`make larql-kv-coverage-policy`.
+
+### Open design questions
+
+1. **Should the mock `EngineBackend` live in `larql-inference::test_utils`
+   or in `larql-kv`?** Reusable-across-crates favours the former;
+   local-to-consumers favours the latter.
+2. **`serial_test` crate vs env-var-injection refactor for `compute.rs`?**
+   The crate is a small dependency add; the refactor is a more
+   invasive change but yields more testable code long-term.
+3. **Acceptance for the GPU-only branches.** Some lines in the
+   dispatch files only fire on a real Metal backend (e.g.
+   `StateDumpMask::Full` paths that exercise the cached-decode
+   kernel). Mock-backend tests can verify the *plumbing* but not
+   the *kernel* — should those lines be excluded via
+   `#[cfg(not(test_coverage))]` or similar, or accepted as
+   coverable-only-via-integration-tests?
+
+These are blocking on the implementation slice landing, not the
+coverage-debt resolution itself; the design choices fall during the
+sub-project work, not before.
 
 ## Open work
 
@@ -439,8 +523,173 @@ in expected ROI order.
   path, the per-engine optimization workstreams (W1-W6) are
   unfalsifiable. Wire it before starting W1.
 
+### P0 — sibling trait extraction for non-K/V engines (Apollo, Mode 5)
+
+**Problem.** The `KvEngine` trait surface assumes per-step K/V append,
+FFN dispatched through `FfnBackend`, and state reconstructible to
+K/V tensors. Apollo violates all three (`engines/apollo/engine.rs`:
+`_ffn` unused, `decode_step` re-forwards full `context_tokens` each
+call, state is residual delta + boundary residual + token list — no
+K/V). Mode 5 / Graph-Grounded will violate the same three when it
+lands. The trait's `Option<T>` return type also collapses
+semantically distinct outcomes — empty prompt, backend unavailable,
+retrieval miss, internal error, decode-before-prefill invariant
+violation — into a single `None` the harnesses route incompatibly:
+`accuracy_suite/runner.rs` silently drops via `filter_map` (Apollo's
+store-miss prompts disappear from the JSON, structurally shorter
+result vector than other engines), while `engine_runtime.rs` aborts
+with `"engine prefill failed"` on the same `None`. Same trait method,
+two semantics, neither implements the spec's documented
+`fallback_mode = standard` from
+[`docs/state-policy.md`](docs/state-policy.md) §3.
+
+**Resolution.** Extract a `RetrievalEngine` (or `QueryEngine`) sibling
+trait that drops the per-step K/V append assumption and the
+`FfnBackend` dispatch requirement. Apollo moves to it; Mode 5 lands
+on it directly. Tighten both trait return types from `Option<T>` to
+`Result<T, EngineError>` with a typed error enum so the two harnesses
+agree on a single taxonomy and downstream consumers can route on
+error kind. Harness dispatch goes through an `AnyEngine::{Kv,
+Retrieval}` enum that branches once at construction.
+
+**Scope (atomic — six touchpoints).** Partial application is worse
+than no application; a half-refactored trait surface has three
+disagreeing semantics instead of two.
+
+1. New `RetrievalEngine` trait. `Apollo` impl moves from `KvEngine`
+   to `RetrievalEngine`. Internal behaviour unchanged.
+2. `KvEngine::prefill` / `decode_step` (and `*_quant` / `*_via_executor`
+   variants) return type changes from `Option<T>` to
+   `Result<T, EngineError>`. **All eight `KvEngine` impls touched** —
+   `standard`, `no_cache`, `markov_residual`, `markov_residual_codec`,
+   `unlimited_context`, `turbo_quant`, `boundary_kv`,
+   `boundary_per_layer` — not just the one that motivated the
+   refactor. The translation is mechanical: validated on three
+   structurally-distinct samples (`markov_residual` for arch
+   preconditions, `unlimited_context` for window boundaries,
+   `boundary_per_layer` for calibration stores); every `None`-return
+   in those engines maps cleanly to `InternalError(...)`. The
+   remaining five are variations on already-validated patterns
+   (`standard` / `no_cache` are simpler; `markov_residual_codec` /
+   `boundary_kv` extend already-sampled families; `turbo_quant`'s
+   destructive-codec failure modes are in-contract per
+   state-policy §3 worked example and don't surface as `None`).
+3. `AnyEngine::{Kv, Retrieval}` dispatch enum at harness boundary.
+   Construction parses to one or the other; execution branches once.
+4. Accuracy harness (`accuracy_suite/runner.rs`,
+   `larql-cli/src/commands/primary/accuracy_cmd.rs`): per-error-kind
+   handling replaces `filter_map`; miss-rate surfaces as a first-class
+   `served_rate` column inseparable from `match_rate`.
+5. Bench harness (`engine_runtime.rs`): distinguish recoverable from
+   internal errors; recoverable misses log a skip note but don't
+   abort the whole run.
+6. `LayerEngine` / `ZoneEngine` (per
+   [`layer-engine.md`](../larql-inference/docs/specs/layer-engine.md),
+   [`zone-engine.md`](../larql-inference/docs/specs/zone-engine.md))
+   consume `AnyEngine` rather than `Box<dyn KvEngine>`.
+
+**Three findings from the validation pass that constrain the design.**
+
+1. **Interim `ffn_backend` JSON limitation (until this refactor lands).**
+   Item 1's schema fix (predecessor PR — see "Predecessors" below)
+   reports `ffn_backend` as the value passed at engine construction,
+   *not* the FFN backend actually used during the run. For engines
+   where the trait method dispatches to multiple internal paths with
+   different FFN usage (`markov_residual`'s CPU path uses `_ffn`;
+   its `*_via_executor` path uses `ffn` — same engine, same trait,
+   different ffn-honoring), the reported value may not reflect which
+   backend actually executed. **Downstream consumers should not
+   condition on `ffn_backend` for engines where this distinction
+   matters until this refactor lands.** The fix falls out naturally
+   from the typed `Result` carrying path information; deferring to
+   the refactor preserves Item 1's 200-300 line scope.
+
+2. **`InternalError` sub-taxonomy is load-bearing for production
+   observability — required design decision, not discretionary.**
+   "decode_step called before prefill" (`markov_residual::engine.rs:103`,
+   `boundary_per_layer::engine.rs:184`, others) is structurally
+   different from "the inner backend returned None for an opaque
+   reason." The first indicates a harness-level dispatch bug that
+   wants immediate investigation; the second indicates a runtime data
+   condition that wants diagnostic logging. Collapsing both into a
+   single `InternalError` makes production logs unable to distinguish
+   these alerting categories. **Recommend splitting `EngineError`
+   into `InvariantViolation { what: String }` and
+   `BackendFailure { details: String }` as two top-level variants**
+   (not a sub-tag under a single `InternalError`). This is the
+   trait-extraction PR reviewer's first design call.
+
+3. **Extensibility note — the four-variant enum is not a permanent
+   ceiling.** Currently-invisible failure modes — `unlimited_context`'s
+   "request crossed an uncheckpointed window boundary" (collapsed
+   into generic `process()` None today), `boundary_per_layer`'s
+   "calibration record missing for policy fingerprint" (a
+   construction-time `.expect()` panic at `lib.rs:362` today) — are
+   real conditions the typed `Result` surface *enables* surfacing
+   without further trait changes. The starting enum
+   (`EmptyPrompt`, `BackendUnavailable`, `RetrievalMiss { reason }`,
+   `InvariantViolation`, `BackendFailure`) is the minimum-honest
+   shape, not a commitment that the taxonomy is closed. New variants
+   are deliberate schema changes — exhaustive enum, breaking changes
+   on extension, no `#[non_exhaustive]`. Defaulting new variants
+   into existing arms reproduces the silent-drop problem one layer
+   down.
+
+**Blocks.** Item 5 in the conversational priority queue (Mode 5 /
+Graph-Grounded engine wiring). Mode 5 lands as a `RetrievalEngine`
+impl once this refactor is in; its canonical state (retrieval graph
++ token archive) is already accommodated by
+[`docs/state-policy.md`](docs/state-policy.md) §2.1's open-list of
+canonical state kinds.
+
+**Predecessors.** Item 1 schema fix (`ScoreOutcome` enum +
+`served_rate` column in `accuracy_suite/runner.rs`) ships as interim
+diagnosability. Its `ScoreOutcome` variants mirror the eventual
+`EngineError` enum so migration is a flat projection when this
+refactor lands; the field stops being interim, only its construction
+path moves from harness-side `match` to engine-side `Result`.
+Item 3 (Apollo into `larql accuracy` coverage) is safe to land once
+Item 1 ships, but its rows will only be properly diagnosable after
+this refactor.
+
+**Closes.** [`docs/state-policy.md`](docs/state-policy.md) §8 Open
+Question 1 ("Where does Apollo's fallback live? Two engines stacked
+or one engine with `fallback_mode = standard`?"). The state-policy
+patch declaring Q1 resolved lands in the same PR as this refactor —
+patching the spec to mark Q1 resolved while the harnesses still
+disagree would reproduce the same category of error the spec already
+commits with `fallback_mode = standard` (documenting intent as if it
+were implementation).
+
 ### P1 — capability extensions
 
+- **Complete the FFN policy harness arc.** Item 2 v0
+  (`FfnBackendKind` + `FfnLayerPolicy` parser + `ValidatedFfnLayerPolicy`
+  + `BoundFfnRouter`) shipped 2026-05-24 along with the
+  cross-product accuracy harness (see "Closed (recent)"). Three
+  follow-ons remain, all blocked on either the sibling trait extraction
+  or the `RemoteWalk` build path landing:
+  - **Q4K `--ffn-policy` honoring.** `run_engine_q4k` in
+    `larql-cli/.../bench/engine_runtime.rs` accepts the flag but
+    logs "not yet honored" and uses the engine's internal Q4K
+    routing. Honoring it requires the Q4K dispatch trait to take
+    `&ModelWeights` instead of `&mut ModelWeights` so a
+    `BoundFfnRouter` (which holds `&weights`) can coexist with the
+    engine call. Naturally folds into the sibling trait extraction
+    (P0 above) since that overhauls the trait surface anyway.
+  - **`RemoteWalk` build path.** `FfnBackendKind::RemoteWalk` parses
+    but errors with `RemoteWalkNotYetWired` in `build_router`. Wiring
+    needs the `RemoteWalkBackend` connection pool plumbed through
+    the build path. Slice estimate: ~200 lines.
+  - **Bench `--ffn` URL/policy flag unification.** Bench keeps two
+    flags today: `--ffn <URL>` (legacy, selects the remote-FFN
+    bench scenario via `run_concurrent_ffn`) and `--ffn-policy <SPEC>`
+    (new, selects engine-internal FFN backend). Once `RemoteWalk`
+    builds work, `--ffn http://x:8080` can become sugar for
+    `--ffn-policy remote-walk:endpoint=http://x:8080` and the two
+    flags merge. Until then they stay separate. Documented in
+    `engine_runtime.rs:run_engine_q4k` and the `--ffn-policy` doc
+    comment in `bench/args.rs`.
 - **Wire `--ffn http://...` through the executor surface.** The
   existing `--ffn` flag uses `run_concurrent_ffn` (separate path that
   routes through the `larql-metal` reference, not the engines). Once
@@ -559,6 +808,100 @@ in expected ROI order.
   spec) makes composition cleaner.
 
 ## Closed (recent)
+
+- **2026-05-24 — Accuracy harness honesty + FFN policy cross-product
+  LANDED.** Multi-PR arc that turns the accuracy suite from "silent
+  drop on engine miss" into a discriminating cross-product harness:
+
+  - **Item 1 — accuracy schema fix** (commit `07684457`).
+    `ScoreOutcome` enum (exhaustive, flat-tagged serde, mirrors the
+    future `EngineError` taxonomy). `PromptScore` / `ConflictScore`
+    gain `outcome` field + `Option<T>` score payload with
+    `served()` / `skipped()` constructors enforcing
+    correlated-optionality. `StrategySplit` gains `*_served` +
+    `*_served_rate` per axis as required-companion fields to
+    `*_match_rate`. `compute_strategy_split` filters on served subset
+    (counting skips as zero would punish honest reporting). Replaces
+    `filter_map` silent-drop in all three drivers. Surfaces Apollo's
+    store-miss rows as `SkippedRetrievalMiss` instead of dropping.
+    `EngineKind::supported_names()` replaces hard-coded six-engine
+    error string at two bench sites.
+
+  - **Item 2 v0 — `FfnBackendKind` parser + `FfnLayerPolicy`
+    (in `larql-inference::ffn_policy/`).** New crate-shape:
+    `FfnBackendKind` (Dense / Walk{k} / RemoteWalk / Null),
+    `RoutingPredicate` (All / Layers / Otherwise), `FfnLayerPolicy`
+    with from_spec parser supporting per-layer routing
+    (`{walk:k=100}@layers=14-27;{dense}@otherwise`).
+    Construction-errors on overlapping ranges; exhaustive enums;
+    typed error taxonomy (`PolicyParseError` /
+    `PolicyValidationError`). Module lives in `larql-inference` not
+    `larql-kv` — FFN policy is the FFN axis, not the KV axis.
+
+  - **`build_router` slice — `ValidatedFfnLayerPolicy` newtype +
+    `BoundFfnRouter`.** Type-system enforcement of "validate before
+    build" via non-public constructor. `BoundFfnRouter<'a>` owns its
+    backend instances (`Vec<Box<dyn FfnBackend + 'a>>`) so callers
+    don't manage backend lifetimes alongside the router's. `impl
+    FfnBackend for BoundFfnRouter` delegates per-layer via the
+    trait's existing `layer: usize` parameter — drop-in for the
+    `&dyn FfnBackend` surface every engine already takes. Design
+    rationale: `larql-inference/docs/ffn-build-router.md`.
+
+  - **Cross-product harness + typed axis columns.** `accuracy_cmd`
+    iterates `kv_engine × ffn_backend` cross-product via
+    `FfnLayerPolicy::split_specs` (comma-separated, brace-aware,
+    re-parse fallback for kv-comma forms like
+    `remote-walk:endpoint=X,wire=Y`). New `EvalLabels<'a>` struct
+    bundles `(kv_engine, ffn_backend, strategy)` for clean signatures.
+    `PromptScore` / `ConflictScore` / `StrategySplit` gain explicit
+    `kv_engine: String` + `ffn_backend: String` columns alongside
+    `strategy`. `format_strategy_split` grows a two-axis layout
+    (`KV engine` + `FFN backend` columns) when any row has
+    `ffn_backend != "dense"`; default no-`--ffn` runs keep the
+    historical single-`Strategy`-column layout. Closes the
+    interim-`ffn_backend`-as-user-input limitation noted in Item 1's
+    ROADMAP entry.
+
+  - **CLI wiring.** `larql accuracy --ffn dense,walk:k=100,'{walk:k=100}@layers=14-27;{dense}@otherwise'`
+    now runs the cross-product in one invocation. Vindex loaded
+    lazily — only when a Walk binding is present.
+    `larql bench --ffn-policy <spec>` honors the policy on the
+    non-Q4K (CPU) path; Q4K path accepts the flag but doesn't
+    honor it yet (P1 follow-on above).
+
+  - **Apollo into accuracy default engines.** `--engines` default
+    now includes `apollo`. The schema fix above means Apollo's
+    store-miss rows show `served_rate < 1.0` rather than silent
+    drops — diagnostic rather than misleading.
+
+  - **Module splits.** `accuracy_suite/runner.rs` (2050 lines) split
+    into `accuracy_suite/runner/` folder (6 files: `types` /
+    `scoring` / `drivers` / `aggregate` / `legacy` / `mod`). Same
+    pattern that produced the `ffn_policy/` folder split in
+    `larql-inference`.
+
+  - **Coverage lift across 5 engine files.** Pre-existing engine
+    internals had drifted below 90%. Lifted with synthetic-weights
+    + CPU-backend tests: `boundary_per_layer/cold_tier.rs`
+    (88→100%), `executor.rs` (85→90.6%), `walk.rs` (84→95%),
+    `engine.rs` (83→90%), `markov_residual/store.rs` (86→99.6%).
+    `markov_residual/compute.rs` partially lifted (81→86.85%);
+    full lift gated on `serial_test` for env-var paths.
+    Discovered the gate had been passing against a stale JSON —
+    fresh `make larql-kv-coverage-summary` is now required to
+    surface debt. See "Coverage debt" section above for the
+    remaining 6 files.
+
+  Test deltas across the arc: larql-kv lib 595 → 663 (+68),
+  larql-inference lib 1086 → 1102 (+16). Zero regressions. Clippy
+  clean. Aggregate ~3,500 lines of code + tests added across
+  `larql-kv` and `larql-inference`.
+
+  ROADMAP entry for the sibling trait extraction (P0 above)
+  references "Item 1 in the conversational priority queue" — Item 1
+  is the schema fix above. Mode 5 work is still gated on that P0
+  refactor landing.
 
 - **2026-05-18 — W8.2 (doubling-capacity K/V in `markov_residual` +
   `markov_residual_codec`) LANDED: 2.4× decode speedup at 1000 tokens.**

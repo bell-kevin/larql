@@ -428,4 +428,239 @@ mod tests {
         assert_eq!(cold[0].shape()[0], 0, "at exactly window size: empty cold");
         assert_eq!(store.stored[0].shape()[0], 5, "hot store intact");
     }
+
+    // ── append_cold_overflow ────────────────────────────────────────────────
+
+    #[test]
+    fn append_cold_overflow_empty_short_circuits() {
+        // c_new == 0 → early return with no allocation.
+        let mut store = make_store(2, 0, 4);
+        let empty = vec![Array2::<f32>::zeros((0, 4)); 2];
+        store.append_cold_overflow(empty, None);
+        assert!(store.cold_residuals.is_none());
+        assert_eq!(store.cold_len, 0);
+    }
+
+    #[test]
+    fn append_cold_overflow_lazily_allocates_cold_residuals_on_first_call() {
+        // None arm: cold_residuals starts None; first overflow creates
+        // the doubling-capacity buffer with c_new rows of data.
+        let mut store = make_store(2, 0, 4);
+        let overflow: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((3, 4), 0.7))
+            .collect();
+        store.append_cold_overflow(overflow, None);
+        assert!(store.cold_residuals.is_some());
+        assert_eq!(store.cold_len, 3);
+        // cold_kv stays None — no evicted_kv passed AND lossy-codec
+        // path nukes it.
+        assert!(store.cold_kv.is_none());
+        // Underlying capacity is c_new.next_power_of_two().max(8) = 8.
+        let cold = store.cold_residuals.as_ref().unwrap();
+        assert!(cold[0].shape()[0] >= 3, "buffer must hold logical rows");
+    }
+
+    #[test]
+    fn append_cold_overflow_extends_existing_cold_residuals() {
+        // Some arm: pre-populate with one call, then a second call
+        // appends and (potentially) grows the capacity. Verifies the
+        // c_old..new_len assign loop.
+        let mut store = make_store(2, 0, 4);
+        let first: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((3, 4), 0.5))
+            .collect();
+        store.append_cold_overflow(first, None);
+        assert_eq!(store.cold_len, 3);
+
+        // Append 7 more — total 10, capacity should grow past 8.
+        let second: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((7, 4), 0.9))
+            .collect();
+        store.append_cold_overflow(second, None);
+        assert_eq!(store.cold_len, 10);
+        let cold = store.cold_residuals.as_ref().unwrap();
+        assert!(cold[0].shape()[0] >= 10);
+    }
+
+    #[test]
+    fn append_cold_overflow_initialises_cold_kv_when_evicted_kv_provided() {
+        // evicted_kv None-arm initialisation: cold_kv starts None; first
+        // overflow + evicted_kv populates it via the doubling-capacity
+        // buffers.
+        let mut store = make_store(2, 0, 4);
+        let overflow: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((3, 4), 0.1))
+            .collect();
+        let evicted: Vec<SharedKV> = (0..2)
+            .map(|_| {
+                (
+                    Array2::<f32>::from_elem((3, 6), 0.2),
+                    Array2::<f32>::from_elem((3, 6), 0.3),
+                )
+            })
+            .collect();
+        store.append_cold_overflow(overflow, Some(evicted));
+        assert!(store.cold_kv.is_some());
+        let kv = store.cold_kv.as_ref().unwrap();
+        for (k, v) in kv {
+            assert!(k.shape()[0] >= 3);
+            assert!(v.shape()[0] >= 3);
+        }
+    }
+
+    #[test]
+    fn append_cold_overflow_extends_existing_cold_kv() {
+        // Some arm for cold_kv: pre-populate, then extend. Verifies the
+        // doubling-capacity growth path on the K/V side.
+        let mut store = make_store(2, 0, 4);
+        let first_overflow: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((3, 4), 0.1))
+            .collect();
+        let first_evicted: Vec<SharedKV> = (0..2)
+            .map(|_| {
+                (
+                    Array2::<f32>::from_elem((3, 6), 0.2),
+                    Array2::<f32>::from_elem((3, 6), 0.3),
+                )
+            })
+            .collect();
+        store.append_cold_overflow(first_overflow, Some(first_evicted));
+
+        // Now append 7 more, forcing capacity growth on K/V side too.
+        let second_overflow: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((7, 4), 0.4))
+            .collect();
+        let second_evicted: Vec<SharedKV> = (0..2)
+            .map(|_| {
+                (
+                    Array2::<f32>::from_elem((7, 6), 0.5),
+                    Array2::<f32>::from_elem((7, 6), 0.6),
+                )
+            })
+            .collect();
+        store.append_cold_overflow(second_overflow, Some(second_evicted));
+        assert_eq!(store.cold_len, 10);
+        let kv = store.cold_kv.as_ref().unwrap();
+        for (k, v) in kv {
+            assert!(k.shape()[0] >= 10);
+            assert!(v.shape()[0] >= 10);
+        }
+    }
+
+    #[test]
+    fn append_cold_overflow_evicted_kv_none_nukes_existing_cold_kv() {
+        // Lossy-codec contract: passing None for evicted_kv invalidates
+        // any existing cold_kv. Verifies the `else` branch at line 208-210.
+        let mut store = make_store(2, 0, 4);
+        // Seed cold_kv via first call.
+        let overflow: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((3, 4), 0.1))
+            .collect();
+        let evicted: Vec<SharedKV> = (0..2)
+            .map(|_| (Array2::<f32>::zeros((3, 6)), Array2::<f32>::zeros((3, 6))))
+            .collect();
+        store.append_cold_overflow(overflow, Some(evicted));
+        assert!(store.cold_kv.is_some());
+
+        // Second call without evicted_kv → cold_kv should be nuked.
+        let more: Vec<Array2<f32>> = (0..2)
+            .map(|_| Array2::<f32>::from_elem((2, 4), 0.5))
+            .collect();
+        store.append_cold_overflow(more, None);
+        assert!(
+            store.cold_kv.is_none(),
+            "lossy-codec path must invalidate cold_kv"
+        );
+    }
+
+    // ── cold_residual_view / cold_kv_view ───────────────────────────────────
+
+    #[test]
+    fn cold_residual_view_returns_none_when_no_cold() {
+        let store = make_store(2, 5, 4);
+        assert!(store.cold_residual_view(0).is_none());
+        assert!(store.cold_kv_view(0).is_none());
+    }
+
+    #[test]
+    fn cold_residual_view_slices_to_logical_length() {
+        // After append, the view should slice to cold_len rows, not
+        // the (possibly larger) buffer capacity.
+        let mut store = make_store(1, 0, 4);
+        let overflow = vec![Array2::<f32>::from_elem((3, 4), 0.5)];
+        store.append_cold_overflow(overflow, None);
+        let view = store.cold_residual_view(0).unwrap();
+        assert_eq!(
+            view.shape()[0],
+            3,
+            "view must slice to cold_len, not capacity"
+        );
+    }
+
+    #[test]
+    fn cold_kv_view_slices_to_logical_length() {
+        let mut store = make_store(1, 0, 4);
+        let overflow = vec![Array2::<f32>::from_elem((3, 4), 0.1)];
+        let evicted: Vec<SharedKV> =
+            vec![(Array2::<f32>::zeros((3, 6)), Array2::<f32>::zeros((3, 6)))];
+        store.append_cold_overflow(overflow, Some(evicted));
+        let (k, v) = store.cold_kv_view(0).unwrap();
+        assert_eq!(k.shape()[0], 3);
+        assert_eq!(v.shape()[0], 3);
+    }
+
+    // ── snapshot_evicted_hot_kv ──────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_evicted_hot_kv_returns_none_when_empty() {
+        let result = RsStore::snapshot_evicted_hot_kv(&[], &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn snapshot_evicted_hot_kv_returns_none_when_all_keep_zero() {
+        let kv: Vec<SharedKV> = vec![(
+            Array2::<f32>::from_elem((5, 6), 0.1),
+            Array2::<f32>::from_elem((5, 6), 0.2),
+        )];
+        let result = RsStore::snapshot_evicted_hot_kv(&kv, &[0]);
+        assert!(result.is_none(), "all zeros must short-circuit to None");
+    }
+
+    #[test]
+    fn snapshot_evicted_hot_kv_slices_per_layer() {
+        let kv: Vec<SharedKV> = vec![
+            (
+                Array2::<f32>::from_elem((5, 6), 0.1),
+                Array2::<f32>::from_elem((5, 6), 0.2),
+            ),
+            (
+                Array2::<f32>::from_elem((5, 6), 0.3),
+                Array2::<f32>::from_elem((5, 6), 0.4),
+            ),
+        ];
+        // Evict 2 rows from layer 0, 3 from layer 1.
+        let result = RsStore::snapshot_evicted_hot_kv(&kv, &[2, 3]).unwrap();
+        assert_eq!(result[0].0.shape()[0], 2);
+        assert_eq!(result[1].0.shape()[0], 3);
+    }
+
+    // ── finalise_hot_len_after_clip ──────────────────────────────────────────
+
+    #[test]
+    fn finalise_hot_len_after_clip_caps_at_window() {
+        let mut store = make_store(1, 10, 4);
+        store.max_window = Some(3);
+        // hot_len starts at 10, finalise should cap to 3.
+        store.finalise_hot_len_after_clip();
+        assert_eq!(store.hot_len, 3);
+    }
+
+    #[test]
+    fn finalise_hot_len_after_clip_noop_without_window() {
+        let mut store = make_store(1, 10, 4);
+        store.max_window = None;
+        store.finalise_hot_len_after_clip();
+        assert_eq!(store.hot_len, 10, "no window → no cap");
+    }
 }

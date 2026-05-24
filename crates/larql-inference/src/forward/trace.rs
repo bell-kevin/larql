@@ -61,6 +61,94 @@ pub fn capture_spec_residuals(weights: &ModelWeights, token_ids: &[u32]) -> Spec
     }
 }
 
+/// Attn-only forward with optional per-layer pre-W_O head zeroing.
+///
+/// Matches the `forward_attn_only` semantics used for the 2026-05-24
+/// attn-vs-FFN decomposition: the FFN, PLE, and scalar tail are skipped at
+/// every layer; the residual evolves only via the attention sublayer. At each
+/// layer present in `head_zero_map`, the listed query-head slices are zeroed
+/// before W_O via `run_attention_block_zero_pre_o_heads`. Other layers run
+/// the standard attention block.
+///
+/// Returns a `HashMap<layer_index, (seq_len, hidden_size)>` for each layer in
+/// `capture_layers`.
+pub fn trace_forward_attn_only_with_head_zero(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    capture_layers: &[usize],
+    head_zero_map: &std::collections::HashMap<usize, Vec<usize>>,
+) -> std::collections::HashMap<usize, Array2<f32>> {
+    let mut captures = std::collections::HashMap::new();
+    if capture_layers.is_empty() {
+        return captures;
+    }
+    let max_layer = *capture_layers.iter().max().unwrap_or(&0);
+    let mut h = embed_tokens(weights, token_ids);
+    let empty: Vec<usize> = Vec::new();
+
+    for layer in 0..=max_layer {
+        let heads_to_zero = head_zero_map.get(&layer).unwrap_or(&empty);
+        let h_post_attn = if heads_to_zero.is_empty() {
+            match run_attention(weights, &h, layer) {
+                Some(p) => p,
+                None => h.clone(),
+            }
+        } else {
+            match crate::attention::run_attention_block_zero_pre_o_heads(
+                weights,
+                &h,
+                layer,
+                heads_to_zero,
+                None,
+            ) {
+                Some((p, _)) => p,
+                None => h.clone(),
+            }
+        };
+        h = h_post_attn;
+        if capture_layers.contains(&layer) {
+            captures.insert(layer, h.clone());
+        }
+    }
+    captures
+}
+
+/// Attn-only forward returning **pre-W_O per-head outputs** at each requested
+/// layer. FFN, PLE, and scalar tail are skipped at every layer (matching the
+/// `forward_attn_only` semantics). Used for Stage-2 per-head probing.
+///
+/// Returns a `HashMap<layer_index, (seq_len, num_q_heads * head_dim)>`. The
+/// caller slices per-head: `pre_o[:, h * head_dim .. (h + 1) * head_dim]`.
+pub fn trace_forward_attn_only_capture_pre_o(
+    weights: &ModelWeights,
+    token_ids: &[u32],
+    capture_layers: &[usize],
+) -> std::collections::HashMap<usize, Array2<f32>> {
+    let mut captures = std::collections::HashMap::new();
+    if capture_layers.is_empty() {
+        return captures;
+    }
+    let max_layer = *capture_layers.iter().max().unwrap_or(&0);
+    let mut h = embed_tokens(weights, token_ids);
+
+    for layer in 0..=max_layer {
+        if capture_layers.contains(&layer) {
+            // Capture both the post-attention residual (advances h) and pre_o.
+            if let Some((h_post_attn, pre_o)) =
+                crate::attention::run_attention_block_with_pre_o(weights, &h, layer)
+            {
+                captures.insert(layer, pre_o);
+                h = h_post_attn;
+            } else {
+                // Skip layer with degenerate weights — leave h unchanged.
+            }
+        } else if let Some(h_post_attn) = run_attention(weights, &h, layer) {
+            h = h_post_attn;
+        }
+    }
+    captures
+}
+
 /// Run a forward pass through layers 0..=stop_layer and return the full
 /// hidden state matrix (seq_len, hidden_size) at that layer.
 pub fn forward_to_layer(

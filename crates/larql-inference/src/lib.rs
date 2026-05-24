@@ -56,6 +56,7 @@ pub mod chat;
 pub mod error;
 pub mod experts;
 pub mod ffn;
+pub mod ffn_policy;
 pub mod forward;
 pub mod forward_overrides;
 pub mod kv_dispatch;

@@ -107,12 +107,31 @@ pub(super) fn last_row(h: &Array2<f32>) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use larql_compute::CpuBackend;
+    use larql_inference::test_utils::make_test_weights;
 
     #[test]
     fn roundtrip_empty_block_short_circuits() {
         let empty: Array2<f32> = Array2::zeros((0, 8));
         let out = roundtrip(&empty, ColdResidualCodec::Bf16);
         assert_eq!(out.shape(), &[0, 8]);
+    }
+
+    #[test]
+    fn roundtrip_non_empty_block_decodes_through_codec() {
+        // Covers the non-empty path of roundtrip (encode + decode
+        // through ColdResidualCodec::Bf16). Bf16 is lossy, so we
+        // check shape preservation + values within bf16 tolerance.
+        let block = Array2::<f32>::from_shape_fn((3, 4), |(i, j)| 0.1 * (i + j) as f32);
+        let out = roundtrip(&block, ColdResidualCodec::Bf16);
+        assert_eq!(out.shape(), &[3, 4]);
+        for (orig, decoded) in block.iter().zip(out.iter()) {
+            // bf16 round-trip precision: ~1% relative for small values
+            assert!(
+                (orig - decoded).abs() < 0.01,
+                "bf16 round-trip drift too large: {orig} → {decoded}"
+            );
+        }
     }
 
     #[test]
@@ -125,6 +144,111 @@ mod tests {
         assert_eq!(r.shape(), &[1, 4]);
         for j in 0..4 {
             assert_eq!(r[[0, j]], (j + 1) as f32);
+        }
+    }
+
+    /// Build a minimal `RsStorePerLayer` for tests — no `cold_kv`
+    /// (None arm), per-layer codec set to Bf16.
+    fn empty_store(num_layers: usize, hidden: usize) -> RsStorePerLayer {
+        RsStorePerLayer {
+            stored: (0..num_layers)
+                .map(|_| Array2::<f32>::zeros((0, hidden)))
+                .collect(),
+            cold_encoded: None,
+            cold_kv: None,
+            cold_abs_start: 0,
+            next_position: 0,
+            max_window: None,
+            policy_codecs: vec![ColdResidualCodec::Bf16; num_layers],
+        }
+    }
+
+    #[test]
+    fn extend_cold_kv_with_overflow_short_circuits_on_empty_overflow() {
+        // n_new == 0 → early Some(()) return with no work.
+        // Synthetic weights + CPU backend; the function shouldn't
+        // touch them.
+        let weights = make_test_weights();
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let mut rs = empty_store(weights.num_layers, weights.hidden_size);
+        let empty_per_layer: Vec<Array2<f32>> = (0..weights.num_layers)
+            .map(|_| Array2::<f32>::zeros((0, weights.hidden_size)))
+            .collect();
+        let result = extend_cold_kv_with_overflow(
+            &weights,
+            &CpuBackend,
+            &policy,
+            &mut rs,
+            &empty_per_layer,
+            0,
+        );
+        assert!(result.is_some());
+        assert!(rs.cold_kv.is_none(), "empty overflow must not init cold_kv");
+    }
+
+    #[test]
+    fn extend_cold_kv_with_overflow_initialises_cold_kv_on_none_arm() {
+        // None arm: rs.cold_kv starts None; non-empty overflow
+        // initialises it. Verifies the None → Some(Vec) transition
+        // and that recompute_kv runs successfully on each layer.
+        let weights = make_test_weights();
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let mut rs = empty_store(weights.num_layers, weights.hidden_size);
+        let overflow_per_layer: Vec<Array2<f32>> = (0..weights.num_layers)
+            .map(|_| Array2::<f32>::from_elem((2, weights.hidden_size), 0.3f32))
+            .collect();
+        let result = extend_cold_kv_with_overflow(
+            &weights,
+            &CpuBackend,
+            &policy,
+            &mut rs,
+            &overflow_per_layer,
+            0,
+        );
+        assert!(result.is_some(), "initial extend must succeed");
+        let cold_kv = rs
+            .cold_kv
+            .as_ref()
+            .expect("None arm should populate cold_kv");
+        assert_eq!(cold_kv.len(), weights.num_layers);
+        // Each layer's K should have 2 rows (matching overflow size).
+        for (k, _v) in cold_kv {
+            assert_eq!(k.shape()[0], 2, "K/V should match overflow row count");
+        }
+    }
+
+    #[test]
+    fn extend_cold_kv_with_overflow_appends_on_some_arm() {
+        // Some arm: rs.cold_kv pre-populated with 2 rows; new
+        // overflow of 3 rows. Total should be 5 rows per layer.
+        let weights = make_test_weights();
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let mut rs = empty_store(weights.num_layers, weights.hidden_size);
+
+        // Pre-populate cold_kv via a first extend call.
+        let first_overflow: Vec<Array2<f32>> = (0..weights.num_layers)
+            .map(|_| Array2::<f32>::from_elem((2, weights.hidden_size), 0.5f32))
+            .collect();
+        extend_cold_kv_with_overflow(&weights, &CpuBackend, &policy, &mut rs, &first_overflow, 0)
+            .unwrap();
+
+        // Now extend with another 3 rows — exercises the Some arm.
+        let second_overflow: Vec<Array2<f32>> = (0..weights.num_layers)
+            .map(|_| Array2::<f32>::from_elem((3, weights.hidden_size), 0.7f32))
+            .collect();
+        let result = extend_cold_kv_with_overflow(
+            &weights,
+            &CpuBackend,
+            &policy,
+            &mut rs,
+            &second_overflow,
+            2, // cold_abs_pos after the first 2 rows
+        );
+        assert!(result.is_some(), "Some arm extend must succeed");
+        let cold_kv = rs.cold_kv.as_ref().unwrap();
+        for (k, v) in cold_kv {
+            assert_eq!(k.shape()[0], 5, "K should be 2 (old) + 3 (new) = 5 rows");
+            assert_eq!(v.shape()[0], 5, "V should be 2 (old) + 3 (new) = 5 rows");
         }
     }
 }

@@ -184,3 +184,118 @@ pub(super) fn run_decode(
 
     Some((last_row(&h_new), rs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_compute::CpuBackend;
+    use larql_inference::ffn::NullFfn;
+    use larql_inference::layer_executor::LocalWalkExecutor;
+    use larql_inference::test_utils::make_test_weights;
+
+    #[test]
+    fn run_prefill_no_window_returns_state_with_no_cold_tier() {
+        // window_size = None → no overflow → no cold_encoded, no cold_kv.
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let executor = LocalWalkExecutor::new(&backend);
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let token_ids: Vec<u32> = vec![0, 1, 2];
+        let (hidden, rs) = run_prefill(&weights, &executor, &ffn, &policy, None, &token_ids)
+            .expect("prefill should succeed with synthetic weights");
+        assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+        assert_eq!(rs.next_position, 3);
+        assert!(rs.cold_encoded.is_none(), "no overflow → no cold_encoded");
+        assert!(rs.cold_kv.is_none(), "no overflow → no cold_kv");
+        // Each layer's stored slab has all 3 tokens.
+        assert_eq!(rs.stored.len(), weights.num_layers);
+        for slab in &rs.stored {
+            assert_eq!(slab.shape()[0], 3, "each layer slab carries all 3 tokens");
+        }
+    }
+
+    #[test]
+    fn run_prefill_with_small_window_evicts_to_cold_tier() {
+        // window_size = 2 with 3-token prefill → 1 row of overflow per
+        // layer, populates cold_encoded + cold_kv.
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let executor = LocalWalkExecutor::new(&backend);
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let token_ids: Vec<u32> = vec![0, 1, 2];
+        let (_hidden, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(2), &token_ids)
+            .expect("prefill should succeed");
+        assert!(
+            rs.cold_encoded.is_some(),
+            "overflow path must populate cold_encoded"
+        );
+        assert!(
+            rs.cold_kv.is_some(),
+            "overflow path must pre-compute cold_kv"
+        );
+        let cold_kv = rs.cold_kv.as_ref().unwrap();
+        for (k, _v) in cold_kv {
+            assert_eq!(k.shape()[0], 1, "1 row of overflow per layer");
+        }
+    }
+
+    #[test]
+    fn run_decode_extends_hot_tier_when_below_window() {
+        // After a 1-token prefill with window=4, decode 1 token →
+        // both fit in hot, no overflow, no cold-tier mutation.
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let executor = LocalWalkExecutor::new(&backend);
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (_, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(4), &[0]).unwrap();
+        assert!(
+            rs.cold_encoded.is_none(),
+            "no overflow expected after prefill"
+        );
+
+        let (hidden, rs_after) =
+            run_decode(&weights, &executor, &ffn, &policy, rs, 1).expect("decode should succeed");
+        assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+        assert_eq!(rs_after.next_position, 2);
+        for slab in &rs_after.stored {
+            assert_eq!(slab.shape()[0], 2, "hot slab grew to 2 rows");
+        }
+        // Still no overflow at this scale.
+        assert!(rs_after.cold_encoded.is_none());
+    }
+
+    #[test]
+    fn run_decode_promotes_to_cold_tier_on_overflow() {
+        // Prefill 3 tokens with window=2 → 1 row already in cold.
+        // Decode 1 more token → 2 rows in cold after eviction.
+        // Exercises the Some(layers) arm of cold_encoded.as_mut().
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let executor = LocalWalkExecutor::new(&backend);
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (_, rs) = run_prefill(&weights, &executor, &ffn, &policy, Some(2), &[0, 1, 2]).unwrap();
+        assert!(
+            rs.cold_encoded.is_some(),
+            "prefill should have populated cold_encoded"
+        );
+        let initial_cold_rows = rs
+            .cold_encoded
+            .as_ref()
+            .map(|l| l[0].n_positions)
+            .unwrap_or(0);
+        assert_eq!(initial_cold_rows, 1, "1 row in cold after prefill");
+
+        let (_, rs_after) = run_decode(&weights, &executor, &ffn, &policy, rs, 3).unwrap();
+        let after_cold_rows = rs_after
+            .cold_encoded
+            .as_ref()
+            .map(|l| l[0].n_positions)
+            .unwrap_or(0);
+        assert_eq!(after_cold_rows, 2, "decode evicted 1 more row to cold");
+        assert_eq!(rs_after.next_position, 4);
+    }
+}

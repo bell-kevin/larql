@@ -50,6 +50,10 @@ gpu = ["dep:larql-compute-metal", "larql-inference/gpu"]
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+# Serialise tests that read process-global env vars (LARQL_W10_DISABLE
+# dispatch cascade, LARQL_MARKOV_* compute-path diagnostics) so they
+# don't race other tests reading the same variables in parallel.
+serial_test = "3.2"
 
 [[bench]]
 name = "engine_decode"

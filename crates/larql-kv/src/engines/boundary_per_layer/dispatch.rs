@@ -220,3 +220,223 @@ pub(super) fn decode_step_via_dispatch(
     }
     Some((hidden, rs))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the W1-GPU dispatch free functions. Drives
+    //! `CpuBackend` via the synthetic Q4K fixture so the per-layer
+    //! `coarse_*_with_state` populates a `PerLayerDecodeState` the
+    //! helpers then consume into `RsStorePerLayer`.
+    //!
+    //! The W10 mask cascade (`drop_stored_shadow` /
+    //! `StateDumpMask::None`) is on by default; tests exercise both
+    //! the windowed (`HOnly`) and windowless (`None`) shapes.
+
+    use larql_inference::cpu_engine_backend;
+    use larql_inference::test_utils::{
+        make_test_q4k_vindex, make_test_q4k_weights, Q4K_TEST_NUM_LAYERS,
+    };
+    use serial_test::serial;
+
+    use super::*;
+    use crate::engines::boundary_per_layer::policy::BoundaryLayerPolicy;
+
+    fn bf16_policy() -> BoundaryLayerPolicy {
+        BoundaryLayerPolicy::bf16_uniform("test", Q4K_TEST_NUM_LAYERS)
+    }
+
+    /// Reset `LARQL_W10_DISABLE` to a known state. Every test in this
+    /// module exercises code paths gated on `w10_env_on()` (which reads
+    /// this var), so the tests are `#[serial]` and start clean.
+    fn clear_w10_env() {
+        std::env::remove_var("LARQL_W10_DISABLE");
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
+        clear_w10_env();
+        let weights = make_test_q4k_weights();
+        let empty_index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        let backend = cpu_engine_backend();
+        let mut w = weights;
+        assert!(try_prefill_via_dispatch(
+            &mut w,
+            backend.as_ref(),
+            &bf16_policy(),
+            Some(4),
+            &empty_index,
+            &[0u32, 1],
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowed_populates_store_under_w10_honly() {
+        clear_w10_env();
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = cpu_engine_backend();
+        let (h, rs, _handle) = try_prefill_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            Some(4),
+            &index,
+            &[0u32, 1, 2],
+        )
+        .expect("prefill via dispatch");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        // W10 default: HOnly mask is selected (drop_hot_kv unconditional,
+        // drop_stored_shadow only when window_size = None). Windowed
+        // configuration keeps stored populated.
+        assert_eq!(rs.stored.len(), weights.num_layers);
+        assert_eq!(rs.stored[0].shape()[0], 3);
+        assert_eq!(rs.next_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowless_drops_stored_under_w10_none_mask() {
+        clear_w10_env();
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = cpu_engine_backend();
+        let (_h, rs, _handle) = try_prefill_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            None,
+            &index,
+            &[0u32, 1, 2],
+        )
+        .expect("prefill via dispatch (windowless)");
+        // W10 + window=None: drop_stored_shadow is true → empty stored
+        // per layer.
+        for slab in &rs.stored {
+            assert_eq!(slab.shape()[0], 0, "stored should be empty under None mask");
+        }
+        assert!(rs.cold_encoded.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_appends_h_in_under_honly() {
+        clear_w10_env();
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = cpu_engine_backend();
+        let (_h, rs, mut handle) = try_prefill_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            Some(4),
+            &index,
+            &[0u32, 1],
+        )
+        .expect("prefill");
+        let rows_before = rs.stored[0].shape()[0];
+        let (h, rs) = decode_step_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            &mut handle,
+            rs,
+            &index,
+            2,
+        )
+        .expect("decode");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        // HOnly mask appends one h_in row per layer per step.
+        assert_eq!(rs.stored[0].shape()[0], rows_before + 1);
+        assert_eq!(rs.next_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_windowless_takes_none_mask_path() {
+        clear_w10_env();
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = cpu_engine_backend();
+        let (_h, rs, mut handle) = try_prefill_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            None,
+            &index,
+            &[0u32, 1],
+        )
+        .expect("prefill (windowless)");
+        let (_h, rs) = decode_step_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            &mut handle,
+            rs,
+            &index,
+            2,
+        )
+        .expect("decode (None mask)");
+        // None mask: stored stays empty, but next_position still advances.
+        for slab in &rs.stored {
+            assert_eq!(slab.shape()[0], 0);
+        }
+        assert_eq!(rs.next_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_overflow_extends_cold_tier() {
+        clear_w10_env();
+        let mut weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let backend = cpu_engine_backend();
+        // window=2: after prefilling 2 tokens, one decode crosses the
+        // window and the dispatch eviction path runs.
+        let (_h, rs, mut handle) = try_prefill_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            Some(2),
+            &index,
+            &[0u32, 1],
+        )
+        .expect("prefill");
+        assert!(rs.cold_encoded.is_none(), "no overflow at prefill");
+        let (_h, rs) = decode_step_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            &mut handle,
+            rs,
+            &index,
+            2,
+        )
+        .expect("decode");
+        assert!(
+            rs.cold_encoded.is_some(),
+            "first decode past window should fire cold-tier append"
+        );
+        // Subsequent decode should extend an existing cold_encoded
+        // (Some(layers) branch of the match).
+        let (_h, rs) = decode_step_via_dispatch(
+            &mut weights,
+            backend.as_ref(),
+            &bf16_policy(),
+            &mut handle,
+            rs,
+            &index,
+            3,
+        )
+        .expect("decode 2");
+        assert!(rs.cold_encoded.is_some());
+        assert!(rs.cold_encoded.as_ref().unwrap()[0].n_positions >= 2);
+    }
+}

@@ -266,3 +266,262 @@ impl MarkovResidualCodecEngine {
         Some(hidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the W1-GPU dispatch path on the codec engine.
+    //! Mirrors `markov_residual::dispatch::tests` — same `CpuBackend`
+    //! synthetic Q4K driver, same W10 cascade asserts (HOnly under
+    //! windowed default, None under windowless, Full under
+    //! `LARQL_W10_DISABLE=1`). Differences: overflow path encodes into
+    //! `cold_encoded` (bf16) rather than raw `cold_residuals`, and
+    //! `cold_kv` is invalidated on overflow (codec round-trip is lossy).
+
+    use larql_inference::cpu_engine_backend;
+    use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+    use serial_test::serial;
+
+    use super::*;
+    use crate::engines::markov_residual_codec::codec::ColdResidualCodec;
+    use crate::engines::markov_residual_codec::engine::MarkovResidualCodecEngine;
+
+    fn fixture(
+        window_size: Option<usize>,
+    ) -> (
+        MarkovResidualCodecEngine,
+        ModelWeights,
+        larql_vindex::VectorIndex,
+    ) {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let engine = MarkovResidualCodecEngine::with_backend(
+            window_size,
+            ColdResidualCodec::Bf16,
+            cpu_engine_backend(),
+        );
+        (engine, weights, index)
+    }
+
+    fn set_w10_disable(disabled: bool) {
+        if disabled {
+            std::env::set_var("LARQL_W10_DISABLE", "1");
+        } else {
+            std::env::remove_var("LARQL_W10_DISABLE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
+        set_w10_disable(false);
+        let weights = make_test_q4k_weights();
+        let empty_index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        let mut engine = MarkovResidualCodecEngine::with_backend(
+            Some(4),
+            ColdResidualCodec::Bf16,
+            cpu_engine_backend(),
+        );
+        let mut w = weights;
+        assert!(engine
+            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .is_none());
+        assert!(engine.store.is_none());
+        assert!(engine.kv_handle.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowed_keeps_stored_under_w10_default() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        let h = engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        let rs = engine.store.as_ref().unwrap();
+        assert!(rs.hot_kv.is_none(), "W10 default drops hot_kv shadow");
+        assert!(rs.stored[0].shape()[0] >= 3);
+        assert_eq!(rs.hot_len, 3);
+        assert_eq!(rs.next_position, 3);
+        assert!(rs.cold_encoded.is_none(), "no overflow yet");
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowless_drops_stored_under_w10() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(None);
+        let hidden = weights.hidden_size;
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill (windowless)");
+        let rs = engine.store.as_ref().unwrap();
+        assert!(rs.hot_kv.is_none());
+        for slab in &rs.stored {
+            assert_eq!(slab.shape(), &[0, hidden]);
+        }
+        assert_eq!(rs.hot_len, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowed_overflow_codecs_cold_tier() {
+        // window=2 against 4 tokens → prefill clip evicts 2 positions
+        // into `cold_encoded` via the bf16 codec.
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(2));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2, 3])
+            .expect("prefill (overflow)");
+        let rs = engine.store.as_ref().unwrap();
+        let cold = rs.cold_encoded.as_ref().expect("cold_encoded populated");
+        assert_eq!(cold.len(), weights.num_layers);
+        assert!(cold[0].n_positions > 0);
+        // Codec is lossy → cold_kv stays None.
+        assert!(rs.cold_kv.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_full_mask_with_w10_disabled() {
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        let res = engine.try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2]);
+        set_w10_disable(false);
+        res.expect("prefill");
+        let rs = engine.store.as_ref().unwrap();
+        assert!(rs.hot_kv.is_some(), "W10 disabled keeps hot_kv");
+        assert_eq!(rs.hot_len, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_without_prefill_returns_none() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(4));
+        assert!(engine
+            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_windowed_appends_h_in_under_honly() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let hot_len_before = engine.store.as_ref().unwrap().hot_len;
+        let h = engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        let rs = engine.store.as_ref().unwrap();
+        assert_eq!(rs.hot_len, hot_len_before + 1);
+        assert!(rs.hot_kv.is_none());
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_windowless_uses_none_mask() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(None);
+        let hidden = weights.hidden_size;
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill (windowless)");
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode (None mask)");
+        let rs = engine.store.as_ref().unwrap();
+        for slab in &rs.stored {
+            assert_eq!(slab.shape(), &[0, hidden]);
+        }
+        assert_eq!(rs.hot_len, 0);
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_full_mask_with_w10_disabled() {
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let hot_len_before = engine.store.as_ref().unwrap().hot_len;
+        let res = engine.decode_step_via_dispatch(&mut weights, &index, 2);
+        set_w10_disable(false);
+        res.expect("decode");
+        let rs = engine.store.as_ref().unwrap();
+        assert_eq!(rs.hot_len, hot_len_before + 1);
+        assert!(rs.hot_kv.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_overflow_extends_cold_encoded() {
+        // window=2: after prefilling 2 → one decode evicts the oldest
+        // position into cold_encoded (the None match arm constructs it).
+        // Second decode extends an existing cold_encoded (Some arm).
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(2));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        assert!(engine.store.as_ref().unwrap().cold_encoded.is_none());
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode 1");
+        assert!(engine.store.as_ref().unwrap().cold_encoded.is_some());
+        let n_before = engine
+            .store
+            .as_ref()
+            .unwrap()
+            .cold_encoded
+            .as_ref()
+            .unwrap()[0]
+            .n_positions;
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 3)
+            .expect("decode 2");
+        let n_after = engine
+            .store
+            .as_ref()
+            .unwrap()
+            .cold_encoded
+            .as_ref()
+            .unwrap()[0]
+            .n_positions;
+        assert!(
+            n_after > n_before,
+            "second decode should extend cold_encoded"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_with_profiling_records_stages() {
+        set_w10_disable(false);
+        let (engine, mut weights, index) = fixture(Some(8));
+        let mut engine = engine.with_profiling(true);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        assert!(engine.profile.decode_total.count >= 1);
+        assert!(engine.profile.state_capture.count >= 1);
+        assert!(engine.profile.state_materialise.count >= 1);
+        assert!(engine.profile.state_append.count >= 1);
+    }
+}

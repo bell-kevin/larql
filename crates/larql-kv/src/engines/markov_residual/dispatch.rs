@@ -264,3 +264,216 @@ impl MarkovResidualEngine {
         Some(hidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the W1-GPU dispatch path. Drives `CpuBackend` via
+    //! the synthetic Q4K fixture; W10 mask cascade is on by default,
+    //! so windowed configurations hit the `HOnly` path and windowless
+    //! configurations hit `None`. The `Full` path is exercised with
+    //! `LARQL_W10_DISABLE=1`.
+    //!
+    //! Every test is `#[serial]` because `w10_enabled()` reads the
+    //! process-global `LARQL_W10_DISABLE` env var — running in parallel
+    //! would race the env state. Each test resets the env at start via
+    //! [`set_w10_disable`] so prior runs can't leak.
+
+    use larql_inference::cpu_engine_backend;
+    use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+    use serial_test::serial;
+
+    use super::*;
+    use crate::engines::markov_residual::engine::MarkovResidualEngine;
+
+    fn fixture(window_size: Option<usize>) -> (MarkovResidualEngine, ModelWeights, VectorIndex) {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let engine = MarkovResidualEngine::with_backend(window_size, cpu_engine_backend());
+        (engine, weights, index)
+    }
+
+    /// Force `LARQL_W10_DISABLE` to a known state. Pass `true` for the
+    /// Full-mask path; `false` for the cascade-on default.
+    fn set_w10_disable(disabled: bool) {
+        if disabled {
+            std::env::set_var("LARQL_W10_DISABLE", "1");
+        } else {
+            std::env::remove_var("LARQL_W10_DISABLE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
+        set_w10_disable(false);
+        let weights = make_test_q4k_weights();
+        let empty_index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        let mut engine = MarkovResidualEngine::with_backend(Some(4), cpu_engine_backend());
+        let mut w = weights;
+        assert!(engine
+            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .is_none());
+        assert!(engine.store.is_none());
+        assert!(engine.kv_handle.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowed_keeps_stored_under_w10_default() {
+        set_w10_disable(false);
+        // window=Some + default env → drop_hot_kv_shadow=true,
+        // drop_stored_shadow=false. stored populated, hot_kv dropped.
+        // `stored[layer]` is a doubling-capacity buffer
+        // (shape `[max(window,prompt_len), hidden]`); the logical row
+        // count lives in `hot_len`.
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        let h = engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        let rs = engine.store.as_ref().expect("store populated");
+        assert_eq!(rs.stored.len(), weights.num_layers);
+        assert!(
+            rs.stored[0].shape()[0] >= 3,
+            "capacity must hold prefill rows"
+        );
+        assert!(rs.hot_kv.is_none(), "W10 default drops hot_kv shadow");
+        assert_eq!(rs.next_position, 3);
+        assert_eq!(rs.hot_len, 3);
+        assert!(engine.kv_handle.is_some());
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_windowless_drops_stored_shadow_under_w10() {
+        set_w10_disable(false);
+        // window=None + default env → both drop_hot_kv_shadow and
+        // drop_stored_shadow = true. The drop_stored branch replaces
+        // each `stored[l]` with `Array2::<f32>::zeros((0, hidden))`.
+        let (mut engine, mut weights, index) = fixture(None);
+        let hidden = weights.hidden_size;
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill (windowless)");
+        let rs = engine.store.as_ref().unwrap();
+        assert!(rs.hot_kv.is_none());
+        for slab in &rs.stored {
+            assert_eq!(slab.shape(), &[0, hidden], "stored slab should be empty");
+        }
+        assert_eq!(rs.hot_len, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_full_mask_path_with_w10_disabled() {
+        // LARQL_W10_DISABLE=1 → drop_hot_kv_shadow=false; both shadows
+        // populated (Full mask in decode).
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        let res = engine.try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2]);
+        set_w10_disable(false);
+        res.expect("prefill");
+        let rs = engine.store.as_ref().unwrap();
+        assert!(rs.hot_kv.is_some(), "W10 disabled keeps hot_kv");
+        assert_eq!(rs.hot_len, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_without_prefill_returns_none() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(Some(4));
+        // kv_handle is None → early return at `self.kv_handle.as_mut()?`.
+        assert!(engine
+            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_windowed_appends_h_in_under_honly() {
+        set_w10_disable(false);
+        // window=Some + default env → mask=HOnly. hot_len grows by 1;
+        // hot_kv stays None.
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let hot_len_before = engine.store.as_ref().unwrap().hot_len;
+        let h = engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        let rs = engine.store.as_ref().unwrap();
+        assert_eq!(rs.hot_len, hot_len_before + 1);
+        assert!(rs.hot_kv.is_none());
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_windowless_uses_none_mask() {
+        set_w10_disable(false);
+        // window=None + default env → mask=None; stored stays empty,
+        // hot_len doesn't bump.
+        let (mut engine, mut weights, index) = fixture(None);
+        let hidden = weights.hidden_size;
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill (windowless)");
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode (None mask)");
+        let rs = engine.store.as_ref().unwrap();
+        for slab in &rs.stored {
+            assert_eq!(slab.shape(), &[0, hidden]);
+        }
+        assert_eq!(rs.hot_len, 0);
+        // abs_position bumps on every decode regardless of mask.
+        assert_eq!(engine.abs_position, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_full_mask_appends_hot_kv_with_w10_disabled() {
+        // Full mask path: appends to BOTH stored and hot_kv on every layer.
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(Some(8));
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let hot_len_before = engine.store.as_ref().unwrap().hot_len;
+        let result = engine.decode_step_via_dispatch(&mut weights, &index, 2);
+        set_w10_disable(false);
+        result.expect("decode");
+        let rs = engine.store.as_ref().unwrap();
+        assert_eq!(rs.hot_len, hot_len_before + 1);
+        assert!(rs.hot_kv.is_some(), "hot_kv populated under Full mask");
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_with_profiling_records_stages() {
+        set_w10_disable(false);
+        let (engine, mut weights, index) = fixture(Some(8));
+        let mut engine = engine.with_profiling(true);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        // HOnly mask path populates state_capture / state_materialise /
+        // state_append (the loop that runs under HOnly).
+        assert!(engine.profile.decode_total.count >= 1);
+        assert!(engine.profile.state_capture.count >= 1);
+        assert!(engine.profile.state_materialise.count >= 1);
+        assert!(engine.profile.state_append.count >= 1);
+    }
+}

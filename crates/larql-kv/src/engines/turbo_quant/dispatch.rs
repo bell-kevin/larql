@@ -142,3 +142,124 @@ impl TurboQuantEngine {
         Some(hidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the W1-GPU dispatch path. Drives `CpuBackend` via
+    //! the synthetic Q4K fixture (`make_test_q4k_weights` +
+    //! `make_test_q4k_vindex`) — the CPU `coarse_*_with_state` impl
+    //! populates per-layer state, which the dispatch helpers then
+    //! consume into the engine's `CompressedLayer` slots.
+
+    use larql_inference::cpu_engine_backend;
+    use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+
+    use super::*;
+    use crate::engines::turbo_quant::engine::TurboQuantEngine;
+
+    fn fixture() -> (TurboQuantEngine, ModelWeights, VectorIndex) {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let engine = TurboQuantEngine::with_backend(4, cpu_engine_backend());
+        (engine, weights, index)
+    }
+
+    #[test]
+    fn prefill_via_dispatch_compresses_per_layer_kv() {
+        let (mut engine, mut weights, index) = fixture();
+        let h = engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill via dispatch");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(engine.layers.len(), weights.num_layers);
+        assert!(engine.kv_handle.is_some());
+        assert_eq!(engine.abs_position, 3);
+        // Each layer's compressed_k must hold prefill_len heads worth of
+        // bytes — non-zero proves the compress() path ran.
+        for layer in &engine.layers {
+            assert!(!layer.compressed_k.is_empty());
+            assert!(!layer.compressed_v.is_empty());
+        }
+    }
+
+    #[test]
+    fn prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
+        // An empty / fresh VectorIndex (no Q4K attn payload) fails the
+        // `supports_direct_matvec_decode` guard at the top of dispatch.
+        let weights = make_test_q4k_weights();
+        let empty_index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        let mut engine = TurboQuantEngine::with_backend(4, cpu_engine_backend());
+        let mut w = weights;
+        assert!(engine
+            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .is_none());
+        assert!(engine.kv_handle.is_none());
+        assert!(engine.layers.is_empty());
+    }
+
+    #[test]
+    fn prefill_via_dispatch_returns_none_on_empty_prompt() {
+        // Empty token slice routes through CpuBackend's empty-tokens
+        // guard in `coarse_prefill_with_state` → None.
+        let (mut engine, mut weights, index) = fixture();
+        assert!(engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[])
+            .is_none());
+        assert!(engine.kv_handle.is_none());
+    }
+
+    #[test]
+    fn decode_step_via_dispatch_appends_one_position() {
+        let (mut engine, mut weights, index) = fixture();
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let bytes_before: usize = engine.layers.iter().map(|l| l.compressed_k.len()).sum();
+        let h = engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(engine.abs_position, 3);
+        let bytes_after: usize = engine.layers.iter().map(|l| l.compressed_k.len()).sum();
+        // Append-only encode: one new row per layer per step.
+        assert!(
+            bytes_after > bytes_before,
+            "compressed_k must grow after decode_step (was {bytes_before}, now {bytes_after})"
+        );
+        // num_vecs counter should advance by exactly 1 on every layer.
+        for layer in &engine.layers {
+            assert_eq!(layer.num_vecs, 3, "num_vecs should be prefill_len + 1");
+        }
+    }
+
+    #[test]
+    fn decode_step_via_dispatch_without_prefill_returns_none() {
+        let (mut engine, mut weights, index) = fixture();
+        // kv_handle is None → early return at `self.kv_handle.as_mut()?`.
+        assert!(engine
+            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .is_none());
+    }
+
+    #[test]
+    fn decode_step_via_dispatch_with_profiling_records_stages() {
+        let (engine, mut weights, index) = fixture();
+        let mut engine = engine.with_profiling(true);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        // The decode_total / state_capture / recompute_hot timers
+        // should all have at least one observation.
+        assert!(engine.profile.decode_total.count >= 1);
+        assert!(engine.profile.state_capture.count >= 1);
+        assert!(engine.profile.recompute_hot.count >= 1);
+    }
+}

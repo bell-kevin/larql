@@ -1077,6 +1077,274 @@ mod tests {
         assert!(profiler.recompute_cold.count > 0);
     }
 
+    // ── Pure helpers ────────────────────────────────────────────────────────
+
+    #[test]
+    fn dot_rows_basic_arithmetic() {
+        let a = ndarray::arr1(&[1.0f32, 2.0, 3.0]);
+        let b = ndarray::arr1(&[4.0f32, 5.0, 6.0]);
+        // 1*4 + 2*5 + 3*6 = 32
+        assert!((dot_rows(a.view(), b.view()) - 32.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compare_abs_desc_orders_by_absolute_magnitude() {
+        let a = (0usize, -5.0f32);
+        let b = (1usize, 3.0f32);
+        // |a| > |b| so a comes before b under descending sort.
+        assert_eq!(compare_abs_desc(&a, &b), Ordering::Less);
+        assert_eq!(compare_abs_desc(&b, &a), Ordering::Greater);
+        // Tie: NaN/Equal fallback returns Equal.
+        let c = (2usize, 5.0f32);
+        let d = (3usize, -5.0f32);
+        assert_eq!(compare_abs_desc(&c, &d), Ordering::Equal);
+    }
+
+    #[test]
+    fn array_diff_stats_identical_arrays_returns_zero_diff_and_unit_cos() {
+        // Identical arrays → max_abs=0, rms=0, cos=1.
+        let a = Array2::<f32>::from_elem((2, 3), 1.5);
+        let b = a.clone();
+        let (max_abs, rms, cos) = array_diff_stats(&a, &b);
+        assert!(max_abs.abs() < 1e-12);
+        assert!(rms.abs() < 1e-12);
+        assert!(
+            (cos - 1.0).abs() < 1e-9,
+            "cos should be 1 for identical, got {cos}"
+        );
+    }
+
+    #[test]
+    fn array_diff_stats_reports_max_abs_and_rms() {
+        let a = Array2::<f32>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap();
+        let b = Array2::<f32>::from_shape_vec((1, 3), vec![1.0, 2.0, 3.0]).unwrap();
+        let (max_abs, rms, cos) = array_diff_stats(&a, &b);
+        // max_abs = 3, rms = sqrt(((-1)^2 + (-2)^2 + (-3)^2) / 3) = sqrt(14/3)
+        assert!((max_abs - 3.0).abs() < 1e-9);
+        assert!((rms - (14.0_f64 / 3.0).sqrt()).abs() < 1e-9);
+        // a is all zeros so cosine has denom=0 → returns 1.0 sentinel.
+        assert!((cos - 1.0).abs() < 1e-9, "all-zeros a → cos sentinel = 1");
+    }
+
+    #[test]
+    fn array_diff_stats_mismatched_shape_returns_nan_tuple() {
+        let a = Array2::<f32>::zeros((2, 3));
+        let b = Array2::<f32>::zeros((3, 2));
+        let (max_abs, rms, cos) = array_diff_stats(&a, &b);
+        assert!(max_abs.is_nan() && rms.is_nan() && cos.is_nan());
+    }
+
+    #[test]
+    fn layer_in_spec_accepts_singleton_and_ranges() {
+        // Direct test of the spec parser. Covers "5", "5-7", "1,5-7,9"
+        // forms — the helper layered under markov_walk_kv_diag_layer
+        // and markov_walk_kv_top_k env-var paths.
+        assert!(layer_in_spec("5", 5));
+        assert!(!layer_in_spec("5", 6));
+        assert!(layer_in_spec("5-7", 5));
+        assert!(layer_in_spec("5-7", 6));
+        assert!(layer_in_spec("5-7", 7));
+        assert!(!layer_in_spec("5-7", 8));
+        assert!(layer_in_spec("1,5-7,9", 1));
+        assert!(layer_in_spec("1,5-7,9", 6));
+        assert!(layer_in_spec("1,5-7,9", 9));
+        assert!(!layer_in_spec("1,5-7,9", 3));
+    }
+
+    #[test]
+    fn layer_in_spec_rejects_malformed_input() {
+        // Non-numeric pieces should not crash and should return false.
+        assert!(!layer_in_spec("abc", 5));
+        assert!(!layer_in_spec("", 5));
+    }
+
+    #[test]
+    fn print_walk_kv_diag_runs_without_panicking() {
+        // Pure logging helper. The body just prints diagnostic stats;
+        // exercising it produces console output but no observable
+        // state change. Coverage credit for the function body.
+        let a = Array2::<f32>::from_elem((2, 4), 1.0f32);
+        let b = Array2::<f32>::from_elem((2, 4), 0.5f32);
+        print_walk_kv_diag(0, "test_path", "K", "test_label", &a, &b);
+    }
+
+    // ── Env-var-gated walk-KV paths ───────────────────────────────────────────
+    //
+    // These tests cover the `LARQL_MARKOV_WALK_KV_*` /
+    // `LARQL_MARKOV_KV_FORCE_F32` paths in `recompute_kv` +
+    // `markov_walk_kv_*` helpers. The env vars are read at decode
+    // time via `std::env::var`, so each test is `#[serial]` (the
+    // `serial_test` crate) and resets the relevant vars at the start
+    // to prevent prior-test leakage.
+
+    fn clear_markov_walk_env() {
+        for var in [
+            "LARQL_MARKOV_WALK_KV_TOPK",
+            "LARQL_MARKOV_WALK_KV_LAYERS",
+            "LARQL_MARKOV_WALK_KV_SELECT_AT",
+            "LARQL_MARKOV_WALK_KV_DIAG",
+            "LARQL_MARKOV_KV_FORCE_F32",
+        ] {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_walk_kv_requested_top_k_parses_clamps_and_rejects_zero() {
+        clear_markov_walk_env();
+        // Not set → None.
+        assert_eq!(markov_walk_kv_requested_top_k(32), None);
+        // Set → parsed; clamp to kv_dim.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "8");
+        assert_eq!(markov_walk_kv_requested_top_k(32), Some(8));
+        assert_eq!(
+            markov_walk_kv_requested_top_k(4),
+            Some(4),
+            "clamp to kv_dim"
+        );
+        // Zero is rejected.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "0");
+        assert_eq!(markov_walk_kv_requested_top_k(32), None);
+        // Garbage rejects.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "abc");
+        assert_eq!(markov_walk_kv_requested_top_k(32), None);
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_walk_kv_select_at_parses_layer_index() {
+        clear_markov_walk_env();
+        assert_eq!(markov_walk_kv_select_at(), None);
+        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "7");
+        assert_eq!(markov_walk_kv_select_at(), Some(7));
+        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "bad");
+        assert_eq!(markov_walk_kv_select_at(), None);
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_walk_kv_diag_enabled_accepts_truthy_strings() {
+        clear_markov_walk_env();
+        assert!(!markov_walk_kv_diag_enabled());
+        for val in ["1", "true", "TRUE", "yes", "on"] {
+            std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", val);
+            assert!(markov_walk_kv_diag_enabled(), "should accept {val}");
+        }
+        for val in ["0", "false", "no"] {
+            std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", val);
+            assert!(!markov_walk_kv_diag_enabled(), "should reject {val}");
+        }
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_kv_force_f32_projection_reads_env() {
+        clear_markov_walk_env();
+        assert!(!markov_kv_force_f32_projection());
+        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "1");
+        assert!(markov_kv_force_f32_projection());
+        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "no");
+        assert!(!markov_kv_force_f32_projection());
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_walk_kv_diag_layer_respects_layers_spec() {
+        clear_markov_walk_env();
+        // Absent → every layer counts.
+        assert!(markov_walk_kv_diag_layer(0));
+        assert!(markov_walk_kv_diag_layer(99));
+        // Restricted to range → outside layers excluded.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_LAYERS", "3-5");
+        assert!(markov_walk_kv_diag_layer(4));
+        assert!(!markov_walk_kv_diag_layer(0));
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn markov_walk_kv_top_k_honours_layers_and_select_at_gates() {
+        clear_markov_walk_env();
+        // Not requested → None.
+        assert_eq!(markov_walk_kv_top_k(0, 32), None);
+        // Requested but layer not in spec → None.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "4");
+        std::env::set_var("LARQL_MARKOV_WALK_KV_LAYERS", "5-7");
+        assert_eq!(markov_walk_kv_top_k(0, 32), None);
+        assert_eq!(markov_walk_kv_top_k(6, 32), Some(4));
+        // SELECT_AT == layer → None (selector layer keeps the dense path).
+        std::env::remove_var("LARQL_MARKOV_WALK_KV_LAYERS");
+        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "6");
+        assert_eq!(markov_walk_kv_top_k(6, 32), None);
+        assert_eq!(markov_walk_kv_top_k(7, 32), Some(4));
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recompute_kv_force_f32_disables_q4k_path() {
+        clear_markov_walk_env();
+        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "1");
+        let weights = make_test_weights();
+        let h = Array2::from_elem((2, weights.hidden_size), 0.5f32);
+        let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None).unwrap();
+        let kv_dim = weights.num_kv_heads * weights.head_dim;
+        assert_eq!(k.shape(), &[2, kv_dim]);
+        assert_eq!(v.shape(), &[2, kv_dim]);
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recompute_kv_topk_routes_through_walk_projection() {
+        clear_markov_walk_env();
+        // top_k forces the walk-KV f32 fallback regardless of backend.
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "2");
+        let weights = make_test_weights();
+        let h = Array2::from_elem((2, weights.hidden_size), 0.25f32);
+        let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
+        assert!(result.is_some());
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recompute_kv_select_at_uses_cached_indices_on_later_layers() {
+        clear_markov_walk_env();
+        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "2");
+        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "0");
+        let weights = make_test_weights();
+        let h = Array2::from_elem((2, weights.hidden_size), 0.25f32);
+        // Layer 0: should_cache_selection fires, populates the
+        // thread-local; layer 1: walk_project_cached_topk reads it.
+        let _ = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
+        if weights.num_layers >= 2 {
+            let result = recompute_kv(&weights, &h, 1, 0, &CpuBackend, None);
+            assert!(result.is_some());
+        }
+        clear_markov_walk_env();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recompute_kv_diag_fires_when_enabled() {
+        clear_markov_walk_env();
+        std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", "1");
+        let weights = make_test_weights();
+        let h = Array2::from_elem((1, weights.hidden_size), 0.5f32);
+        // Diagnostic path runs `print_walk_kv_diag` — body is
+        // observability output; we just verify no panic and a valid
+        // result.
+        let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
+        assert!(result.is_some());
+        clear_markov_walk_env();
+    }
+
     #[test]
     fn decode_step_with_empty_cold_residuals_falls_through() {
         // Line 159: `(h_hot.clone(), hot_abs_start)` when cold tier exists

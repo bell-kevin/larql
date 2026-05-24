@@ -158,6 +158,13 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
             let kv_ref_bytes =
                 larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
 
+            // Parse + validate --ffn-policy once before the engine loop
+            // (multi-engine sweep reuses the same validated policy).
+            // Q4K path accepts but doesn't yet honor — engine_runtime
+            // logs a warning if non-None.
+            let validated_policy =
+                parse_ffn_policy(args.ffn_policy.as_deref(), weights.num_layers)?;
+
             for engine_name in EngineKind::split_specs(engine_list) {
                 match EngineKind::from_name(&engine_name) {
                     Some(kind) => {
@@ -173,12 +180,14 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             kv_ref_bytes,
                             kind,
                             backend,
+                            validated_policy.as_ref(),
                             &args,
                         )?);
                     }
                     None => eprintln!(
-                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
-                        engine_name
+                        "unknown engine {:?} — supported: {}",
+                        engine_name,
+                        EngineKind::supported_names().join(", "),
                     ),
                 }
             }
@@ -190,6 +199,9 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("tokenize: {e}"))?;
             let kv_ref_bytes =
                 larql_kv::markov_residual::kv_memory_bytes_for_seq(&weights, token_ids.len());
+
+            let validated_policy =
+                parse_ffn_policy(args.ffn_policy.as_deref(), weights.num_layers)?;
 
             for engine_name in EngineKind::split_specs(engine_list) {
                 match EngineKind::from_name(&engine_name) {
@@ -205,12 +217,14 @@ pub fn run(args: BenchArgs) -> Result<(), Box<dyn std::error::Error>> {
                             kv_ref_bytes,
                             kind,
                             backend,
+                            validated_policy.as_ref(),
                             &args,
                         )?);
                     }
                     None => eprintln!(
-                        "unknown engine {:?} — supported: standard, no-cache, markov-rs, unlimited-context, turbo-quant, apollo",
-                        engine_name
+                        "unknown engine {:?} — supported: {}",
+                        engine_name,
+                        EngineKind::supported_names().join(", "),
                     ),
                 }
             }
@@ -370,4 +384,23 @@ fn auto_default_threads() -> usize {
     {
         0
     }
+}
+
+/// Parse + validate the `--ffn-policy <spec>` flag value. Returns
+/// `None` when the flag was omitted; `Some(validated)` when a spec
+/// was provided. Surfaces parse / validation errors with a `--ffn-policy:`
+/// prefix so the user sees which flag failed.
+fn parse_ffn_policy(
+    spec: Option<&str>,
+    num_layers: usize,
+) -> Result<Option<larql_inference::ffn_policy::ValidatedFfnLayerPolicy>, Box<dyn std::error::Error>>
+{
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let validated = larql_inference::ffn_policy::FfnLayerPolicy::from_spec(spec)
+        .map_err(|e| format!("--ffn-policy parse: {e}"))?
+        .validate_for(num_layers)
+        .map_err(|e| format!("--ffn-policy validation: {e}"))?;
+    Ok(Some(validated))
 }

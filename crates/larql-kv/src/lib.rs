@@ -276,6 +276,34 @@ impl EngineKind {
         }
     }
 
+    /// All engine names recognised by [`Self::from_name`] — bare names
+    /// only, no parameter syntax. Single source of truth for the
+    /// "supported engines" help text in CLI error messages so the list
+    /// doesn't drift when a new engine lands.
+    ///
+    /// The list contains the canonical name for each variant (the one
+    /// `display_name` returns). Aliases that `from_name` also accepts
+    /// (`full`/`fp32` for `standard`, `none`/`off` for `no-cache`,
+    /// etc.) are intentionally omitted — the help text shows users
+    /// the recommended spelling, not every accepted spelling.
+    ///
+    /// Adding a new engine variant **must** add a new entry here; the
+    /// `engine_kind_supported_names_covers_every_variant` test in
+    /// this module enforces that invariant via the parser.
+    pub fn supported_names() -> &'static [&'static str] {
+        &[
+            "standard",
+            "no-cache",
+            "markov-rs",
+            "markov-rs-codec",
+            "unlimited-context",
+            "turbo-quant",
+            "apollo",
+            "boundary-kv",
+            "boundary-per-layer",
+        ]
+    }
+
     /// Build a boxed engine, dispatching compute through `backend`.
     pub fn build(self, backend: Box<dyn larql_inference::EngineBackend>) -> Box<dyn KvEngine> {
         self.build_with_profiling(backend, false)
@@ -796,6 +824,61 @@ mod compliance_tests {
             Some(EngineKind::UnlimitedContext { window_size: 512 }) => {}
             other => panic!("unknown param should use default, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn supported_names_every_entry_parses_back_via_from_name() {
+        // Every name `supported_names()` advertises must be a name the
+        // parser actually accepts. Catches the failure mode where
+        // someone adds a variant to one side without the other.
+        for name in EngineKind::supported_names() {
+            let kind = EngineKind::from_name(name).unwrap_or_else(|| {
+                panic!("supported_names lists {name:?} but from_name rejected it")
+            });
+            assert_eq!(
+                kind.display_name(),
+                *name,
+                "supported_names entry {name:?} parses to a different display_name"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_names_covers_every_engine_kind_variant() {
+        // Build one of every variant via the parser, collect their
+        // canonical names, and verify supported_names() lists each.
+        // This is the test the doc comment refers to; adding a new
+        // EngineKind variant without adding a supported_names entry
+        // makes this test fail with a useful diff.
+        let one_of_each: Vec<&'static str> = [
+            "standard",
+            "no-cache",
+            "markov-rs",
+            "markov-rs-codec",
+            "unlimited-context",
+            "turbo-quant",
+            "apollo",
+            "boundary-kv",
+            "boundary-per-layer",
+        ]
+        .iter()
+        .map(|s| {
+            EngineKind::from_name(s)
+                .unwrap_or_else(|| panic!("test fixture {s:?} failed to parse"))
+                .display_name()
+        })
+        .collect();
+        for name in &one_of_each {
+            assert!(
+                EngineKind::supported_names().contains(name),
+                "EngineKind variant with display_name {name:?} is missing from supported_names"
+            );
+        }
+        assert_eq!(
+            EngineKind::supported_names().len(),
+            one_of_each.len(),
+            "supported_names and the variant set are out of sync"
+        );
     }
 
     #[test]

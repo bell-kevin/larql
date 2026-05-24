@@ -51,7 +51,10 @@ pub use predict::types::{
 // ── Re-exports: preserve all `crate::forward::*` paths ──
 
 pub use embed::embed_tokens_pub;
-pub use hooks::{CompositeHook, LayerHook, NoopHook, RecordHook, SteerHook, ZeroAblateHook};
+pub use hooks::{
+    AttnZeroHook, CompositeHook, FFNZeroHook, LayerHook, NoopHook, RecordHook, SteerHook,
+    ZeroAblateHook,
+};
 pub use infer_patched::{
     apply_knn_override, infer_patched, infer_patched_q4k, walk_trace_from_residuals,
     InferPatchedResult, KnnOverride, KNN_COSINE_THRESHOLD,
@@ -81,8 +84,8 @@ pub use target_delta::{TargetDelta, TargetDeltaOpts};
 pub use trace::{
     calibrate_scalar_gains, capture_decoy_residuals, capture_ffn_activation_matrix,
     capture_residuals, capture_spec_residuals, estimate_ffn_covariance, forward_to_layer,
-    trace_forward, trace_forward_full, trace_forward_full_hooked, trace_forward_with_ffn,
-    SpecCapture,
+    trace_forward, trace_forward_attn_only_capture_pre_o, trace_forward_attn_only_with_head_zero,
+    trace_forward_full, trace_forward_full_hooked, trace_forward_with_ffn, SpecCapture,
 };
 pub use vocab_proj::{
     embedding_neighbors, embedding_row, embedding_row_scaled, project_through_unembed,

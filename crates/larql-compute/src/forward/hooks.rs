@@ -168,6 +168,77 @@ impl LayerHook for ZeroAblateHook {
     }
 }
 
+/// Zeroes the FFN sublayer contribution at requested layers by snapshotting
+/// the residual after attention and restoring it at post-layer. The FFN
+/// computation still runs (so other hooks observing `on_ffn_activation` still
+/// fire) but its addition to the residual stream — along with any PLE / scalar
+/// adjustment applied inside the post-attention → post-layer step — is
+/// discarded.
+///
+/// Pair with [`AttnZeroHook`] for sublayer-decomposition forwards: one pass
+/// with each isolates the attention vs. FFN contribution to the final
+/// residual.
+pub struct FFNZeroHook {
+    pub layers: HashSet<usize>,
+    /// Per-layer snapshot taken in `on_post_attention`, consumed in
+    /// `on_post_layer`.
+    pub cache: HashMap<usize, Array2<f32>>,
+}
+
+impl FFNZeroHook {
+    pub fn for_layers<I: IntoIterator<Item = usize>>(layers: I) -> Self {
+        Self {
+            layers: layers.into_iter().collect(),
+            cache: HashMap::new(),
+        }
+    }
+}
+
+impl LayerHook for FFNZeroHook {
+    fn on_post_attention(&mut self, layer: usize, h: &mut Array2<f32>) {
+        if self.layers.contains(&layer) {
+            self.cache.insert(layer, h.clone());
+        }
+    }
+    fn on_post_layer(&mut self, layer: usize, h: &mut Array2<f32>) {
+        if let Some(saved) = self.cache.remove(&layer) {
+            h.assign(&saved);
+        }
+    }
+}
+
+/// Zeroes the attention sublayer contribution at requested layers by
+/// snapshotting the residual entering the layer and restoring it at
+/// post-attention. The attention computation still runs (so hooks observing
+/// `on_attention_weights` still fire) but its addition to the residual stream
+/// is discarded.
+pub struct AttnZeroHook {
+    pub layers: HashSet<usize>,
+    pub cache: HashMap<usize, Array2<f32>>,
+}
+
+impl AttnZeroHook {
+    pub fn for_layers<I: IntoIterator<Item = usize>>(layers: I) -> Self {
+        Self {
+            layers: layers.into_iter().collect(),
+            cache: HashMap::new(),
+        }
+    }
+}
+
+impl LayerHook for AttnZeroHook {
+    fn on_pre_layer(&mut self, layer: usize, h: &Array2<f32>) {
+        if self.layers.contains(&layer) {
+            self.cache.insert(layer, h.clone());
+        }
+    }
+    fn on_post_attention(&mut self, layer: usize, h: &mut Array2<f32>) {
+        if let Some(saved) = self.cache.remove(&layer) {
+            h.assign(&saved);
+        }
+    }
+}
+
 /// Adds `alpha * v` to the last-token row of the post-layer residual at
 /// requested layers. Implements lazarus's `steer_and_generate`.
 ///
@@ -440,6 +511,63 @@ mod tests {
     fn steer_hook_default_is_empty() {
         let hook = SteerHook::default();
         assert!(hook.steers.is_empty());
+    }
+
+    #[test]
+    fn ffn_zero_restores_post_attention_residual() {
+        let mut hook = FFNZeroHook::for_layers([0]);
+        let mut h: Array2<f32> = array![[1.0, 2.0], [3.0, 4.0]];
+        hook.on_post_attention(0, &mut h);
+        let after_ffn: Array2<f32> = array![[10.0, 20.0], [30.0, 40.0]];
+        let mut h_after = after_ffn.clone();
+        hook.on_post_layer(0, &mut h_after);
+        assert_eq!(
+            h_after,
+            array![[1.0, 2.0], [3.0, 4.0]],
+            "post_layer must be restored to the snapshot taken at post_attention"
+        );
+    }
+
+    #[test]
+    fn ffn_zero_only_affects_listed_layers() {
+        let mut hook = FFNZeroHook::for_layers([1]);
+        let mut h: Array2<f32> = array![[1.0, 2.0]];
+        hook.on_post_attention(0, &mut h);
+        let mut h_after: Array2<f32> = array![[99.0, 99.0]];
+        hook.on_post_layer(0, &mut h_after);
+        assert_eq!(
+            h_after,
+            array![[99.0, 99.0]],
+            "layer 0 is not in set — post_layer is untouched"
+        );
+    }
+
+    #[test]
+    fn attn_zero_restores_pre_layer_residual() {
+        let mut hook = AttnZeroHook::for_layers([0]);
+        let h_pre: Array2<f32> = array![[1.0, 2.0], [3.0, 4.0]];
+        hook.on_pre_layer(0, &h_pre);
+        let mut h_after_attn: Array2<f32> = array![[100.0, 200.0], [300.0, 400.0]];
+        hook.on_post_attention(0, &mut h_after_attn);
+        assert_eq!(
+            h_after_attn,
+            array![[1.0, 2.0], [3.0, 4.0]],
+            "post_attention must be restored to the pre_layer snapshot"
+        );
+    }
+
+    #[test]
+    fn attn_zero_only_affects_listed_layers() {
+        let mut hook = AttnZeroHook::for_layers([1]);
+        let h_pre: Array2<f32> = array![[1.0, 2.0]];
+        hook.on_pre_layer(0, &h_pre);
+        let mut h_after_attn: Array2<f32> = array![[99.0, 99.0]];
+        hook.on_post_attention(0, &mut h_after_attn);
+        assert_eq!(
+            h_after_attn,
+            array![[99.0, 99.0]],
+            "layer 0 is not in set — post_attention is untouched"
+        );
     }
 
     /// `SteerHook::on_post_layer` early-returns when h has zero rows or

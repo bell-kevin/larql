@@ -26,7 +26,7 @@ use larql_kv::accuracy_suite::needle::needle_tests;
 use larql_kv::accuracy_suite::prompts::{quick_20, KnowledgeSource};
 use larql_kv::accuracy_suite::runner::{
     compute_strategy_split, evaluate_conflict, evaluate_in_context, evaluate_parametric,
-    format_strategy_split,
+    format_strategy_split, EvalLabels,
 };
 use larql_kv::EngineKind;
 
@@ -60,7 +60,7 @@ fn parametric_corpus_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts[..4],
     );
 
@@ -68,12 +68,24 @@ fn parametric_corpus_runs_through_standard_engine() {
     for s in &scores {
         assert_eq!(s.strategy, "Standard");
         assert_eq!(s.knowledge_source, KnowledgeSource::Parametric);
-        assert!(!s.predicted_top1.is_empty(), "empty predicted_top1");
+        // Standard engine never skips a real prompt — every row must
+        // be Served and carry the score fields.
+        assert!(
+            s.outcome.is_served(),
+            "standard engine must serve, got {:?}",
+            s.outcome
+        );
+        let predicted = s
+            .predicted_top1
+            .as_deref()
+            .expect("served row has predicted_top1");
+        assert!(!predicted.is_empty(), "empty predicted_top1");
+        let bits = s.bits_per_token.expect("served row has bits_per_token");
         // Real models on real prompts should produce finite bits.
         assert!(
-            s.bits_per_token.is_finite(),
+            bits.is_finite(),
             "bits should be finite on a real model, got {} for prompt {:?}",
-            s.bits_per_token,
+            bits,
             s.prompt
         );
     }
@@ -104,14 +116,16 @@ fn in_context_needle_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &needles,
     );
     assert_eq!(scores.len(), 2);
     for s in &scores {
         assert_eq!(s.knowledge_source, KnowledgeSource::InContext);
         assert_eq!(s.category, "needle");
-        assert!(s.bits_per_token.is_finite() || s.bits_per_token.is_nan());
+        assert!(s.outcome.is_served(), "standard engine must serve needles");
+        let bits = s.bits_per_token.expect("served row has bits_per_token");
+        assert!(bits.is_finite() || bits.is_nan());
     }
 }
 
@@ -131,23 +145,42 @@ fn conflict_corpus_runs_through_standard_engine() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts,
     );
     assert_eq!(scores.len(), prompts.len());
     for s in &scores {
         assert!(
-            !(s.followed_context && s.parametric_fallback),
+            s.outcome.is_served(),
+            "standard engine must serve, got {:?}",
+            s.outcome
+        );
+        let followed = s.followed_context.expect("served row has followed_context");
+        let fallback = s
+            .parametric_fallback
+            .expect("served row has parametric_fallback");
+        assert!(
+            !(followed && fallback),
             "followed and fallback are mutually exclusive by construction"
         );
     }
     eprintln!(
         "conflict scores: follow={} fallback={} other={}",
-        scores.iter().filter(|s| s.followed_context).count(),
-        scores.iter().filter(|s| s.parametric_fallback).count(),
         scores
             .iter()
-            .filter(|s| !s.followed_context && !s.parametric_fallback)
+            .filter(|s| s.followed_context == Some(true))
+            .count(),
+        scores
+            .iter()
+            .filter(|s| s.parametric_fallback == Some(true))
+            .count(),
+        scores
+            .iter()
+            .filter(|s| {
+                s.outcome.is_served()
+                    && s.followed_context != Some(true)
+                    && s.parametric_fallback != Some(true)
+            })
             .count(),
     );
 }
@@ -171,7 +204,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &prompts[..4],
     );
     all_scores.extend(evaluate_in_context(
@@ -179,7 +212,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &needles,
     ));
     let conflict_scores = evaluate_conflict(
@@ -187,7 +220,7 @@ fn split_table_renders_for_real_model_run() {
         weights,
         &ffn,
         tokenizer,
-        "Standard",
+        EvalLabels::for_kv_engine("Standard"),
         &conflicts,
     );
 

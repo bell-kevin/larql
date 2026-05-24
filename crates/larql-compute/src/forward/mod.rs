@@ -19,7 +19,10 @@ pub mod predict;
 pub mod vocab_proj;
 
 pub use embed::embed_tokens_pub;
-pub use hooks::{CompositeHook, LayerHook, NoopHook, RecordHook, SteerHook, ZeroAblateHook};
+pub use hooks::{
+    AttnZeroHook, CompositeHook, FFNZeroHook, LayerHook, NoopHook, RecordHook, SteerHook,
+    ZeroAblateHook,
+};
 pub use layer::{
     run_attention, run_attention_inner, run_attention_public, run_attention_with_kv_cache, run_ffn,
     run_layer_with_capture, run_layer_with_capture_hooked, run_layer_with_ffn,

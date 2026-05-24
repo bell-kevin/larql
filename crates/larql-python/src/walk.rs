@@ -5,7 +5,7 @@
 //! Peak RSS: ~one layer of weights at a time (OS manages page eviction).
 
 use ndarray::{Array1, Array2};
-use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
@@ -18,7 +18,9 @@ use larql_inference::forward::{
     logit_lens_topk, patch_and_trace_with_ffn,
     project_through_unembed as li_project_through_unembed, trace_forward_full_hooked,
     track_race as li_track_race, track_token as li_track_token,
-    unembedding_row as li_unembedding_row, RecordHook, SteerHook, ZeroAblateHook,
+    trace_forward_attn_only_capture_pre_o, trace_forward_attn_only_with_head_zero,
+    unembedding_row as li_unembedding_row, AttnZeroHook, FFNZeroHook, RecordHook, SteerHook,
+    ZeroAblateHook,
 };
 use larql_inference::{predict_with_ffn, ModelWeights, WalkFfn};
 use larql_kv::generation::generate_cached_hooked;
@@ -624,6 +626,187 @@ impl PyWalkModel {
             out.set_item(*layer, mat.clone().into_pyarray(py))?;
         }
         Ok(out)
+    }
+
+    /// Run a forward pass with the **FFN sublayer skipped at every layer**
+    /// (the FFN computation still runs but its addition to the residual stream
+    /// is discarded) and capture the resulting post-layer residual at each
+    /// requested layer. Used for attention-vs-FFN decomposition: this gives
+    /// the "attention-only contribution" residual stream.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_attn_only<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let n_layers = self.weights.num_layers;
+        let mut ffn_zero = FFNZeroHook::for_layers(0..n_layers);
+        let mut record = RecordHook::for_layers(layers.iter().copied());
+        {
+            let mut composite = larql_inference::forward::CompositeHook::new(vec![
+                &mut ffn_zero as &mut dyn larql_inference::forward::LayerHook,
+                &mut record as &mut dyn larql_inference::forward::LayerHook,
+            ]);
+            let _ = trace_forward_full_hooked(
+                &self.weights,
+                &token_ids,
+                &layers,
+                false,
+                0,
+                false,
+                &walk_ffn,
+                &mut composite,
+            );
+        }
+
+        let out = PyDict::new(py);
+        for (layer, mat) in record.post_layer.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Run a forward pass with the **attention sublayer skipped at every
+    /// layer** (the attention computation still runs but its addition to the
+    /// residual stream is discarded) and capture the resulting post-layer
+    /// residual at each requested layer. Used for attention-vs-FFN
+    /// decomposition: this gives the "FFN-only contribution" residual stream.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_ffn_only<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let walk_ffn = WalkFfn::new(&self.weights, &self.index, self.top_k);
+        let n_layers = self.weights.num_layers;
+        let mut attn_zero = AttnZeroHook::for_layers(0..n_layers);
+        let mut record = RecordHook::for_layers(layers.iter().copied());
+        {
+            let mut composite = larql_inference::forward::CompositeHook::new(vec![
+                &mut attn_zero as &mut dyn larql_inference::forward::LayerHook,
+                &mut record as &mut dyn larql_inference::forward::LayerHook,
+            ]);
+            let _ = trace_forward_full_hooked(
+                &self.weights,
+                &token_ids,
+                &layers,
+                false,
+                0,
+                false,
+                &walk_ffn,
+                &mut composite,
+            );
+        }
+
+        let out = PyDict::new(py);
+        for (layer, mat) in record.post_layer.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Attn-only forward with **per-layer pre-W_O head zeroing**.
+    ///
+    /// Like `forward_attn_only` (FFN/PLE/scalar skipped at every layer) but at
+    /// each layer L listed in `head_zeros` the listed query-head slices are
+    /// zeroed before the W_O projection. With an empty `head_zeros` list this
+    /// matches `forward_attn_only` exactly (useful as a self-consistency
+    /// check).
+    ///
+    /// `head_zeros` is a list of `(layer, [head_idx, ...])` tuples.
+    ///
+    /// Returns `dict[layer_index] -> numpy.ndarray (seq_len, hidden_size)`.
+    #[pyo3(signature = (prompt, head_zeros, layers))]
+    fn forward_attn_only_head_zero<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        head_zeros: Vec<(usize, Vec<usize>)>,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let head_zero_map: HashMap<usize, Vec<usize>> = head_zeros.into_iter().collect();
+        let captures =
+            trace_forward_attn_only_with_head_zero(&self.weights, &token_ids, &layers, &head_zero_map);
+        let out = PyDict::new(py);
+        for (layer, mat) in captures.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Attn-only forward returning **pre-W_O per-head outputs** at each
+    /// requested layer. FFN/PLE/scalar are skipped at every layer (matching
+    /// `forward_attn_only` semantics). The returned array has shape
+    /// `(seq_len, num_q_heads * head_dim)` per layer; slice per-head as
+    /// `pre_o[:, h * head_dim : (h + 1) * head_dim]`.
+    ///
+    /// Use `num_q_heads_for_layer(L)` and `head_dim_for_layer(L)` to get the
+    /// strides.
+    #[pyo3(signature = (prompt, layers))]
+    fn forward_attn_only_capture_pre_o<'py>(
+        &self,
+        py: Python<'py>,
+        prompt: &str,
+        layers: Vec<usize>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let token_ids = self.encode(prompt)?;
+        let captures = trace_forward_attn_only_capture_pre_o(&self.weights, &token_ids, &layers);
+        let out = PyDict::new(py);
+        for (layer, mat) in captures.iter() {
+            out.set_item(*layer, mat.clone().into_pyarray(py))?;
+        }
+        Ok(out)
+    }
+
+    /// Returns the number of query heads at the given layer (Gemma 3 4B has 8).
+    fn num_q_heads_for_layer(&self, layer: usize) -> PyResult<usize> {
+        Ok(self.weights.arch.num_q_heads_for_layer(layer))
+    }
+
+    /// Returns the per-head dimension at the given layer (Gemma 3 4B uses 256).
+    fn head_dim_for_layer(&self, layer: usize) -> PyResult<usize> {
+        Ok(self.weights.arch.head_dim_for_layer(layer))
+    }
+
+    /// Returns the W_O slice for a specific head at a specific layer.
+    /// Shape: (head_dim, hidden_size). Used for projecting per-head pre-W_O
+    /// outputs into residual space.
+    fn w_o_for_head<'py>(
+        &self,
+        py: Python<'py>,
+        layer: usize,
+        head: usize,
+    ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+        let head_dim = self.weights.arch.head_dim_for_layer(layer);
+        let key = self.weights.arch.attn_o_key(layer);
+        let w_o = self
+            .weights
+            .tensors
+            .get(&key)
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err(format!("missing {key}")))?;
+        let start = head * head_dim;
+        let end = start + head_dim;
+        if end > w_o.ncols() {
+            return Err(pyo3::exceptions::PyIndexError::new_err(format!(
+                "head {head} out of range for layer {layer} (W_O has {} cols)",
+                w_o.ncols()
+            )));
+        }
+        // W_O has shape (hidden_size, n_heads * head_dim); the head slice is columns
+        // [start..end]. We want (head_dim, hidden_size) so each row is "this column of
+        // pre_o contributes this residual delta". Transpose the slice.
+        let slice = w_o.slice(ndarray::s![.., start..end]);
+        Ok(slice.t().to_owned().into_pyarray(py))
     }
 
     /// Zero-ablate the post-layer residual at the listed `ablate_layers`,

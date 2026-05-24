@@ -159,3 +159,178 @@ impl UnlimitedContextEngine {
         Some(hidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the W1-GPU dispatch path. `UnlimitedContextEngine`
+    //! takes a non-optional `window_size: usize`; W10 mask cascade is
+    //! gated on whether `current_window_kv` is dropped (the
+    //! `LARQL_W10_DISABLE` env var). Tests are `#[serial]` because
+    //! `w10_enabled()` reads a process-global env var.
+
+    use larql_inference::cpu_engine_backend;
+    use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
+    use serial_test::serial;
+
+    use super::*;
+    use crate::engines::unlimited_context::engine::UnlimitedContextEngine;
+
+    fn fixture(window_size: usize) -> (UnlimitedContextEngine, ModelWeights, VectorIndex) {
+        let weights = make_test_q4k_weights();
+        let index = make_test_q4k_vindex(&weights);
+        let engine = UnlimitedContextEngine::with_backend(window_size, cpu_engine_backend());
+        (engine, weights, index)
+    }
+
+    fn set_w10_disable(disabled: bool) {
+        if disabled {
+            std::env::set_var("LARQL_W10_DISABLE", "1");
+        } else {
+            std::env::remove_var("LARQL_W10_DISABLE");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
+        set_w10_disable(false);
+        let weights = make_test_q4k_weights();
+        let empty_index = larql_vindex::VectorIndex::new(
+            vec![None; weights.num_layers],
+            vec![None; weights.num_layers],
+            weights.num_layers,
+            weights.hidden_size,
+        );
+        let mut engine = UnlimitedContextEngine::with_backend(4, cpu_engine_backend());
+        let mut w = weights;
+        assert!(engine
+            .try_prefill_via_dispatch(&mut w, &empty_index, &[0u32, 1])
+            .is_none());
+        assert!(engine.kv_handle.is_none());
+        assert!(engine.current_window_kv.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_drops_window_kv_under_w10_default() {
+        // W10 on by default → drop_window_kv_shadow = true. The engine
+        // doesn't populate `current_window_kv`; Metal's kv cache is the
+        // truth.
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(4);
+        let h = engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2])
+            .expect("prefill");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert!(engine.current_window_kv.is_none());
+        assert_eq!(engine.current_window_kv_len, 3);
+        assert_eq!(engine.current_window_tokens, vec![0u32, 1, 2]);
+        assert!(engine.kv_handle.is_some());
+        assert!(engine.last_hidden.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn try_prefill_via_dispatch_populates_window_kv_with_w10_disabled() {
+        // W10 off → engine pre-allocates `[window_cap, kv_dim]` per
+        // layer and copies the prefill K/V rows in.
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(8);
+        let res = engine.try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1, 2]);
+        set_w10_disable(false);
+        res.expect("prefill");
+        let kv = engine
+            .current_window_kv
+            .as_ref()
+            .expect("W10-disabled keeps window_kv");
+        assert_eq!(kv.len(), weights.num_layers);
+        // Buffer is `[window_cap, kv_dim]` where window_cap = max(window, prompt_len) = 8.
+        assert_eq!(kv[0].0.shape()[0], 8);
+        assert_eq!(engine.current_window_kv_len, 3);
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_without_prefill_returns_none() {
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(4);
+        // kv_handle is None → early return.
+        assert!(engine
+            .decode_step_via_dispatch(&mut weights, &index, 0)
+            .is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_h_only_skips_kv_append() {
+        // W10 default + window_kv dropped at prefill → HOnly mask.
+        // The dispatch decode runs through the `if !matches!(mask, HOnly)`
+        // skip branch and still bumps the per-step counters.
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(4);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let kv_len_before = engine.current_window_kv_len;
+        let h = engine
+            .decode_step_via_dispatch(&mut weights, &index, 2)
+            .expect("decode");
+        assert_eq!(h.shape(), &[1, weights.hidden_size]);
+        assert_eq!(engine.current_window_kv_len, kv_len_before + 1);
+        assert_eq!(engine.current_window_tokens.last(), Some(&2u32));
+        assert!(
+            engine.current_window_kv.is_none(),
+            "HOnly mask keeps window_kv None"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_full_mask_appends_kv_with_w10_disabled() {
+        // W10 off → Full mask. Each layer's K/V row blits into the
+        // pre-allocated window_kv buffer at `current_window_kv_len`.
+        set_w10_disable(true);
+        let (mut engine, mut weights, index) = fixture(8);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32, 1])
+            .expect("prefill");
+        let kv_len_before = engine.current_window_kv_len;
+        let res = engine.decode_step_via_dispatch(&mut weights, &index, 2);
+        set_w10_disable(false);
+        res.expect("decode");
+        assert_eq!(engine.current_window_kv_len, kv_len_before + 1);
+        let kv = engine.current_window_kv.as_ref().unwrap();
+        // The new row sits at position `kv_len_before` (= 2) of every
+        // layer's buffer. Non-zero rows imply the assign actually ran.
+        for slot in kv {
+            let row = slot.0.row(kv_len_before);
+            let any_non_zero = row.iter().any(|v| *v != 0.0);
+            assert!(
+                any_non_zero,
+                "K row at position {kv_len_before} should be populated"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn decode_step_via_dispatch_fires_window_auto_close() {
+        // window=2: prefill 2 → token count == window → close_window
+        // fires inside the dispatch decode and resets the window.
+        set_w10_disable(false);
+        let (mut engine, mut weights, index) = fixture(2);
+        engine
+            .try_prefill_via_dispatch(&mut weights, &index, &[0u32])
+            .expect("prefill");
+        let cp_before = engine.checkpoints.len();
+        engine
+            .decode_step_via_dispatch(&mut weights, &index, 1)
+            .expect("decode that triggers window-close");
+        // close_window() emits a checkpoint and resets
+        // current_window_tokens (the legacy emit path).
+        assert!(
+            engine.checkpoints.len() > cp_before,
+            "window auto-close should emit a checkpoint"
+        );
+    }
+}

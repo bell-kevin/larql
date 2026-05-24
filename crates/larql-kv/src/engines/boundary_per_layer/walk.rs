@@ -202,3 +202,117 @@ pub(super) fn run_decode(
 
     Some((last_row(&h_new), rs))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use larql_compute::CpuBackend;
+    use larql_inference::ffn::NullFfn;
+    use larql_inference::test_utils::make_test_weights;
+
+    #[test]
+    fn run_prefill_no_window_returns_state_with_no_cold_tier() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (hidden, rs) = run_prefill(&weights, &ffn, &backend, &policy, None, &[0, 1, 2])
+            .expect("prefill should succeed");
+        assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+        assert_eq!(rs.next_position, 3);
+        assert!(rs.cold_encoded.is_none());
+        assert!(rs.cold_kv.is_none());
+        for slab in &rs.stored {
+            assert_eq!(slab.shape()[0], 3);
+        }
+    }
+
+    #[test]
+    fn run_prefill_with_small_window_evicts_to_cold_tier() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        assert!(rs.cold_encoded.is_some(), "overflow → cold_encoded");
+        assert!(rs.cold_kv.is_some(), "overflow → cold_kv pre-computed");
+        let cold_kv = rs.cold_kv.as_ref().unwrap();
+        for (k, _v) in cold_kv {
+            assert_eq!(k.shape()[0], 1);
+        }
+    }
+
+    #[test]
+    fn run_decode_extends_hot_tier_when_below_window() {
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(4), &[0]).unwrap();
+        assert!(rs.cold_encoded.is_none());
+
+        let (hidden, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 1).unwrap();
+        assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+        assert_eq!(rs_after.next_position, 2);
+        for slab in &rs_after.stored {
+            assert_eq!(slab.shape()[0], 2);
+        }
+        assert!(rs_after.cold_encoded.is_none());
+    }
+
+    #[test]
+    fn run_decode_uses_cold_encoded_when_cold_kv_is_none() {
+        // Defensive branch: cold_kv is None but cold_encoded is Some
+        // and non-empty. In practice run_prefill always builds both
+        // together, but the code carries a fallback path for the
+        // case where they get desynchronised. Hand-construct that
+        // state to exercise the decode path.
+        use crate::engines::markov_residual_codec::codec::ColdResidualCodec;
+
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+
+        // First build a normal state with overflow.
+        let (_, mut rs) =
+            run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        // Now wipe the pre-computed cold_kv. cold_encoded stays
+        // populated. Decode should recompute K/V from the decoded
+        // cold residuals.
+        rs.cold_kv = None;
+        // Sanity: the cold_encoded still carries the evicted row.
+        assert!(rs.cold_encoded.as_ref().unwrap()[0].n_positions > 0);
+
+        let _ = ColdResidualCodec::Bf16; // keep import live
+        let (hidden, _) = run_decode(&weights, &ffn, &backend, &policy, rs, 3)
+            .expect("decode should succeed without cold_kv");
+        assert_eq!(hidden.shape(), &[1, weights.hidden_size]);
+    }
+
+    #[test]
+    fn run_decode_promotes_to_cold_tier_on_overflow() {
+        // Prefill 3 with window=2 → 1 in cold. Decode 1 → 2 in cold.
+        // Exercises Some(layers) arm of cold_encoded match.
+        let weights = make_test_weights();
+        let backend = CpuBackend;
+        let ffn = NullFfn;
+        let policy = BoundaryLayerPolicy::bf16_uniform("test", weights.num_layers);
+        let (_, rs) = run_prefill(&weights, &ffn, &backend, &policy, Some(2), &[0, 1, 2]).unwrap();
+        let initial = rs
+            .cold_encoded
+            .as_ref()
+            .map(|l| l[0].n_positions)
+            .unwrap_or(0);
+        assert_eq!(initial, 1);
+
+        let (_, rs_after) = run_decode(&weights, &ffn, &backend, &policy, rs, 3).unwrap();
+        let after = rs_after
+            .cold_encoded
+            .as_ref()
+            .map(|l| l[0].n_positions)
+            .unwrap_or(0);
+        assert_eq!(after, 2);
+        assert_eq!(rs_after.next_position, 4);
+    }
+}
