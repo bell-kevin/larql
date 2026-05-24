@@ -268,22 +268,17 @@ impl MarkovResidualEngine {
 #[cfg(test)]
 mod tests {
     //! Coverage for the W1-GPU dispatch path. Drives `CpuBackend` via
-    //! the synthetic Q4K fixture; W10 mask cascade is on by default,
-    //! so windowed configurations hit the `HOnly` path and windowless
-    //! configurations hit `None`. The `Full` path is exercised with
-    //! `LARQL_W10_DISABLE=1`.
-    //!
-    //! Every test is `#[serial]` because `w10_enabled()` reads the
-    //! process-global `LARQL_W10_DISABLE` env var — running in parallel
-    //! would race the env state. Each test resets the env at start via
-    //! [`set_w10_disable`] so prior runs can't leak.
+    //! the synthetic Q4K fixture. W10 mask cascade is exercised via
+    //! [`crate::engines::set_w10_disabled_override`] — a per-thread
+    //! override so tests don't race other parallel tests that also
+    //! consult `w10_enabled()`.
 
     use larql_inference::cpu_engine_backend;
     use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-    use serial_test::serial;
 
     use super::*;
     use crate::engines::markov_residual::engine::MarkovResidualEngine;
+    use crate::engines::set_w10_disabled_override;
 
     fn fixture(window_size: Option<usize>) -> (MarkovResidualEngine, ModelWeights, VectorIndex) {
         let weights = make_test_q4k_weights();
@@ -292,18 +287,14 @@ mod tests {
         (engine, weights, index)
     }
 
-    /// Force `LARQL_W10_DISABLE` to a known state. Pass `true` for the
-    /// Full-mask path; `false` for the cascade-on default.
+    /// Pin W10 cascade state for this thread. `true` simulates
+    /// `LARQL_W10_DISABLE=1` (Full mask); `false` simulates the
+    /// default-on cascade (HOnly / None masks).
     fn set_w10_disable(disabled: bool) {
-        if disabled {
-            std::env::set_var("LARQL_W10_DISABLE", "1");
-        } else {
-            std::env::remove_var("LARQL_W10_DISABLE");
-        }
+        set_w10_disabled_override(Some(disabled));
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
         set_w10_disable(false);
         let weights = make_test_q4k_weights();
@@ -323,7 +314,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowed_keeps_stored_under_w10_default() {
         set_w10_disable(false);
         // window=Some + default env → drop_hot_kv_shadow=true,
@@ -350,7 +340,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowless_drops_stored_shadow_under_w10() {
         set_w10_disable(false);
         // window=None + default env → both drop_hot_kv_shadow and
@@ -370,7 +359,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_full_mask_path_with_w10_disabled() {
         // LARQL_W10_DISABLE=1 → drop_hot_kv_shadow=false; both shadows
         // populated (Full mask in decode).
@@ -385,7 +373,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(Some(4));
@@ -396,7 +383,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_windowed_appends_h_in_under_honly() {
         set_w10_disable(false);
         // window=Some + default env → mask=HOnly. hot_len grows by 1;
@@ -417,7 +403,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_windowless_uses_none_mask() {
         set_w10_disable(false);
         // window=None + default env → mask=None; stored stays empty,
@@ -440,7 +425,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_full_mask_appends_hot_kv_with_w10_disabled() {
         // Full mask path: appends to BOTH stored and hot_kv on every layer.
         set_w10_disable(true);
@@ -458,7 +442,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_with_profiling_records_stages() {
         set_w10_disable(false);
         let (engine, mut weights, index) = fixture(Some(8));

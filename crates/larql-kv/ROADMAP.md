@@ -47,15 +47,15 @@ entirely (W10 — engine-side state lives on GPU until window-close).
   - in-crate `benches/engine_decode.rs` (criterion: dispatch helpers + Standard parity)
 - Coverage policy: 90 % line coverage per source file (see
   `coverage-policy.json`); CI gate at `make larql-kv-coverage-policy`.
-  Workspace `larql-kv` lib total: **95.55% lines, 95.40% regions, 94.49%
-  functions** (2026-05-17 evening, up from 92.12% earlier the same day).
-  **All 43 files now ≥90% lines; debt baselines cleared from policy
-  file.** The post-Phase-2 push lifted `accuracy_suite/measurement.rs`
-  (77→99%), `accuracy_suite/runner.rs` (75→94%), `vindex_compare.rs`
-  (65→97%), and `engines/apollo/store.rs` (89→92%) by adding
-  formatter + driver tests against the synthetic fixtures; the
-  Phase-2 engines (`unlimited_context/engine.rs`, `turbo_quant/engine.rs`,
-  `apollo/engine.rs`) all land ≥92% on the new `*_via_executor` methods.
+  Workspace `larql-kv` lib total: **95.62% lines, 95.43% regions, 95.50%
+  functions** (2026-05-24 evening, post coverage-debt clearance).
+  **All 61 files at ≥90% lines; debt baselines cleared from policy
+  file.** The 2026-05-24 push lifted the five `engines/*/dispatch.rs`
+  files (range 7.95–80.68% → 93.57–97.85%) and
+  `engines/markov_residual/compute.rs` (86.85→95.30%). See "Closed
+  (recent)" entry for the thread-local-override pattern that makes
+  the env-gated paths in `compute.rs` and the W10 mask cascade in
+  the dispatch files testable without process-env mutation.
 
 ## Architectural cuts (2026-05-17)
 
@@ -125,95 +125,66 @@ Metal calls `larql_inference::vindex::fused_prefill`.
 
 ## Coverage debt
 
-**Status (2026-05-24):** six files below the 90% per-file floor after
-the Phase-2 dispatch additions and the env-var-gated diagnostic
-paths in `compute.rs` drifted past the 2026-05-17 cleared state. The
-post-Item-2 cross-product work added five new files (`runner/*.rs`)
-all above 90%; the regression is in older engine internals that
-weren't covered when the dispatch paths landed in May.
+**Status (2026-05-24 — CLOSED.)** All six files below the 90% per-file
+floor have been lifted; `make larql-kv-coverage-policy` passes
+against fresh `summary.json` regeneration. Workspace total 95.62%
+lines, 61/61 files at ≥90%, 0 debt baselines in
+`coverage-policy.json`.
 
-| File | Coverage | Lift path |
-|---|---:|---|
-| `engines/markov_residual/compute.rs` | 86.85% | env-var-gated paths (`LARQL_MARKOV_WALK_KV_DIAG`, `_FORCE_F32`, `_TOPK`) — needs `serial_test` crate or config-injection refactor |
-| `engines/unlimited_context/dispatch.rs` | 59.09% | needs mock `EngineBackend` infrastructure |
-| `engines/markov_residual/dispatch.rs` | 77.51% | needs mock `EngineBackend` infrastructure |
-| `engines/markov_residual_codec/dispatch.rs` | 80.68% | needs mock `EngineBackend` infrastructure |
-| `engines/turbo_quant/dispatch.rs` | 9.35% | needs mock `EngineBackend` infrastructure |
-| `engines/boundary_per_layer/dispatch.rs` | 7.95% | needs mock `EngineBackend` infrastructure |
+| File | Pre | Post |
+|---|---:|---:|
+| `engines/markov_residual/compute.rs` | 86.85% | **95.30%** |
+| `engines/unlimited_context/dispatch.rs` | 59.09% | **97.24%** |
+| `engines/markov_residual/dispatch.rs` | 77.51% | **96.78%** |
+| `engines/markov_residual_codec/dispatch.rs` | 80.68% | **97.72%** |
+| `engines/turbo_quant/dispatch.rs` | 9.35% | **97.85%** |
+| `engines/boundary_per_layer/dispatch.rs` | 7.95% | **93.57%** |
 
-Progress 2026-05-24 (session-level): lifted five files above the
-floor (cold_tier 88→100%, executor 85→90.6%, walk 84→95%, engine
-83→90%, store 86→99.6%) and improved compute.rs from 81→86.85%
-without env-var test infrastructure. 37 new tests across the five
-fixed files; clippy clean; zero regressions.
+**Implementation summary.** No new shared mock infrastructure was
+needed: `CpuBackend` (via `cpu_engine_backend()`) already implements
+`coarse_*_with_state` for the synthetic Q4K fixture
+(`make_test_q4k_weights` + `make_test_q4k_vindex`), which drives
+every dispatch happy-path through real per-layer state capture.
+~50 new `#[cfg(test)] mod tests` cases added inline per dispatch
+file plus ~10 env-var-gated cases in `compute.rs`. Zero regressions;
+`make larql-kv-ci` passes.
 
-### What's left
+**Env-var-gated paths — thread-local override pattern.** The
+`LARQL_MARKOV_*` (compute.rs walk-KV diagnostics) and
+`LARQL_W10_DISABLE` (dispatch mask cascade) helpers were
+near-impossible to test safely under `cargo test --jobs N`: setting
+process-global env from one test races every other parallel test
+that consults the same var (caught a real flake in
+`prefill_with_overflow_creates_encoded_cold_tier`). Resolution: each
+env helper now consults a per-thread `RefCell` override map
+*before* falling back to `std::env::var`. Tests inject values into
+the thread-local; production reads env unchanged. No `serial_test`
+crate needed, no `#[serial]` annotations, no env mutation. The
+helpers:
 
-**Sub-project A — mock `EngineBackend` infrastructure (5 files).** All
-five remaining dispatch files call
-`backend.coarse_prefill_with_state` and
-`backend.coarse_decode_step_with_state_masked` — the GPU-dispatch
-surface that only `MetalBackend` implements meaningfully today. The
-existing 59–80% coverage on three of them comes from
-`tests/dispatch_parity.rs` (integration tests against real engines);
-the 0-10% files (`boundary_per_layer/dispatch.rs`,
-`turbo_quant/dispatch.rs`) aren't even reached by those.
+- `compute.rs::read_markov_env(key)` + `set_markov_env_override(...)` /
+  `clear_markov_env_overrides()` (test-only).
+- `engines/mod.rs::w10_enabled()` + `set_w10_disabled_override(...)`
+  (test-only).
 
-The lift requires a shared test-only `EngineBackend` impl that
-returns synthetic `PerLayerDecodeState` payloads conformant with the
-trait. Once built, each dispatch file gets ~5 unit tests exercising
-prefill happy-path, prefill no-state-dump fallback, decode happy-path,
-decode `StateDumpMask::HOnly` / `None` cascades. Open question: where
-the mock lives — `larql-inference::test_utils` (next to
-`make_test_weights`) or a new `larql-kv/src/test_utils.rs` that
-imports the trait. The former is more reusable across crates; the
-latter is local to where the mock is consumed.
+**Open design questions — resolved by the work above.**
 
-Estimated scope: ~1 hour for the mock infra + 30 min per dispatch
-file = 3-4 hours total.
+1. *Mock `EngineBackend` location* — moot. `CpuBackend` is the mock;
+   nothing new was added.
+2. *`serial_test` vs config-injection refactor* — chose neither.
+   Thread-local override (per-test isolation without process
+   mutation) is the third option and the right one.
+3. *GPU-only dispatch branches* — non-issue at current coverage.
+   Every dispatch file lands at ≥93% via the CPU happy path; the
+   Metal-only `StateDumpMask::Full` blit branches are exercised
+   indirectly by `CpuBackend`'s in-process implementation. No
+   `cfg`-gating needed.
 
-**Sub-project B — `compute.rs` env-var path coverage (1 file).** The
-remaining ~7% gap is the diagnostic + force-f32 code paths gated on
-`LARQL_MARKOV_WALK_KV_DIAG`, `LARQL_MARKOV_KV_FORCE_F32`,
-`LARQL_MARKOV_WALK_KV_TOPK`, `LARQL_MARKOV_WALK_KV_SELECT_AT`. These
-read process env vars at decode time — testing them in parallel
-requires `serial_test` (or similar) to serialise `env::set_var` calls
-without racing other tests. Alternative: refactor the helpers to
-take an explicit config struct argument; the env-var read becomes a
-single thin caller and the tests can pass values directly without
-touching the global env.
-
-Estimated scope: 45 min for `serial_test` integration, 1-2 hours for
-the config-injection refactor.
-
-**Acceptance criterion.** `make larql-kv-coverage-policy` passes
-against a *freshly regenerated* `coverage/larql-kv/summary.json`
-(via `make larql-kv-coverage-summary`, not the cached JSON). 2026-05-24
-note: the gate was previously passing against a stale JSON that
-predated the dispatch additions — fresh regeneration surfaced the
-debt. Future commits to engine internals should run
-`make larql-kv-coverage-summary` locally, not just
-`make larql-kv-coverage-policy`.
-
-### Open design questions
-
-1. **Should the mock `EngineBackend` live in `larql-inference::test_utils`
-   or in `larql-kv`?** Reusable-across-crates favours the former;
-   local-to-consumers favours the latter.
-2. **`serial_test` crate vs env-var-injection refactor for `compute.rs`?**
-   The crate is a small dependency add; the refactor is a more
-   invasive change but yields more testable code long-term.
-3. **Acceptance for the GPU-only branches.** Some lines in the
-   dispatch files only fire on a real Metal backend (e.g.
-   `StateDumpMask::Full` paths that exercise the cached-decode
-   kernel). Mock-backend tests can verify the *plumbing* but not
-   the *kernel* — should those lines be excluded via
-   `#[cfg(not(test_coverage))]` or similar, or accepted as
-   coverable-only-via-integration-tests?
-
-These are blocking on the implementation slice landing, not the
-coverage-debt resolution itself; the design choices fall during the
-sub-project work, not before.
+**Lesson for future env-gated production code:** add the
+thread-local override at the same time as the `std::env::var` read,
+not as a follow-on. Saves the future test-author from picking
+between flaky parallel tests, `serial_test` ceremony, or a
+config-injection refactor.
 
 ## Open work
 
@@ -808,6 +779,38 @@ were implementation).
   spec) makes composition cleaner.
 
 ## Closed (recent)
+
+- **2026-05-24 — Coverage debt CLEARED.** All six files below the
+  90% per-file floor lifted; `make larql-kv-coverage-policy` passes
+  against fresh `summary.json` regeneration. Workspace total 95.62%
+  lines, 61/61 files at ≥90%, 0 debt baselines remaining.
+
+  Files lifted (pre → post): `turbo_quant/dispatch` 9.35→97.85%,
+  `boundary_per_layer/dispatch` 7.95→93.57%, `unlimited_context/dispatch`
+  59.09→97.24%, `markov_residual/dispatch` 77.51→96.78%,
+  `markov_residual_codec/dispatch` 80.68→97.72%,
+  `markov_residual/compute` 86.85→95.30%.
+
+  Approach inverted both pre-baked design assumptions:
+  - **No new shared mock `EngineBackend`** — `CpuBackend` (via
+    `cpu_engine_backend()`) already implements `coarse_*_with_state`
+    when driven against the synthetic Q4K fixture
+    (`make_test_q4k_weights` + `make_test_q4k_vindex`), so every
+    dispatch happy-path tested end-to-end without new infrastructure.
+  - **No `serial_test` crate** — env-gated paths
+    (`LARQL_MARKOV_WALK_KV_*`, `LARQL_W10_DISABLE`) instead gained
+    a per-thread `RefCell` override that production helpers consult
+    *before* `std::env::var`. Tests inject without touching the
+    process env; no race with other parallel tests. New helpers:
+    `compute.rs::set_markov_env_override(...)`,
+    `engines/mod.rs::set_w10_disabled_override(...)` (both
+    `#[cfg(test)]` only).
+
+  Test deltas: larql-kv lib 663 → 712 (+49). Zero regressions
+  (5/5 successive `cargo test -p larql-kv --lib` runs green after
+  the thread-local override fix; pre-fix the env-var-setting tests
+  produced flaky `cold_kv.is_some()` failures in unrelated codec
+  tests via process-env race). `make larql-kv-ci` passes end-to-end.
 
 - **2026-05-24 — Accuracy harness honesty + FFN policy cross-product
   LANDED.** Multi-PR arc that turns the accuracy suite from "silent

@@ -236,7 +236,6 @@ mod tests {
     use larql_inference::test_utils::{
         make_test_q4k_vindex, make_test_q4k_weights, Q4K_TEST_NUM_LAYERS,
     };
-    use serial_test::serial;
 
     use super::*;
     use crate::engines::boundary_per_layer::policy::BoundaryLayerPolicy;
@@ -245,17 +244,16 @@ mod tests {
         BoundaryLayerPolicy::bf16_uniform("test", Q4K_TEST_NUM_LAYERS)
     }
 
-    /// Reset `LARQL_W10_DISABLE` to a known state. Every test in this
-    /// module exercises code paths gated on `w10_env_on()` (which reads
-    /// this var), so the tests are `#[serial]` and start clean.
-    fn clear_w10_env() {
-        std::env::remove_var("LARQL_W10_DISABLE");
+    /// Clear the per-thread W10 cascade override so the engine reads
+    /// the (unset, default-on) env. Tests call this at the start to
+    /// neutralise overrides leaked by earlier tests on the same thread.
+    fn clear_w10_override() {
+        crate::engines::set_w10_disabled_override(None);
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
-        clear_w10_env();
+        clear_w10_override();
         let weights = make_test_q4k_weights();
         let empty_index = larql_vindex::VectorIndex::new(
             vec![None; weights.num_layers],
@@ -277,9 +275,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowed_populates_store_under_w10_honly() {
-        clear_w10_env();
+        clear_w10_override();
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
@@ -302,9 +299,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowless_drops_stored_under_w10_none_mask() {
-        clear_w10_env();
+        clear_w10_override();
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
@@ -326,9 +322,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_appends_h_in_under_honly() {
-        clear_w10_env();
+        clear_w10_override();
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
@@ -359,9 +354,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_windowless_takes_none_mask_path() {
-        clear_w10_env();
+        clear_w10_override();
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();
@@ -392,9 +386,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_overflow_extends_cold_tier() {
-        clear_w10_env();
+        clear_w10_override();
         let mut weights = make_test_q4k_weights();
         let index = make_test_q4k_vindex(&weights);
         let backend = cpu_engine_backend();

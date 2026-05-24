@@ -34,6 +34,46 @@ struct WalkKvSelection {
 
 thread_local! {
     static WALK_KV_SELECTION: RefCell<Option<WalkKvSelection>> = const { RefCell::new(None) };
+    /// Per-thread override for `LARQL_MARKOV_*` env vars consulted by
+    /// the walk-KV helpers below. Tests set entries here to exercise
+    /// the env-gated branches without mutating the process-global env
+    /// (which would race other parallel tests in the same crate that
+    /// also call `recompute_kv`). Production code is unaffected — when
+    /// the thread-local is empty the helpers fall through to
+    /// `std::env::var`.
+    static MARKOV_ENV_OVERRIDE: RefCell<std::collections::HashMap<&'static str, Option<String>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// Read an env var subject to thread-local overrides (test-only escape
+/// hatch — see `MARKOV_ENV_OVERRIDE`). An override of `Some(value)`
+/// behaves like the env var being set to that value; `None` behaves
+/// like the var being unset. With no override the helper delegates to
+/// the real process env, so production callers see no change.
+fn read_markov_env(key: &'static str) -> Option<String> {
+    let overridden = MARKOV_ENV_OVERRIDE.with(|o| {
+        o.borrow()
+            .get(key)
+            .map(|v| (true, v.clone()))
+            .unwrap_or((false, None))
+    });
+    if overridden.0 {
+        overridden.1
+    } else {
+        std::env::var(key).ok()
+    }
+}
+
+#[cfg(test)]
+fn set_markov_env_override(key: &'static str, value: Option<&str>) {
+    MARKOV_ENV_OVERRIDE.with(|o| {
+        o.borrow_mut().insert(key, value.map(|s| s.to_string()));
+    });
+}
+
+#[cfg(test)]
+fn clear_markov_env_overrides() {
+    MARKOV_ENV_OVERRIDE.with(|o| o.borrow_mut().clear());
 }
 
 pub struct RsPrefillResult {
@@ -503,7 +543,7 @@ fn markov_walk_kv_top_k(layer: usize, kv_dim: usize) -> Option<usize> {
             return None;
         }
     }
-    if let Ok(spec) = std::env::var("LARQL_MARKOV_WALK_KV_LAYERS") {
+    if let Some(spec) = read_markov_env("LARQL_MARKOV_WALK_KV_LAYERS") {
         if !layer_in_spec(&spec, layer) {
             return None;
         }
@@ -512,7 +552,7 @@ fn markov_walk_kv_top_k(layer: usize, kv_dim: usize) -> Option<usize> {
 }
 
 fn markov_walk_kv_requested_top_k(kv_dim: usize) -> Option<usize> {
-    let raw = std::env::var("LARQL_MARKOV_WALK_KV_TOPK").ok()?;
+    let raw = read_markov_env("LARQL_MARKOV_WALK_KV_TOPK")?;
     let top_k = raw.trim().parse::<usize>().ok()?;
     if top_k == 0 {
         return None;
@@ -521,22 +561,19 @@ fn markov_walk_kv_requested_top_k(kv_dim: usize) -> Option<usize> {
 }
 
 fn markov_walk_kv_select_at() -> Option<usize> {
-    std::env::var("LARQL_MARKOV_WALK_KV_SELECT_AT")
-        .ok()?
+    read_markov_env("LARQL_MARKOV_WALK_KV_SELECT_AT")?
         .trim()
         .parse()
         .ok()
 }
 
 fn markov_walk_kv_diag_enabled() -> bool {
-    std::env::var("LARQL_MARKOV_WALK_KV_DIAG")
-        .ok()
+    read_markov_env("LARQL_MARKOV_WALK_KV_DIAG")
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn markov_kv_force_f32_projection() -> bool {
-    std::env::var("LARQL_MARKOV_KV_FORCE_F32")
-        .ok()
+    read_markov_env("LARQL_MARKOV_KV_FORCE_F32")
         .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
@@ -544,9 +581,7 @@ fn markov_walk_kv_diag_layer(layer: usize) -> bool {
     // `is_none_or` is MSRV 1.82; project pins MSRV 1.80. Equivalent
     // semantics: env-var absent → true (diag applies to all layers),
     // env-var present → check the comma-list.
-    std::env::var("LARQL_MARKOV_WALK_KV_LAYERS")
-        .ok()
-        .map_or(true, |spec| layer_in_spec(&spec, layer))
+    read_markov_env("LARQL_MARKOV_WALK_KV_LAYERS").map_or(true, |spec| layer_in_spec(&spec, layer))
 }
 
 fn layer_in_spec(spec: &str, layer: usize) -> bool {
@@ -1171,178 +1206,145 @@ mod tests {
     // ── Env-var-gated walk-KV paths ───────────────────────────────────────────
     //
     // These tests cover the `LARQL_MARKOV_WALK_KV_*` /
-    // `LARQL_MARKOV_KV_FORCE_F32` paths in `recompute_kv` +
-    // `markov_walk_kv_*` helpers. The env vars are read at decode
-    // time via `std::env::var`, so each test is `#[serial]` (the
-    // `serial_test` crate) and resets the relevant vars at the start
-    // to prevent prior-test leakage.
-
-    fn clear_markov_walk_env() {
-        for var in [
-            "LARQL_MARKOV_WALK_KV_TOPK",
-            "LARQL_MARKOV_WALK_KV_LAYERS",
-            "LARQL_MARKOV_WALK_KV_SELECT_AT",
-            "LARQL_MARKOV_WALK_KV_DIAG",
-            "LARQL_MARKOV_KV_FORCE_F32",
-        ] {
-            std::env::remove_var(var);
-        }
-    }
+    // `LARQL_MARKOV_KV_FORCE_F32` paths in `recompute_kv` and the
+    // `markov_walk_kv_*` helpers. Production reads via
+    // `read_markov_env`, which consults the per-thread
+    // `MARKOV_ENV_OVERRIDE` map *before* `std::env::var`. Tests inject
+    // values through `set_markov_env_override` — no process-global env
+    // mutation, no `#[serial]` needed, no race with other parallel
+    // tests that also call `recompute_kv`.
 
     #[test]
-    #[serial_test::serial]
     fn markov_walk_kv_requested_top_k_parses_clamps_and_rejects_zero() {
-        clear_markov_walk_env();
-        // Not set → None.
+        clear_markov_env_overrides();
         assert_eq!(markov_walk_kv_requested_top_k(32), None);
-        // Set → parsed; clamp to kv_dim.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "8");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("8"));
         assert_eq!(markov_walk_kv_requested_top_k(32), Some(8));
         assert_eq!(
             markov_walk_kv_requested_top_k(4),
             Some(4),
             "clamp to kv_dim"
         );
-        // Zero is rejected.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "0");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("0"));
         assert_eq!(markov_walk_kv_requested_top_k(32), None);
-        // Garbage rejects.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "abc");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("abc"));
         assert_eq!(markov_walk_kv_requested_top_k(32), None);
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn markov_walk_kv_select_at_parses_layer_index() {
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
         assert_eq!(markov_walk_kv_select_at(), None);
-        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "7");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_SELECT_AT", Some("7"));
         assert_eq!(markov_walk_kv_select_at(), Some(7));
-        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "bad");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_SELECT_AT", Some("bad"));
         assert_eq!(markov_walk_kv_select_at(), None);
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn markov_walk_kv_diag_enabled_accepts_truthy_strings() {
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
         assert!(!markov_walk_kv_diag_enabled());
         for val in ["1", "true", "TRUE", "yes", "on"] {
-            std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", val);
+            set_markov_env_override("LARQL_MARKOV_WALK_KV_DIAG", Some(val));
             assert!(markov_walk_kv_diag_enabled(), "should accept {val}");
         }
         for val in ["0", "false", "no"] {
-            std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", val);
+            set_markov_env_override("LARQL_MARKOV_WALK_KV_DIAG", Some(val));
             assert!(!markov_walk_kv_diag_enabled(), "should reject {val}");
         }
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn markov_kv_force_f32_projection_reads_env() {
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
         assert!(!markov_kv_force_f32_projection());
-        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "1");
+        set_markov_env_override("LARQL_MARKOV_KV_FORCE_F32", Some("1"));
         assert!(markov_kv_force_f32_projection());
-        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "no");
+        set_markov_env_override("LARQL_MARKOV_KV_FORCE_F32", Some("no"));
         assert!(!markov_kv_force_f32_projection());
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn markov_walk_kv_diag_layer_respects_layers_spec() {
-        clear_markov_walk_env();
-        // Absent → every layer counts.
+        clear_markov_env_overrides();
         assert!(markov_walk_kv_diag_layer(0));
         assert!(markov_walk_kv_diag_layer(99));
-        // Restricted to range → outside layers excluded.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_LAYERS", "3-5");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_LAYERS", Some("3-5"));
         assert!(markov_walk_kv_diag_layer(4));
         assert!(!markov_walk_kv_diag_layer(0));
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn markov_walk_kv_top_k_honours_layers_and_select_at_gates() {
-        clear_markov_walk_env();
-        // Not requested → None.
+        clear_markov_env_overrides();
         assert_eq!(markov_walk_kv_top_k(0, 32), None);
-        // Requested but layer not in spec → None.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "4");
-        std::env::set_var("LARQL_MARKOV_WALK_KV_LAYERS", "5-7");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("4"));
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_LAYERS", Some("5-7"));
         assert_eq!(markov_walk_kv_top_k(0, 32), None);
         assert_eq!(markov_walk_kv_top_k(6, 32), Some(4));
-        // SELECT_AT == layer → None (selector layer keeps the dense path).
-        std::env::remove_var("LARQL_MARKOV_WALK_KV_LAYERS");
-        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "6");
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_LAYERS", None);
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_SELECT_AT", Some("6"));
         assert_eq!(markov_walk_kv_top_k(6, 32), None);
         assert_eq!(markov_walk_kv_top_k(7, 32), Some(4));
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn recompute_kv_force_f32_disables_q4k_path() {
-        clear_markov_walk_env();
-        std::env::set_var("LARQL_MARKOV_KV_FORCE_F32", "1");
+        clear_markov_env_overrides();
+        set_markov_env_override("LARQL_MARKOV_KV_FORCE_F32", Some("1"));
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.5f32);
         let (k, v) = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None).unwrap();
         let kv_dim = weights.num_kv_heads * weights.head_dim;
         assert_eq!(k.shape(), &[2, kv_dim]);
         assert_eq!(v.shape(), &[2, kv_dim]);
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn recompute_kv_topk_routes_through_walk_projection() {
-        clear_markov_walk_env();
-        // top_k forces the walk-KV f32 fallback regardless of backend.
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "2");
+        clear_markov_env_overrides();
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("2"));
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.25f32);
         let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
         assert!(result.is_some());
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn recompute_kv_select_at_uses_cached_indices_on_later_layers() {
-        clear_markov_walk_env();
-        std::env::set_var("LARQL_MARKOV_WALK_KV_TOPK", "2");
-        std::env::set_var("LARQL_MARKOV_WALK_KV_SELECT_AT", "0");
+        clear_markov_env_overrides();
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_TOPK", Some("2"));
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_SELECT_AT", Some("0"));
         let weights = make_test_weights();
         let h = Array2::from_elem((2, weights.hidden_size), 0.25f32);
-        // Layer 0: should_cache_selection fires, populates the
-        // thread-local; layer 1: walk_project_cached_topk reads it.
+        // Layer 0: should_cache_selection fires, populates
+        // WALK_KV_SELECTION; layer 1: walk_project_cached_topk reads it.
         let _ = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
         if weights.num_layers >= 2 {
             let result = recompute_kv(&weights, &h, 1, 0, &CpuBackend, None);
             assert!(result.is_some());
         }
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]
-    #[serial_test::serial]
     fn recompute_kv_diag_fires_when_enabled() {
-        clear_markov_walk_env();
-        std::env::set_var("LARQL_MARKOV_WALK_KV_DIAG", "1");
+        clear_markov_env_overrides();
+        set_markov_env_override("LARQL_MARKOV_WALK_KV_DIAG", Some("1"));
         let weights = make_test_weights();
         let h = Array2::from_elem((1, weights.hidden_size), 0.5f32);
-        // Diagnostic path runs `print_walk_kv_diag` — body is
-        // observability output; we just verify no panic and a valid
-        // result.
         let result = recompute_kv(&weights, &h, 0, 0, &CpuBackend, None);
         assert!(result.is_some());
-        clear_markov_walk_env();
+        clear_markov_env_overrides();
     }
 
     #[test]

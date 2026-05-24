@@ -73,6 +73,29 @@ pub mod unlimited_context;
 /// boundary_per_layer). Engines that treat K/V as canonical state
 /// (turbo_quant) don't call this — their dispatch path stays on
 /// Full mask regardless.
+///
+/// Tests inject a value through `set_w10_disabled_override` (per-thread)
+/// rather than mutating the process env, so they don't race other
+/// parallel tests that also call this helper.
 pub(crate) fn w10_enabled() -> bool {
-    std::env::var("LARQL_W10_DISABLE").as_deref() != Ok("1")
+    let overridden = W10_DISABLED_OVERRIDE.with(|o| *o.borrow());
+    match overridden {
+        Some(disabled) => !disabled,
+        None => std::env::var("LARQL_W10_DISABLE").as_deref() != Ok("1"),
+    }
+}
+
+std::thread_local! {
+    /// Per-thread override for [`w10_enabled`]. `Some(true)` simulates
+    /// `LARQL_W10_DISABLE=1` (cascade off); `Some(false)` simulates the
+    /// var unset (cascade on); `None` falls through to the real env.
+    /// Test-only escape hatch — production callers leave it `None`.
+    static W10_DISABLED_OVERRIDE: std::cell::RefCell<Option<bool>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn set_w10_disabled_override(disabled: Option<bool>) {
+    W10_DISABLED_OVERRIDE.with(|o| *o.borrow_mut() = disabled);
 }

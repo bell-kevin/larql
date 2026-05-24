@@ -279,7 +279,6 @@ mod tests {
 
     use larql_inference::cpu_engine_backend;
     use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-    use serial_test::serial;
 
     use super::*;
     use crate::engines::markov_residual_codec::codec::ColdResidualCodec;
@@ -303,15 +302,10 @@ mod tests {
     }
 
     fn set_w10_disable(disabled: bool) {
-        if disabled {
-            std::env::set_var("LARQL_W10_DISABLE", "1");
-        } else {
-            std::env::remove_var("LARQL_W10_DISABLE");
-        }
+        crate::engines::set_w10_disabled_override(Some(disabled));
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
         set_w10_disable(false);
         let weights = make_test_q4k_weights();
@@ -335,7 +329,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowed_keeps_stored_under_w10_default() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(Some(8));
@@ -353,7 +346,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowless_drops_stored_under_w10() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(None);
@@ -370,7 +362,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_windowed_overflow_codecs_cold_tier() {
         // window=2 against 4 tokens → prefill clip evicts 2 positions
         // into `cold_encoded` via the bf16 codec.
@@ -388,7 +379,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_full_mask_with_w10_disabled() {
         set_w10_disable(true);
         let (mut engine, mut weights, index) = fixture(Some(8));
@@ -401,7 +391,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(Some(4));
@@ -411,7 +400,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_windowed_appends_h_in_under_honly() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(Some(8));
@@ -430,7 +418,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_windowless_uses_none_mask() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(None);
@@ -450,7 +437,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_full_mask_with_w10_disabled() {
         set_w10_disable(true);
         let (mut engine, mut weights, index) = fixture(Some(8));
@@ -467,7 +453,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_overflow_extends_cold_encoded() {
         // window=2: after prefilling 2 → one decode evicts the oldest
         // position into cold_encoded (the None match arm constructs it).
@@ -508,7 +493,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_with_profiling_records_stages() {
         set_w10_disable(false);
         let (engine, mut weights, index) = fixture(Some(8));

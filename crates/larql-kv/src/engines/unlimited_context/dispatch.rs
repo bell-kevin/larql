@@ -164,13 +164,13 @@ impl UnlimitedContextEngine {
 mod tests {
     //! Coverage for the W1-GPU dispatch path. `UnlimitedContextEngine`
     //! takes a non-optional `window_size: usize`; W10 mask cascade is
-    //! gated on whether `current_window_kv` is dropped (the
-    //! `LARQL_W10_DISABLE` env var). Tests are `#[serial]` because
-    //! `w10_enabled()` reads a process-global env var.
+    //! gated on whether `current_window_kv` is dropped. Tests pin the
+    //! cascade state via [`crate::engines::set_w10_disabled_override`]
+    //! — a per-thread override so they don't race other parallel tests
+    //! that also call `w10_enabled()`.
 
     use larql_inference::cpu_engine_backend;
     use larql_inference::test_utils::{make_test_q4k_vindex, make_test_q4k_weights};
-    use serial_test::serial;
 
     use super::*;
     use crate::engines::unlimited_context::engine::UnlimitedContextEngine;
@@ -183,15 +183,10 @@ mod tests {
     }
 
     fn set_w10_disable(disabled: bool) {
-        if disabled {
-            std::env::set_var("LARQL_W10_DISABLE", "1");
-        } else {
-            std::env::remove_var("LARQL_W10_DISABLE");
-        }
+        crate::engines::set_w10_disabled_override(Some(disabled));
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_returns_none_when_index_lacks_direct_matvec() {
         set_w10_disable(false);
         let weights = make_test_q4k_weights();
@@ -211,7 +206,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_drops_window_kv_under_w10_default() {
         // W10 on by default → drop_window_kv_shadow = true. The engine
         // doesn't populate `current_window_kv`; Metal's kv cache is the
@@ -230,7 +224,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn try_prefill_via_dispatch_populates_window_kv_with_w10_disabled() {
         // W10 off → engine pre-allocates `[window_cap, kv_dim]` per
         // layer and copies the prefill K/V rows in.
@@ -250,7 +243,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_without_prefill_returns_none() {
         set_w10_disable(false);
         let (mut engine, mut weights, index) = fixture(4);
@@ -261,7 +253,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_h_only_skips_kv_append() {
         // W10 default + window_kv dropped at prefill → HOnly mask.
         // The dispatch decode runs through the `if !matches!(mask, HOnly)`
@@ -285,7 +276,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_full_mask_appends_kv_with_w10_disabled() {
         // W10 off → Full mask. Each layer's K/V row blits into the
         // pre-allocated window_kv buffer at `current_window_kv_len`.
@@ -313,7 +303,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn decode_step_via_dispatch_fires_window_auto_close() {
         // window=2: prefill 2 → token count == window → close_window
         // fires inside the dispatch decode and resets the window.
