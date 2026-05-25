@@ -30,6 +30,7 @@ pub mod q4_k;
 pub mod q5_k;
 pub mod q6_k;
 pub mod quantize;
+pub mod tq;
 
 pub use legacy::{dequantize_q4_0, dequantize_q5_0, dequantize_q5_1};
 pub use q3_k::dequantize_q3_k;
@@ -52,6 +53,10 @@ pub const TYPE_Q4_K: u32 = 12;
 pub const TYPE_Q5_K: u32 = 13;
 pub const TYPE_Q6_K: u32 = 14;
 pub const TYPE_BF16: u32 = 30;
+/// BitNet 1.58 ternary, 5-trits-per-byte base-3 packing (1.6875 bpw).
+pub const TYPE_TQ1_0: u32 = 34;
+/// BitNet 1.58 ternary, 4-trits-per-byte 2-bit packing (2.0625 bpw).
+pub const TYPE_TQ2_0: u32 = 35;
 
 // ── Block geometry (canonical GGML wire format) ─────────────────────────
 //
@@ -109,6 +114,18 @@ pub const Q6_K_BLOCK_BYTES: usize = 210;
 /// Elements per Q6_K super-block.
 pub const Q6_K_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
 
+/// Bytes per TQ1_0 super-block (256 elements): 48 (qs) + 4 (qh) + 2 (d) = 54.
+/// 1.6875 bits per weight — BitNet 1.58 5-trits-per-byte base-3 layout.
+pub const TQ1_0_BLOCK_BYTES: usize = 54;
+/// Elements per TQ1_0 super-block.
+pub const TQ1_0_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
+
+/// Bytes per TQ2_0 super-block (256 elements): 64 (qs) + 2 (d) = 66.
+/// 2.0625 bits per weight — BitNet 1.58 4-trits-per-byte 2-bit layout.
+pub const TQ2_0_BLOCK_BYTES: usize = 66;
+/// Elements per TQ2_0 super-block.
+pub const TQ2_0_BLOCK_ELEMS: usize = K_QUANT_BLOCK_ELEMS;
+
 /// Validate that `data` holds at least `n_blocks` blocks of
 /// `block_size` bytes for `n_elements` total elements (which must be a
 /// multiple of `block_elems`). Returns the block count.
@@ -160,6 +177,8 @@ pub fn tensor_data_size(tensor_type: u32, n_elements: usize) -> Result<usize, Mo
         TYPE_Q4_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q4_K_BLOCK_BYTES),
         TYPE_Q5_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q5_K_BLOCK_BYTES),
         TYPE_Q6_K => Ok(n_elements / K_QUANT_BLOCK_ELEMS * Q6_K_BLOCK_BYTES),
+        TYPE_TQ1_0 => Ok(n_elements / K_QUANT_BLOCK_ELEMS * TQ1_0_BLOCK_BYTES),
+        TYPE_TQ2_0 => Ok(n_elements / K_QUANT_BLOCK_ELEMS * TQ2_0_BLOCK_BYTES),
         _ => Err(ModelError::Parse(format!(
             "tensor_data_size: unsupported type id {tensor_type}"
         ))),
@@ -182,6 +201,8 @@ pub fn type_name(tensor_type: u32) -> &'static str {
         TYPE_Q4_K => "Q4_K",
         TYPE_Q5_K => "Q5_K",
         TYPE_Q6_K => "Q6_K",
+        TYPE_TQ1_0 => "TQ1_0",
+        TYPE_TQ2_0 => "TQ2_0",
         TYPE_BF16 => "BF16",
         _ => "unknown",
     }
@@ -223,6 +244,8 @@ pub fn dequantize(
         TYPE_Q4_K => dequantize_q4_k(data, n_elements),
         TYPE_Q5_K => dequantize_q5_k(data, n_elements),
         TYPE_Q6_K => dequantize_q6_k(data, n_elements),
+        TYPE_TQ1_0 => tq::dequantize_tq1_0(data, n_elements),
+        TYPE_TQ2_0 => tq::dequantize_tq2_0(data, n_elements),
         other => Err(ModelError::UnsupportedDtype(format!("GGML type {other}"))),
     }
 }
