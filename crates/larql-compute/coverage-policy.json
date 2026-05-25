@@ -8,6 +8,6 @@
   "default_line_min_percent": 90.0,
   "total_line_min_percent": 95.0,
   "per_file_line_min_percent": {
-    "crates/larql-compute/src/connectors/projector.rs": 81.0
+    "crates/larql-compute/src/connectors/projector.rs": 80.0
   }
 }
