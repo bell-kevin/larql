@@ -5,4 +5,5 @@
 //! matmul convention) dispatches at the forward-pass level in
 //! `larql-compute::connectors::projector`.
 
+pub mod mlp_connector;
 pub mod projector;

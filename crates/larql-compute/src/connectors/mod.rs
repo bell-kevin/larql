@@ -6,4 +6,5 @@
 //! `larql_models::MmConnector` to avoid clashing with crate-local
 //! `Connector` types).
 
+pub mod mlp_connector;
 pub mod projector;

@@ -274,11 +274,14 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .as_u64()
         .map(|v| v as usize)
         .filter(|&v| v > 0);
+
     // Per-layer embedding dimension (PLE)
     let per_layer_embed_dim = text_config["hidden_size_per_layer_input"]
         .as_u64()
         .map(|v| v as usize)
         .filter(|&v| v > 0);
+
+    let has_vision_config = config.get("vision_config").is_some();
 
     ModelConfig {
         model_type,
@@ -320,5 +323,6 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         enable_moe_block,
         top_k_experts,
         moe_intermediate_size,
+        has_vision_config,
     }
 }

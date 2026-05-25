@@ -232,6 +232,7 @@ mod tests {
             attention_k_eq_v: false,
             per_layer_embed_dim: None,
             num_kv_shared_layers: None,
+            has_vision_config: false,
         }
     }
 

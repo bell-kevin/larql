@@ -33,7 +33,11 @@ impl<'w> VisionEncoder<'w> {
 
 impl ModalEncoder for VisionEncoder<'_> {
     fn family(&self) -> &str {
-        "siglip"
+        if self.weights.config.is_siglip2() {
+            "siglip2"
+        } else {
+            "siglip"
+        }
     }
 
     fn encoder_hidden_size(&self) -> usize {
@@ -85,6 +89,7 @@ fn forward(weights: &VisionWeights, rgb_u8: &[u8]) -> Array2<f32> {
     let head_dim = cfg.head_dim();
     let num_heads = cfg.num_attention_heads;
     let eps = cfg.layer_norm_eps;
+    let hidden_act = cfg.hidden_act.as_str();
 
     for layer in &weights.layers {
         // ── Pre-attention residual block ──
@@ -104,7 +109,7 @@ fn forward(weights: &VisionWeights, rgb_u8: &[u8]) -> Array2<f32> {
             Some(&layer.layer_norm2.bias),
             eps,
         );
-        let mlp_out = gelu_mlp(&h_norm, layer);
+        let mlp_out = encoder_mlp(&h_norm, layer, hidden_act);
         h = h + mlp_out;
     }
 
@@ -248,10 +253,15 @@ fn bidirectional_attention(
     proj_with_bias(&out_flat, &layer.out_proj.weight, &layer.out_proj.bias)
 }
 
-/// FFN with GELU (HF SigLIP uses `gelu_pytorch_tanh`).
-fn gelu_mlp(x: &Array2<f32>, layer: &VisionLayerWeights) -> Array2<f32> {
+/// FFN with configurable activation. SigLIP uses `gelu_pytorch_tanh`;
+/// SigLIP2 may use `gelu` or `silu`.
+fn encoder_mlp(x: &Array2<f32>, layer: &VisionLayerWeights, hidden_act: &str) -> Array2<f32> {
     let h1 = proj_with_bias(x, &layer.fc1.weight, &layer.fc1.bias);
-    let h1 = h1.mapv(crate::ffn::gelu_tanh);
+    let h1 = match hidden_act {
+        "silu" => h1.mapv(|v| v / (1.0 + (-v).exp())),
+        "gelu" => h1.mapv(crate::ffn::gelu_tanh),
+        _ => h1.mapv(crate::ffn::gelu_tanh),
+    };
     proj_with_bias(&h1, &layer.fc2.weight, &layer.fc2.bias)
 }
 
@@ -332,6 +342,8 @@ mod tests {
             image_size: 4,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         };
         let hidden = config.hidden_size;
         let inter = config.intermediate_size;
@@ -569,6 +581,8 @@ mod tests {
             image_size: 896,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         };
         let w = load_vision_tower_from_safetensors(snap, config).expect("load");
         let enc = VisionEncoder::new(&w);
@@ -593,6 +607,82 @@ mod tests {
         assert!(
             col0_max - col0_min > 1e-4,
             "first output column collapsed: min={col0_min} max={col0_max}"
+        );
+    }
+
+    // ── SigLIP2 parameterization tests ───────────────────────────────────
+
+    fn synth_siglip2_weights() -> VisionWeights {
+        let mut w = synth_weights();
+        w.config.hidden_act = "silu".to_string();
+        w.config.norm_type = "rms_norm".to_string();
+        w
+    }
+
+    #[test]
+    fn siglip2_family_name() {
+        let w = synth_siglip2_weights();
+        let enc = VisionEncoder::new(&w);
+        assert_eq!(enc.family(), "siglip2");
+    }
+
+    #[test]
+    fn siglip_family_name() {
+        let w = synth_weights();
+        let enc = VisionEncoder::new(&w);
+        assert_eq!(enc.family(), "siglip");
+    }
+
+    #[test]
+    fn siglip2_encode_produces_valid_output() {
+        let w = synth_siglip2_weights();
+        let enc = VisionEncoder::new(&w);
+        let side = w.config.image_size;
+        let rgb = gradient_rgb(side);
+        let out = enc
+            .encode(ModalInput::Image {
+                rgb: &rgb,
+                width: side,
+                height: side,
+            })
+            .expect("SigLIP2 encode should succeed");
+        assert_eq!(out.shape(), &[w.config.num_patches(), w.config.hidden_size]);
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn silu_and_gelu_produce_different_outputs() {
+        let side = 4;
+        let rgb = gradient_rgb(side);
+
+        let w_gelu = synth_weights();
+        let enc_gelu = VisionEncoder::new(&w_gelu);
+        let out_gelu = enc_gelu
+            .encode(ModalInput::Image {
+                rgb: &rgb,
+                width: side,
+                height: side,
+            })
+            .unwrap();
+
+        let w_silu = synth_siglip2_weights();
+        let enc_silu = VisionEncoder::new(&w_silu);
+        let out_silu = enc_silu
+            .encode(ModalInput::Image {
+                rgb: &rgb,
+                width: side,
+                height: side,
+            })
+            .unwrap();
+
+        assert_eq!(out_gelu.shape(), out_silu.shape());
+        let differ = out_gelu
+            .iter()
+            .zip(out_silu.iter())
+            .any(|(a, b)| (a - b).abs() > 1e-6);
+        assert!(
+            differ,
+            "SiLU and GELU-tanh should produce different outputs"
         );
     }
 }

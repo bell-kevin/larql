@@ -429,6 +429,104 @@ sharing the encoder/connector code from earlier phases.
 
 ---
 
+## GPU / Metal encoder acceleration
+
+> **Status:** Not Phase 2 scope. Written to inform the Metal encoder
+> follow-up PR after Phase 2 merges.
+
+### Current state
+
+Phase 1 and Phase 2 both use CPU-only vision encoders (SigLIP, SigLIP2).
+The production inference pipeline is:
+
+```
+CPU encoder → CPU connector → embed_plan (CPU) → Metal LM prefill → Metal decode
+```
+
+This matches how most local multi-modal runtimes start. The CPU→GPU
+boundary is at `prefill_from_hidden()`, which receives the fully-spliced
+`Array2<f32>` initial hidden state and runs the LM layers on Metal.
+
+### Metal encoder feasibility
+
+The existing Metal shader inventory in `crates/larql-compute-metal/src/shaders/`
+already covers most of the SigLIP/SigLIP2 encoder pipeline:
+
+| Encoder op | Existing shader | Gap |
+| --- | --- | --- |
+| Patchify (Conv2D as matmul) | `sgemm` / `sgemm_transb` | None — reshape + matmul |
+| Position embedding add | Element-wise add | Trivial |
+| LayerNorm (scale + bias) | `layer_norm` | None |
+| Biased QKV projections | `sgemm` + bias add | None |
+| Bidirectional attention | `causal_attention` | **Mask removal** — existing shader applies triangular mask; encoder needs the same GEMM sequence minus the mask |
+| Output projection | `sgemm` + bias add | None |
+| GELU activation | `activation` (gelu_tanh) | None for SigLIP; SiLU variant may be needed for some SigLIP2 configs |
+| MLP (fc1 → act → fc2) | `sgemm` + activation + `sgemm` | None |
+| Post-LayerNorm | `layer_norm` | None |
+
+**Single structural gap:** bidirectional attention. The current
+`causal_attention.rs` shader applies `if col > row { -inf }` before
+softmax. SigLIP's attention is identical except without that mask line.
+This is a shader variant (remove the conditional), not a new kernel
+architecture.
+
+### Memory budget
+
+| Encoder | Params | f32 | f16 |
+| --- | --- | --- | --- |
+| SigLIP (Gemma 3 4B) | ~400M | ~1.6 GB | ~800 MB |
+| SigLIP2 (Granite Vision) | ~400M | ~1.6 GB | ~800 MB |
+
+Both fit comfortably in Apple Silicon unified memory alongside the LM
+weights. Quantization of encoder weights is deferred (v1 runs f16/f32
+only) but the memory headroom is not a blocker.
+
+### Expected speedup
+
+The SigLIP forward pass on Gemma 3 4B-it (27 layers, 4096 patches,
+hidden=1152) takes ~30s on CPU (from real-checkpoint test). Metal
+should bring this to 1–3s based on the GPU matmul throughput ratio
+observed in the LM path. This is the primary user-visible performance
+improvement — the LM path is already Metal-accelerated.
+
+### Zero-copy pipeline
+
+The target architecture eliminates the GPU→CPU→GPU round-trip:
+
+```
+Metal encoder GPU buffer → Metal connector GPU buffer
+  → Metal embed_plan splice → Metal LM prefill
+```
+
+This requires `embed_plan` to accept GPU-resident `Precomputed` chunks
+(currently `Array2<f32>` on the host). The actual Metal encoder seam
+change is making `EmbeddingChunk::Precomputed` carry either a host
+array or a Metal buffer handle. The host-side `decode_and_tile` /
+`decode_and_resize_square` remains CPU (image decoding is not
+GPU-worthy at these resolutions).
+
+### AnyRes + Metal interaction
+
+For Granite Vision, each tile runs through the encoder independently.
+Metal encoder enables parallel tile processing via sequential tile
+dispatch on Metal's command queue — the N+1 tiles per image (base +
+detail) can pipeline without CPU round-trips between tiles.
+
+### Recommended sequencing
+
+1. Phase 2 ships CPU encoder (unchanged).
+2. Metal encoder is a follow-up PR after Phase 2 merges. Start with
+   SigLIP since Gemma 3 is the established baseline with a working
+   CPU reference; SigLIP2 follows trivially once the bidirectional
+   attention shader variant exists.
+3. The bidirectional attention shader variant is the first deliverable
+   — it unblocks the entire Metal encoder pipeline.
+4. Metal connector (MLP GELU, Gemma projector) is trivially composed
+   from existing `sgemm` + activation shaders once the encoder
+   outputs are GPU-resident.
+
+---
+
 ## Open questions
 
 1. **Where do encoder weights live?**

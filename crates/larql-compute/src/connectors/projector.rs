@@ -205,6 +205,8 @@ mod tests {
             image_size: 8,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         }
     }
 
@@ -342,6 +344,8 @@ mod tests {
             image_size: 896,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         };
         let conn = VisionProjector::new(&w, &cfg, 256).expect("connector");
         assert_eq!(conn.input_dim(), 1152);

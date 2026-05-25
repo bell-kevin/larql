@@ -51,6 +51,12 @@ pub struct VisionConfig {
     /// LayerNorm epsilon. HF default for SigLIP is 1e-6.
     #[serde(default = "default_layer_norm_eps")]
     pub layer_norm_eps: f64,
+    /// Activation function in the encoder MLP. Defaults to `"gelu_pytorch_tanh"` (SigLIP).
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
+    /// Normalization type. `"layer_norm"` for SigLIP, `"rms_norm"` for SigLIP2 variants.
+    #[serde(default = "default_norm_type")]
+    pub norm_type: String,
 }
 
 fn default_num_channels() -> usize {
@@ -58,6 +64,12 @@ fn default_num_channels() -> usize {
 }
 fn default_layer_norm_eps() -> f64 {
     1e-6
+}
+fn default_hidden_act() -> String {
+    "gelu_pytorch_tanh".to_string()
+}
+fn default_norm_type() -> String {
+    "layer_norm".to_string()
 }
 
 impl VisionConfig {
@@ -83,6 +95,11 @@ impl VisionConfig {
     /// 1152 / 16 = 72.
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_attention_heads
+    }
+
+    /// Whether this config describes a SigLIP2 encoder.
+    pub fn is_siglip2(&self) -> bool {
+        self.norm_type != "layer_norm" || self.hidden_act == "gelu" || self.hidden_act == "silu"
     }
 }
 
@@ -333,6 +350,8 @@ mod tests {
             image_size: 896,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         }
     }
 
@@ -442,6 +461,8 @@ mod tests {
             image_size: 4,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         }
     }
 
@@ -730,5 +751,68 @@ mod tests {
         assert_eq!(l0.layer_norm1.weight.len(), 1152);
         // Spot-check finiteness on a single tensor.
         assert!(l0.q_proj.weight.iter().all(|v| v.is_finite()));
+    }
+
+    // ── SigLIP2 config extensions ────────────────────────────────────────
+
+    #[test]
+    fn siglip_config_is_not_siglip2() {
+        let cfg = gemma3_4b_it_vision_config();
+        assert!(!cfg.is_siglip2());
+    }
+
+    #[test]
+    fn siglip2_gelu_config_is_siglip2() {
+        let mut cfg = gemma3_4b_it_vision_config();
+        cfg.hidden_act = "gelu".to_string();
+        assert!(cfg.is_siglip2());
+    }
+
+    #[test]
+    fn siglip2_silu_config_is_siglip2() {
+        let mut cfg = gemma3_4b_it_vision_config();
+        cfg.hidden_act = "silu".to_string();
+        assert!(cfg.is_siglip2());
+    }
+
+    #[test]
+    fn siglip2_rmsnorm_config_is_siglip2() {
+        let mut cfg = gemma3_4b_it_vision_config();
+        cfg.norm_type = "rms_norm".to_string();
+        assert!(cfg.is_siglip2());
+    }
+
+    #[test]
+    fn hidden_act_defaults_to_gelu_pytorch_tanh() {
+        let json = serde_json::json!({
+            "hidden_size": 768,
+            "image_size": 224,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "patch_size": 16
+        });
+        let cfg = VisionConfig::from_json(&json).unwrap();
+        assert_eq!(cfg.hidden_act, "gelu_pytorch_tanh");
+        assert_eq!(cfg.norm_type, "layer_norm");
+        assert!(!cfg.is_siglip2());
+    }
+
+    #[test]
+    fn explicit_hidden_act_and_norm_type_parse() {
+        let json = serde_json::json!({
+            "hidden_size": 768,
+            "image_size": 224,
+            "intermediate_size": 3072,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+            "patch_size": 16,
+            "hidden_act": "silu",
+            "norm_type": "rms_norm"
+        });
+        let cfg = VisionConfig::from_json(&json).unwrap();
+        assert_eq!(cfg.hidden_act, "silu");
+        assert_eq!(cfg.norm_type, "rms_norm");
+        assert!(cfg.is_siglip2());
     }
 }

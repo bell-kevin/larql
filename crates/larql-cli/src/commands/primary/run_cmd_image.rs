@@ -37,40 +37,31 @@ use larql_compute::connectors::projector::VisionProjector;
 use larql_compute::encoders::vision_tower::VisionEncoder;
 use larql_compute::forward::{embed_plan, EmbeddingChunk, EmbeddingPlan, PositionScheme};
 use larql_models::connectors::projector::{load_projector_from_safetensors, ProjectorWeights};
-use larql_models::encoders::vision_tower::{
-    load_vision_tower_from_safetensors, VisionConfig, VisionWeights,
-};
+use larql_models::encoders::vision_tower::{load_vision_tower_from_safetensors, VisionConfig};
 use larql_models::{MmConnector, ModalEncoder, ModalInput, Modality, ModelArchitecture};
 
+use crate::anyres_tiler::AnyResTileSpec;
 use crate::commands::primary::run_cmd::RunArgs;
 use crate::image_input::decode_and_resize_square;
 
-/// Compose the Phase 1d multi-modal input plan for Gemma 3.
+/// Compose a multi-modal input plan from images + text.
 ///
-/// `lm_arch` must be a Gemma 3 architecture whose `multimodal()` returns
-/// `Some` (with image placeholder protocol = the 255999 / 262144 / 256000
-/// triple verified in `architectures/gemma3.rs`). `siglip` + `projector`
-/// + `siglip_config` describe the encoder and connector to compose.
+/// Dispatches on `TokenBudget`:
+///   - `Fixed(n)` — Gemma 3 path: single square resize per image,
+///     AvgPool connector. One Precomputed chunk per image.
+///   - `PerTile { tokens_per_tile }` — Granite Vision path: AnyRes
+///     tiling, MLP connector. **N+1 Precomputed chunks per image**
+///     (1 base + N detail tiles). This is the Phase 2 splice stress test.
+///   - `Dynamic` — Qwen-VL (Phase 4), rejected.
 ///
-/// Each image path is decoded, resized to `siglip_config.image_size`,
-/// run through the encoder, projected to LM hidden via the connector,
-/// then wrapped in placeholder markers. Text tokens go last (prefix-only).
-///
-/// Returns an `EmbeddingPlan` ready for `embed_plan(weights, &plan)`.
-/// The arch's `precomputed_scaling()` is honoured by `embed_plan`, not
-/// here — this function emits the precomputed rows as-is from the
-/// connector output (per ADR-0023's "connector owns its normalisation"
-/// pairing and the doc-comment on `Gemma3MultiModal::precomputed_scaling`).
-///
-/// Errors as `String` for parity with `decode_and_resize_square` and
-/// the encoder/connector trait surfaces. Tighten to a typed error if
-/// `larql run` ever grows a structured error reporter.
+/// The `encoder` and `connector` are supplied as trait objects so the
+/// caller can dispatch on `mm.vision_encoder()` when loading weights.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_multimodal_input(
     lm_arch: &dyn ModelArchitecture,
-    siglip: &VisionWeights,
-    siglip_config: &VisionConfig,
-    projector: &ProjectorWeights,
+    encoder: &dyn ModalEncoder,
+    connector: &dyn MmConnector,
+    encoder_image_size: usize,
     image_paths: &[impl AsRef<Path>],
     text_token_ids: &[u32],
 ) -> Result<EmbeddingPlan, String> {
@@ -81,54 +72,69 @@ pub fn prepare_multimodal_input(
         .image_placeholder()
         .ok_or_else(|| "model does not declare an image placeholder protocol".to_string())?;
 
-    // Phase 2 dispatch point: when Granite Vision 4.1 lands, this is
-    // where we branch on `mm.vision_encoder()` to pick VisionEncoder vs
-    // Granite's SigLIP2 encoder. For Phase 1d, only SigLIP exists.
-    let encoder = VisionEncoder::new(siglip);
-    // Connector construction needs the LM-side tokens-per-image budget;
-    // Gemma 3 hardcodes Fixed(256). Phase 2 Granite will need to
-    // dispatch on TokenBudget variants here.
-    let mm_tokens_per_image = match mm.image_token_budget() {
-        larql_models::TokenBudget::Fixed(n) => n,
-        other => {
-            return Err(format!(
-                "Phase 1 only handles TokenBudget::Fixed; got {other:?} \
-                 (this surfaces in Phase 2 with Granite AnyRes)"
-            ));
-        }
-    };
-    let connector = VisionProjector::new(projector, siglip_config, mm_tokens_per_image)?;
-
     let mut chunks: Vec<EmbeddingChunk> = Vec::with_capacity(image_paths.len() * 3 + 1);
 
-    for path in image_paths {
-        let path = path.as_ref();
-        let rgb = decode_and_resize_square(path, siglip_config.image_size)?;
+    match mm.image_token_budget() {
+        larql_models::TokenBudget::Fixed(_) => {
+            for path in image_paths {
+                let path = path.as_ref();
+                let rgb = decode_and_resize_square(path, encoder_image_size)?;
 
-        let encoder_out = encoder.encode(ModalInput::Image {
-            rgb: &rgb,
-            width: siglip_config.image_size,
-            height: siglip_config.image_size,
-        })?;
-        let projected = connector.project(&encoder_out);
+                let encoder_out = encoder.encode(ModalInput::Image {
+                    rgb: &rgb,
+                    width: encoder_image_size,
+                    height: encoder_image_size,
+                })?;
+                let projected = connector.project(&encoder_out);
 
-        // TODO(Phase 3): ChatTemplate MM extension should own
-        // placeholder-token emission. For Phase 1 prefix-only, the host
-        // pre-bakes the start/fill/end markers as Tokens chunks here.
-        // When Phase 3 lands native interleaving (the Gemma 3
-        // <start_of_image>+256×<image_soft_token>+<end_of_image> sandwich
-        // mid-text), placeholder emission moves into ChatTemplate and
-        // these three lines become a tokenizer concern. Don't let this
-        // drift into Phase 4 — bind explicitly.
-        if let Some(start) = placeholder.start {
-            chunks.push(EmbeddingChunk::Tokens(vec![start]));
+                if let Some(start) = placeholder.start {
+                    chunks.push(EmbeddingChunk::Tokens(vec![start]));
+                }
+                chunks.push(EmbeddingChunk::Precomputed {
+                    rows: projected,
+                    modality: Modality::Image,
+                });
+                if let Some(end) = placeholder.end {
+                    chunks.push(EmbeddingChunk::Tokens(vec![end]));
+                }
+            }
         }
-        chunks.push(EmbeddingChunk::Precomputed {
-            rows: projected,
-            modality: Modality::Image,
-        });
-        if let Some(end) = placeholder.end {
-            chunks.push(EmbeddingChunk::Tokens(vec![end]));
+        larql_models::TokenBudget::PerTile { .. } => {
+            let tile_counts = mm.valid_tile_counts();
+            if tile_counts.is_empty() {
+                return Err("PerTile budget but valid_tile_counts is empty".to_string());
+            }
+            let spec = AnyResTileSpec {
+                tile_size: encoder_image_size,
+                valid_tile_counts: tile_counts.to_vec(),
+            };
+            for path in image_paths {
+                let path = path.as_ref();
+                let img = image::open(path)
+                    .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+                let (w, h) = (img.width() as usize, img.height() as usize);
+                let rgb = img.to_rgb8().into_raw();
+                let tiled = spec.tile(&rgb, w, h);
+
+                let all_tiles = std::iter::once(&tiled.base_tile).chain(tiled.detail_tiles.iter());
+                for tile_rgb in all_tiles {
+                    let encoder_out = encoder.encode(ModalInput::Image {
+                        rgb: tile_rgb,
+                        width: encoder_image_size,
+                        height: encoder_image_size,
+                    })?;
+                    let projected = connector.project(&encoder_out);
+
+                    chunks.push(EmbeddingChunk::Tokens(vec![placeholder.fill]));
+                    chunks.push(EmbeddingChunk::Precomputed {
+                        rows: projected,
+                        modality: Modality::Image,
+                    });
+                }
+            }
+        }
+        larql_models::TokenBudget::Dynamic => {
+            return Err("Dynamic token budget is Phase 4 (Qwen-VL); not yet supported".to_string());
         }
     }
 
@@ -277,11 +283,17 @@ pub fn run_with_images(
     let text_token_ids: Vec<u32> = encoding.get_ids().to_vec();
 
     // ── 7. + 8. Build plan + embed ──
+    let encoder = VisionEncoder::new(&siglip);
+    let mm_tokens_per_image = match weights.arch.multimodal().unwrap().image_token_budget() {
+        larql_models::TokenBudget::Fixed(n) => n,
+        _ => 0,
+    };
+    let connector = VisionProjector::new(&projector, &siglip_config, mm_tokens_per_image.max(1))?;
     let plan = prepare_multimodal_input(
         &*weights.arch,
-        &siglip,
-        &siglip_config,
-        &projector,
+        &encoder,
+        &connector,
+        siglip_config.image_size,
         &args.image,
         &text_token_ids,
     )?;
@@ -431,6 +443,8 @@ mod tests {
             image_size: 4,
             num_channels: 3,
             layer_norm_eps: 1e-6,
+            hidden_act: "gelu_pytorch_tanh".to_string(),
+            norm_type: "layer_norm".to_string(),
         }
     }
 
@@ -526,11 +540,13 @@ mod tests {
         let img = write_synth_png(tmp.path(), "one.png", 4);
         let text = [1u32, 2, 3, 4, 5];
 
+        let encoder = VisionEncoder::new(&siglip);
+        let connector = VisionProjector::new(&projector, &siglip_cfg, 4).unwrap();
         let plan = prepare_multimodal_input(
             &arch,
-            &siglip,
-            &siglip_cfg,
-            &projector,
+            &encoder,
+            &connector,
+            siglip_cfg.image_size,
             std::slice::from_ref(&img),
             &text,
         )
@@ -587,8 +603,17 @@ mod tests {
         ];
         let text = [9u32, 10];
 
-        let plan = prepare_multimodal_input(&arch, &siglip, &siglip_cfg, &projector, &imgs, &text)
-            .expect("prepare 2 images");
+        let encoder = VisionEncoder::new(&siglip);
+        let connector = VisionProjector::new(&projector, &siglip_cfg, 4).unwrap();
+        let plan = prepare_multimodal_input(
+            &arch,
+            &encoder,
+            &connector,
+            siglip_cfg.image_size,
+            &imgs,
+            &text,
+        )
+        .expect("prepare 2 images");
 
         assert_eq!(plan.chunks.len(), 7);
         // Both image fragments produce identical chunk SHAPES but
@@ -669,9 +694,189 @@ mod tests {
 
         let imgs: Vec<std::path::PathBuf> = vec![];
         let text = [42u32, 43];
-        let plan = prepare_multimodal_input(&arch, &siglip, &siglip_cfg, &projector, &imgs, &text)
-            .expect("zero-images call");
+        let encoder = VisionEncoder::new(&siglip);
+        let connector = VisionProjector::new(&projector, &siglip_cfg, 4).unwrap();
+        let plan = prepare_multimodal_input(
+            &arch,
+            &encoder,
+            &connector,
+            siglip_cfg.image_size,
+            &imgs,
+            &text,
+        )
+        .expect("zero-images call");
         assert_eq!(plan.chunks.len(), 1);
         assert!(plan.is_text_only());
+    }
+
+    // ─── Phase 2: PerTile path (Granite Vision) ──────────────────────────
+
+    struct TestPerTileMm;
+    impl MultiModalProtocol for TestPerTileMm {
+        fn vision_encoder(&self) -> Option<&str> {
+            Some("siglip2")
+        }
+        fn image_placeholder(&self) -> Option<PlaceholderProtocol> {
+            Some(PlaceholderProtocol {
+                start: None,
+                fill: 49152,
+                end: None,
+            })
+        }
+        fn image_token_budget(&self) -> TokenBudget {
+            TokenBudget::PerTile { tokens_per_tile: 4 }
+        }
+        fn precomputed_scaling(&self) -> PrecomputedScaling {
+            PrecomputedScaling::None
+        }
+        fn valid_tile_counts(&self) -> &[usize] {
+            &[1, 2, 3, 4]
+        }
+    }
+
+    struct TestPerTileArch {
+        config: larql_models::ModelConfig,
+        mm: TestPerTileMm,
+    }
+    impl ModelArchitecture for TestPerTileArch {
+        fn family(&self) -> &str {
+            "test-per-tile"
+        }
+        fn config(&self) -> &larql_models::ModelConfig {
+            &self.config
+        }
+        fn multimodal(&self) -> Option<&dyn MultiModalProtocol> {
+            Some(&self.mm)
+        }
+    }
+
+    fn synth_per_tile_arch() -> TestPerTileArch {
+        let w = larql_models::test_fixtures::make_test_weights();
+        TestPerTileArch {
+            config: w.arch.config().clone(),
+            mm: TestPerTileMm,
+        }
+    }
+
+    #[test]
+    fn per_tile_plan_has_multiple_splice_points_per_image() {
+        let arch = synth_per_tile_arch();
+        let siglip_cfg = synth_siglip_config_4x4_patch2();
+        let siglip = synth_siglip(&siglip_cfg);
+        let encoder = VisionEncoder::new(&siglip);
+        use larql_compute::connectors::mlp_connector::MlpGelu;
+        use larql_models::connectors::mlp_connector::MlpConnectorWeights;
+        let mlp_weights = MlpConnectorWeights {
+            fc1_weight: Array2::from_shape_fn((16, 8), |(i, j)| asymmetric(i, j)),
+            fc1_bias: vec![0.01; 16],
+            fc2_weight: Array2::from_shape_fn((12, 16), |(i, j)| asymmetric(i + 5, j)),
+            fc2_bias: vec![-0.01; 12],
+        };
+        let connector = MlpGelu::new(&mlp_weights);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let img = write_synth_png(tmp.path(), "tile_test.png", 8);
+        let text = [1u32, 2, 3];
+
+        let plan = prepare_multimodal_input(
+            &arch,
+            &encoder,
+            &connector,
+            siglip_cfg.image_size,
+            std::slice::from_ref(&img),
+            &text,
+        )
+        .expect("per-tile plan");
+
+        // PerTile path: each tile generates (fill_token, Precomputed).
+        // For an 8x8 image with tile_size=4 and valid_tile_counts=[1..4],
+        // the grid should be >= 1 tile. Base + detail tiles = N+1 total.
+        // Each tile = 2 chunks (fill token + precomputed).
+        // Plus 1 trailing text chunk.
+        assert!(
+            plan.chunks.len() >= 3,
+            "need at least 1 tile (2 chunks) + text = 3; got {}",
+            plan.chunks.len()
+        );
+        assert!(!plan.is_text_only());
+
+        // Verify the pattern: alternating (Tokens([fill]), Precomputed)
+        let tile_chunks = plan.chunks.len() - 1; // exclude trailing text
+        assert_eq!(
+            tile_chunks % 2,
+            0,
+            "tile chunks should come in pairs (fill, precomputed); got {tile_chunks}"
+        );
+        let num_tiles = tile_chunks / 2;
+        assert!(
+            num_tiles >= 2,
+            "AnyRes should produce base + at least 1 detail tile; got {num_tiles}"
+        );
+
+        for i in 0..num_tiles {
+            match &plan.chunks[i * 2] {
+                EmbeddingChunk::Tokens(toks) => {
+                    assert_eq!(toks, &vec![49152], "tile {i} fill token");
+                }
+                other => panic!("tile {i} chunk 0 should be fill token, got {other:?}"),
+            }
+            match &plan.chunks[i * 2 + 1] {
+                EmbeddingChunk::Precomputed { rows, modality } => {
+                    assert_eq!(rows.ncols(), 12, "projected to connector output dim");
+                    assert!(rows.iter().all(|v| v.is_finite()));
+                    assert_eq!(*modality, Modality::Image);
+                }
+                other => panic!("tile {i} chunk 1 should be precomputed, got {other:?}"),
+            }
+        }
+
+        // Trailing text chunk
+        match plan.chunks.last().unwrap() {
+            EmbeddingChunk::Tokens(toks) => assert_eq!(toks, &vec![1, 2, 3]),
+            other => panic!("last chunk should be text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_tile_two_images_produce_independent_tile_sets() {
+        let arch = synth_per_tile_arch();
+        let siglip_cfg = synth_siglip_config_4x4_patch2();
+        let siglip = synth_siglip(&siglip_cfg);
+        let encoder = VisionEncoder::new(&siglip);
+        use larql_compute::connectors::mlp_connector::MlpGelu;
+        use larql_models::connectors::mlp_connector::MlpConnectorWeights;
+        let mlp_weights = MlpConnectorWeights {
+            fc1_weight: Array2::from_shape_fn((16, 8), |(i, j)| asymmetric(i, j)),
+            fc1_bias: vec![0.01; 16],
+            fc2_weight: Array2::from_shape_fn((12, 16), |(i, j)| asymmetric(i + 5, j)),
+            fc2_bias: vec![-0.01; 12],
+        };
+        let connector = MlpGelu::new(&mlp_weights);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let imgs = vec![
+            write_synth_png(tmp.path(), "a.png", 8),
+            write_synth_png(tmp.path(), "b.png", 8),
+        ];
+        let text = [99u32];
+
+        let plan = prepare_multimodal_input(
+            &arch,
+            &encoder,
+            &connector,
+            siglip_cfg.image_size,
+            &imgs,
+            &text,
+        )
+        .expect("per-tile 2 images");
+
+        // Two images should produce more tile chunks than one.
+        let tile_chunks = plan.chunks.len() - 1;
+        assert!(tile_chunks % 2 == 0);
+        let num_tiles = tile_chunks / 2;
+        assert!(
+            num_tiles >= 4,
+            "two images should yield at least 2*(base+1 detail) = 4 tiles; got {num_tiles}"
+        );
     }
 }

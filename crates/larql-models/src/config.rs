@@ -157,6 +157,8 @@ pub struct ModelConfig {
     /// Number of layers at the end of the model that share KV from earlier layers.
     /// E.g., 20 means the last 20 layers reuse KV cache from earlier source layers.
     pub num_kv_shared_layers: Option<usize>,
+    /// Whether the model's config.json contains a `vision_config` section.
+    pub has_vision_config: bool,
 }
 
 /// Architecture-specific behavior. Describes how a model is structured
