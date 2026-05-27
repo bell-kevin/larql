@@ -334,6 +334,7 @@ pub fn run(args: RunArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.max_tokens,
             &args.moe_dispatch,
             args.moe_predispatch_iters,
+            args.metal,
         );
     }
 
@@ -463,6 +464,7 @@ fn run_with_moe_shards(
     max_tokens: usize,
     dispatch: &str,
     predispatch_iters: usize,
+    metal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use larql_inference::ffn::moe_remote::{parse_unit_manifest, RemoteMoeBackend, ShardConfig};
     use larql_inference::{generate_with_remote_moe, generate_with_remote_moe_batch};
@@ -510,7 +512,22 @@ fn run_with_moe_shards(
 
     let num_shards = configs.len();
     // Initialise compute backend early so we can report it in the topology banner.
-    let backend = larql_compute::default_backend();
+    // Mirrors the `--metal` wiring in `run_with_remote_ffn` (PR #122): explicit
+    // opt-in via the CLI flag, with Metal-init failure falling back to CPU.
+    let backend: Box<dyn larql_compute::ComputeBackend> = if metal {
+        #[cfg(all(feature = "gpu", target_os = "macos"))]
+        {
+            larql_compute_metal::metal_backend()
+                .map(|m| Box::new(m) as Box<dyn larql_compute::ComputeBackend>)
+                .unwrap_or_else(larql_compute::cpu_backend)
+        }
+        #[cfg(not(all(feature = "gpu", target_os = "macos")))]
+        {
+            return Err("`--metal` requires the `gpu` feature on macOS".into());
+        }
+    } else {
+        larql_compute::cpu_backend()
+    };
     eprintln!("Connecting to {} MoE shard(s)…", num_shards);
     let remote = RemoteMoeBackend::connect(configs)
         .map_err(|e| format!("failed to connect to MoE shards: {e}"))?;

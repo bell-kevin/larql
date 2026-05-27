@@ -417,6 +417,22 @@ pub fn resolve_ffn_weights<'a>(
         );
     }
 
+    // Pure MoE vindexes (e.g. Gemma-4 26B A4B) have no dense FFN tensor, so
+    // `interleaved_q4k.bin` is 0 bytes. The interleaved-kquant branch above is
+    // also absent for these (no per-matrix manifest entries), so we fall through
+    // here with an empty `q4_ffn_mmap`. Return empty `QuantWeight` stubs —
+    // `patch_pipeline_layers_for_remote_moe` (below) overwrites the per-layer
+    // dense weights for MoE layers, and `moe_fn` supersedes the dense FFN path
+    // during decode, so the empty slices are never read.
+    if q4_ffn_mmap.is_empty() {
+        let empty = QuantWeight {
+            data: &[],
+            scales: None,
+            format: ffn_format,
+        };
+        return (empty, empty, empty);
+    }
+
     let q4_ffn_per_layer = q4_ffn_per_matrix * 3;
     let fs = layer * q4_ffn_per_layer;
     (
@@ -767,5 +783,31 @@ mod tests {
         for l in &layers {
             assert!(l.ffn_is_remote, "patch should set ffn_is_remote = true");
         }
+    }
+
+    /// Pure-MoE vindexes (e.g. Gemma-4 26B A4B) ship a zero-byte
+    /// `interleaved_q4k.bin` because there is no dense FFN. Before the
+    /// `is_empty()` guard, `resolve_ffn_weights` would panic on the first
+    /// `q4_ffn_mmap[fs..fs + q4_ffn_per_matrix]` slice. The guard returns
+    /// empty `QuantWeight` stubs — `patch_pipeline_layers_for_remote_moe`
+    /// overwrites the per-layer MoE weights afterward and the dense FFN
+    /// path is bypassed entirely by `moe_fn` during decode, so the empty
+    /// slices are never read.
+    #[test]
+    fn resolve_ffn_weights_returns_empty_stubs_when_q4_ffn_mmap_is_empty() {
+        struct EmptyIdx;
+        impl crate::KvIndex for EmptyIdx {}
+        let idx = EmptyIdx;
+        let empty_mmap: &[u8] = &[];
+        // q4_ffn_per_matrix is irrelevant on this path — what we're pinning
+        // is "no slice happens against the empty mmap" (i.e. no panic).
+        let (gate, up, down) =
+            resolve_ffn_weights(&idx, 7, empty_mmap, 1_115_136, QuantFormat::Q4_K);
+        assert!(gate.data.is_empty());
+        assert!(up.data.is_empty());
+        assert!(down.data.is_empty());
+        assert_eq!(gate.format, QuantFormat::Q4_K);
+        assert_eq!(up.format, QuantFormat::Q4_K);
+        assert_eq!(down.format, QuantFormat::Q4_K);
     }
 }
